@@ -15,6 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
+from gooomoku import env
+from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 from scripts.self_play import build_play_many_games_fn
 
@@ -86,6 +88,119 @@ def _save_checkpoint(path: Path, params, config: dict) -> None:
 
 def _extract_host_params(params, use_pmap: bool):
     return jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
+
+
+def _add_batch_dim_state(state: env.GomokuState) -> env.GomokuState:
+    return jax.tree_util.tree_map(lambda x: x[None, ...], state)
+
+
+def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict:
+    return {
+        "board_size": args.board_size,
+        "channels": args.channels,
+        "blocks": args.blocks,
+        "num_simulations": args.num_simulations,
+        "max_num_considered_actions": args.max_num_considered_actions,
+        "updates_per_step": args.updates_per_step,
+        "temperature": args.temperature,
+        "temperature_drop_move": args.temperature_drop_move,
+        "final_temperature": args.final_temperature,
+        "root_dirichlet_fraction": args.root_dirichlet_fraction,
+        "root_dirichlet_alpha": args.root_dirichlet_alpha,
+        "lr": args.lr,
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_end_value": args.lr_end_value,
+        "symmetry_augmentation": not args.disable_symmetry_augmentation,
+        "arena_every_steps": args.arena_every_steps,
+        "arena_games": args.arena_games,
+        "arena_replace_threshold": args.arena_replace_threshold,
+        "arena_num_simulations": args.arena_num_simulations,
+        "arena_max_num_considered_actions": args.arena_max_num_considered_actions,
+        "arena_temperature": args.arena_temperature,
+        "optimizer_updates": optimizer_updates,
+        "best_step": best_step,
+    }
+
+
+def build_arena_fn(
+    *,
+    model: PolicyValueNet,
+    board_size: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_games: int,
+    temperature: float,
+):
+    max_steps = board_size * board_size
+    search_fn = build_search_fn(
+        model=model,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        root_dirichlet_fraction=0.0,
+        root_dirichlet_alpha=0.03,
+    )
+    use_greedy = temperature <= 1e-6
+    temp = jnp.float32(temperature)
+
+    @jax.jit
+    def play_game(params_a, params_b, rng_key, a_color):
+        state = env.reset(board_size)
+
+        def cond_fn(carry):
+            cur_state, _, step_idx = carry
+            return (step_idx < max_steps) & (~cur_state.terminated)
+
+        def body_fn(carry):
+            cur_state, cur_key, step_idx = carry
+            cur_key, search_key, sample_key = jax.random.split(cur_key, 3)
+
+            def choose_action(eval_params):
+                policy_output = search_fn(eval_params, _add_batch_dim_state(cur_state), search_key)
+                visit_probs = policy_output.action_weights[0]
+                if use_greedy:
+                    return jnp.argmax(visit_probs).astype(jnp.int32)
+                logits = jnp.log(jnp.maximum(visit_probs, 1e-8)) / temp
+                return jax.random.categorical(sample_key, logits).astype(jnp.int32)
+
+            action = jax.lax.cond(
+                cur_state.to_play == a_color,
+                lambda pair: choose_action(pair[0]),
+                lambda pair: choose_action(pair[1]),
+                operand=(params_a, params_b),
+            )
+            next_state, _, _ = env.step(cur_state, action)
+            return (next_state, cur_key, step_idx + 1)
+
+        state, _, _ = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (state, rng_key, jnp.int32(0)),
+        )
+        winner = state.winner
+        a_win = winner == a_color
+        draw = winner == 0
+        b_win = (~a_win) & (~draw)
+        return a_win.astype(jnp.int32), b_win.astype(jnp.int32), draw.astype(jnp.int32)
+
+    @jax.jit
+    def arena_fn(params_a, params_b, rng_key):
+        game_indices = jnp.arange(num_games, dtype=jnp.int32)
+
+        def body_fn(carry, game_idx):
+            cur_key, a_wins, b_wins, draws = carry
+            cur_key, game_key = jax.random.split(cur_key)
+            a_color = jnp.where((game_idx % 2) == 0, jnp.int8(1), jnp.int8(-1))
+            a_win, b_win, draw = play_game(params_a, params_b, game_key, a_color)
+            return (cur_key, a_wins + a_win, b_wins + b_win, draws + draw), 0
+
+        (_, a_wins, b_wins, draws), _ = jax.lax.scan(
+            body_fn,
+            (rng_key, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
+            game_indices,
+        )
+        return a_wins, b_wins, draws
+
+    return arena_fn
 
 
 def _replicate_tree_for_pmap(tree, local_devices: int):
@@ -187,12 +302,26 @@ def main() -> None:
     parser.add_argument("--root-dirichlet-fraction", type=float, default=0.25)
     parser.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
     parser.add_argument("--disable-symmetry-augmentation", action="store_true")
+    parser.add_argument("--arena-every-steps", type=int, default=10)
+    parser.add_argument("--arena-games", type=int, default=64)
+    parser.add_argument("--arena-replace-threshold", type=float, default=0.55)
+    parser.add_argument("--arena-num-simulations", type=int, default=None)
+    parser.add_argument("--arena-max-num-considered-actions", type=int, default=None)
+    parser.add_argument("--arena-temperature", type=float, default=0.0)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
         raise ValueError("updates-per-step must be >= 1")
+    if args.arena_every_steps < 0:
+        raise ValueError("arena-every-steps must be >= 0")
+    if args.arena_games < 2:
+        raise ValueError("arena-games must be >= 2")
+    if args.arena_games % 2 != 0:
+        raise ValueError("arena-games must be even")
+    if not (0.0 < args.arena_replace_threshold <= 1.0):
+        raise ValueError("arena-replace-threshold must be in (0, 1]")
 
     model = PolicyValueNet(board_size=args.board_size, channels=args.channels, blocks=args.blocks)
     rng_key, init_key = jax.random.split(jax.random.PRNGKey(args.seed))
@@ -229,6 +358,16 @@ def main() -> None:
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
     )
+    arena_num_simulations = args.arena_num_simulations or args.num_simulations
+    arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
+    arena_fn = build_arena_fn(
+        model=model,
+        board_size=args.board_size,
+        num_simulations=arena_num_simulations,
+        max_num_considered_actions=arena_max_num_considered_actions,
+        num_games=args.arena_games,
+        temperature=args.arena_temperature,
+    )
 
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
@@ -253,6 +392,9 @@ def main() -> None:
     replay_value = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
     optimizer_updates = 0
+    best_params = _extract_host_params(params, use_pmap=use_pmap)
+    best_step = 0
+    best_path = args.output.parent / f"{args.output.stem}.best{args.output.suffix}"
 
     for step in range(1, args.train_steps + 1):
         rng_key, collect_key = jax.random.split(rng_key)
@@ -364,26 +506,31 @@ def main() -> None:
             f"bw={black_win} ww={white_win} d={draw}"
         )
 
+        if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
+            current_params = _extract_host_params(params, use_pmap=use_pmap)
+            rng_key, arena_key = jax.random.split(rng_key)
+            arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
+            arena_wins = int(arena_wins)
+            arena_losses = int(arena_losses)
+            arena_draws = int(arena_draws)
+            arena_win_rate = arena_wins / args.arena_games
+            print(
+                f"arena step={step} candidate_w={arena_wins} candidate_l={arena_losses} "
+                f"draw={arena_draws} win_rate={arena_win_rate:.3f} threshold={args.arena_replace_threshold:.3f}"
+            )
+            if arena_win_rate >= args.arena_replace_threshold:
+                best_params = current_params
+                best_step = step
+                best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
+                _save_checkpoint(best_path, best_params, best_cfg)
+                print(f"arena promoted candidate at step={step} -> {best_path}")
+
     final_params = _extract_host_params(params, use_pmap=use_pmap)
-    cfg = {
-        "board_size": args.board_size,
-        "channels": args.channels,
-        "blocks": args.blocks,
-        "num_simulations": args.num_simulations,
-        "max_num_considered_actions": args.max_num_considered_actions,
-        "updates_per_step": args.updates_per_step,
-        "temperature": args.temperature,
-        "temperature_drop_move": args.temperature_drop_move,
-        "final_temperature": args.final_temperature,
-        "root_dirichlet_fraction": args.root_dirichlet_fraction,
-        "root_dirichlet_alpha": args.root_dirichlet_alpha,
-        "lr": args.lr,
-        "lr_warmup_steps": args.lr_warmup_steps,
-        "lr_end_value": args.lr_end_value,
-        "symmetry_augmentation": not args.disable_symmetry_augmentation,
-    }
+    cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
     _save_checkpoint(args.output, final_params, cfg)
     print(f"saved checkpoint to {args.output}")
+    _save_checkpoint(best_path, best_params, cfg)
+    print(f"saved best checkpoint to {best_path}")
 
 
 if __name__ == "__main__":

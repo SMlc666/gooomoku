@@ -47,6 +47,9 @@ PYTHONPATH=src python scripts/train.py \
   --batch-size 256 \
   --num-simulations 32 \
   --max-num-considered-actions 24 \
+  --arena-every-steps 10 \
+  --arena-games 64 \
+  --arena-replace-threshold 0.55 \
   --lr 1e-3 \
   --lr-warmup-steps 100 \
   --lr-end-value 1e-4 \
