@@ -121,6 +121,10 @@ def main() -> None:
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature-drop-move", type=int, default=12)
+    parser.add_argument("--final-temperature", type=float, default=0.0)
+    parser.add_argument("--root-dirichlet-fraction", type=float, default=0.25)
+    parser.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
     args = parser.parse_args()
@@ -137,6 +141,10 @@ def main() -> None:
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
         num_games=args.games_per_step,
+        temperature_drop_move=args.temperature_drop_move,
+        final_temperature=args.final_temperature,
+        root_dirichlet_fraction=args.root_dirichlet_fraction,
+        root_dirichlet_alpha=args.root_dirichlet_alpha,
     )
 
     local_devices = jax.local_device_count()
@@ -235,6 +243,11 @@ def main() -> None:
         "blocks": args.blocks,
         "num_simulations": args.num_simulations,
         "max_num_considered_actions": args.max_num_considered_actions,
+        "temperature": args.temperature,
+        "temperature_drop_move": args.temperature_drop_move,
+        "final_temperature": args.final_temperature,
+        "root_dirichlet_fraction": args.root_dirichlet_fraction,
+        "root_dirichlet_alpha": args.root_dirichlet_alpha,
     }
     _save_checkpoint(args.output, final_params, cfg)
     print(f"saved checkpoint to {args.output}")

@@ -15,6 +15,33 @@ def _masked_logits(logits: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(legal_mask, logits, min_logit)
 
 
+def _apply_root_dirichlet_noise(
+    prior_logits: jnp.ndarray,
+    legal_mask: jnp.ndarray,
+    rng_key,
+    fraction: float,
+    alpha: float,
+) -> jnp.ndarray:
+    probs = jax.nn.softmax(prior_logits, axis=-1)
+    num_actions = prior_logits.shape[-1]
+
+    noise = jax.random.dirichlet(
+        rng_key,
+        jnp.full((num_actions,), jnp.float32(alpha), dtype=probs.dtype),
+        shape=(prior_logits.shape[0],),
+    )
+    legal = legal_mask.astype(probs.dtype)
+    noise = noise * legal
+    noise = noise / jnp.clip(jnp.sum(noise, axis=-1, keepdims=True), 1e-8)
+
+    mixed = (jnp.float32(1.0) - jnp.float32(fraction)) * probs + jnp.float32(fraction) * noise
+    mixed = mixed * legal
+    mixed = mixed / jnp.clip(jnp.sum(mixed, axis=-1, keepdims=True), 1e-8)
+
+    min_logit = jnp.finfo(prior_logits.dtype).min
+    return jnp.where(legal_mask, jnp.log(jnp.clip(mixed, 1e-20)), min_logit)
+
+
 def root_output(params, model: PolicyValueNet, states: env.GomokuState) -> mctx.RootFnOutput:
     obs = env.batch_encode_states(states)
     logits, value = model.apply(params, obs)
@@ -70,16 +97,35 @@ def build_search_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     gumbel_scale: float = 1.0,
+    root_dirichlet_fraction: float = 0.0,
+    root_dirichlet_alpha: float = 0.03,
 ):
     recurrent = functools.partial(recurrent_fn, model=model)
+    use_root_noise = root_dirichlet_fraction > 0.0
 
     @jax.jit
     def search_fn(params, states: env.GomokuState, rng_key):
+        search_key = rng_key
         root = root_output(params=params, model=model, states=states)
         invalid_actions = ~env.batch_legal_action_mask(states)
+        if use_root_noise:
+            noise_key, search_key = jax.random.split(rng_key)
+            legal_actions = ~invalid_actions
+            noisy_logits = _apply_root_dirichlet_noise(
+                prior_logits=root.prior_logits,
+                legal_mask=legal_actions,
+                rng_key=noise_key,
+                fraction=root_dirichlet_fraction,
+                alpha=root_dirichlet_alpha,
+            )
+            root = mctx.RootFnOutput(
+                prior_logits=noisy_logits,
+                value=root.value,
+                embedding=root.embedding,
+            )
         return mctx.gumbel_muzero_policy(
             params=params,
-            rng_key=rng_key,
+            rng_key=search_key,
             root=root,
             recurrent_fn=recurrent,
             num_simulations=num_simulations,

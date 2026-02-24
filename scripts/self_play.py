@@ -47,6 +47,10 @@ def build_play_one_game_fn(
     board_size: int,
     num_simulations: int,
     max_num_considered_actions: int,
+    temperature_drop_move: int = 12,
+    final_temperature: float = 0.0,
+    root_dirichlet_fraction: float = 0.25,
+    root_dirichlet_alpha: float = 0.03,
 ):
     max_steps = board_size * board_size
     num_actions = max_steps
@@ -54,6 +58,8 @@ def build_play_one_game_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        root_dirichlet_fraction=root_dirichlet_fraction,
+        root_dirichlet_alpha=root_dirichlet_alpha,
     )
 
     @jax.jit
@@ -73,7 +79,12 @@ def build_play_one_game_fn(
 
             policy_output = search_fn(params, _add_batch_dim(cur_state), search_key)
             visit_probs = policy_output.action_weights[0]
-            action = _sample_action_jax(visit_probs, sample_key, temperature)
+            move_temperature = jnp.where(
+                step_idx < jnp.int32(temperature_drop_move),
+                temperature,
+                jnp.float32(final_temperature),
+            )
+            action = _sample_action_jax(visit_probs, sample_key, move_temperature)
 
             obs = env.encode_state(cur_state)
             next_obs = cur_obs.at[step_idx].set(obs)
@@ -110,12 +121,20 @@ def build_play_many_games_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     num_games: int,
+    temperature_drop_move: int = 12,
+    final_temperature: float = 0.0,
+    root_dirichlet_fraction: float = 0.25,
+    root_dirichlet_alpha: float = 0.03,
 ):
     play_one_fn = build_play_one_game_fn(
         model=model,
         board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        temperature_drop_move=temperature_drop_move,
+        final_temperature=final_temperature,
+        root_dirichlet_fraction=root_dirichlet_fraction,
+        root_dirichlet_alpha=root_dirichlet_alpha,
     )
 
     @jax.jit
@@ -141,12 +160,20 @@ def play_one_game(
     num_simulations: int,
     max_num_considered_actions: int,
     temperature: float,
+    temperature_drop_move: int = 12,
+    final_temperature: float = 0.0,
+    root_dirichlet_fraction: float = 0.25,
+    root_dirichlet_alpha: float = 0.03,
 ) -> Tuple[List[TrainingExample], int]:
     compiled = build_play_one_game_fn(
         model=model,
         board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        temperature_drop_move=temperature_drop_move,
+        final_temperature=final_temperature,
+        root_dirichlet_fraction=root_dirichlet_fraction,
+        root_dirichlet_alpha=root_dirichlet_alpha,
     )
     obs_buf, pi_buf, value_buf, mask, _, winner = compiled(params, rng_key, jnp.float32(temperature))
 
@@ -178,6 +205,10 @@ def play_many_games(
     num_simulations: int,
     max_num_considered_actions: int,
     temperature: float,
+    temperature_drop_move: int = 12,
+    final_temperature: float = 0.0,
+    root_dirichlet_fraction: float = 0.25,
+    root_dirichlet_alpha: float = 0.03,
 ) -> Tuple[List[TrainingExample], dict]:
     play_many_fn = build_play_many_games_fn(
         model=model,
@@ -185,6 +216,10 @@ def play_many_games(
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         num_games=num_games,
+        temperature_drop_move=temperature_drop_move,
+        final_temperature=final_temperature,
+        root_dirichlet_fraction=root_dirichlet_fraction,
+        root_dirichlet_alpha=root_dirichlet_alpha,
     )
     obs, pi, value, mask, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
     obs = jax.device_get(obs)
