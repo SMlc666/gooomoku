@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import pickle
 from pathlib import Path
 import sys
@@ -46,7 +47,7 @@ def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTrans
 
 
 def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
-    @jax.pmap(axis_name="device")
+    @functools.partial(jax.pmap, axis_name="device")
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
             logits, value = model.apply(trainable, obs)
