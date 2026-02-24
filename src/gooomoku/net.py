@@ -17,6 +17,15 @@ class ResidualBlock(nn.Module):
         return x
 
 
+class ResidualScanCell(nn.Module):
+    channels: int
+
+    @nn.compact
+    def __call__(self, carry: jnp.ndarray, _: jnp.ndarray) -> tuple[jnp.ndarray, None]:
+        carry = ResidualBlock(channels=self.channels)(carry)
+        return carry, None
+
+
 class PolicyValueNet(nn.Module):
     board_size: int
     channels: int = 64
@@ -28,14 +37,16 @@ class PolicyValueNet(nn.Module):
         x = nn.relu(x)
 
         residual_stack = nn.scan(
-            ResidualBlock,
+            ResidualScanCell,
             variable_axes={"params": 0},
             split_rngs={"params": True},
-            in_axes=nn.broadcast,
-            out_axes=nn.broadcast,
-            length=self.blocks,
+            in_axes=0,
+            out_axes=0,
         )
-        x = residual_stack(channels=self.channels, name="residual_stack")(x)
+        x, _ = residual_stack(channels=self.channels, name="residual_stack")(
+            x,
+            jnp.arange(self.blocks, dtype=jnp.int32),
+        )
 
         policy = nn.Conv(2, kernel_size=(1, 1), padding="SAME")(x)
         policy = nn.relu(policy)
