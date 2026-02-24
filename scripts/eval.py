@@ -16,6 +16,17 @@ from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 
 
+def _dtype_from_name(name: str):
+    table = {
+        "float32": jnp.float32,
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+    }
+    if name not in table:
+        raise ValueError(f"unsupported dtype: {name}")
+    return table[name]
+
+
 def _add_batch_dim(state: env.GomokuState) -> env.GomokuState:
     return jax.tree_util.tree_map(lambda x: x[None, ...], state)
 
@@ -133,6 +144,8 @@ def main() -> None:
     parser.add_argument("--board-size", type=int, default=None)
     parser.add_argument("--channels", type=int, default=None)
     parser.add_argument("--blocks", type=int, default=None)
+    parser.add_argument("--compute-dtype", type=str, default=None)
+    parser.add_argument("--param-dtype", type=str, default=None)
     parser.add_argument("--num-simulations", type=int, default=None)
     parser.add_argument("--max-num-considered-actions", type=int, default=None)
     args = parser.parse_args()
@@ -141,10 +154,20 @@ def main() -> None:
     board_size = args.board_size or int(config.get("board_size", 9))
     channels = args.channels or int(config.get("channels", 64))
     blocks = args.blocks or int(config.get("blocks", 6))
+    compute_dtype_name = args.compute_dtype or str(config.get("compute_dtype", "float32"))
+    param_dtype_name = args.param_dtype or str(config.get("param_dtype", "float32"))
+    compute_dtype = _dtype_from_name(compute_dtype_name)
+    param_dtype = _dtype_from_name(param_dtype_name)
     num_simulations = args.num_simulations or int(config.get("num_simulations", 64))
     max_num_considered_actions = args.max_num_considered_actions or int(config.get("max_num_considered_actions", 24))
 
-    model = PolicyValueNet(board_size=board_size, channels=channels, blocks=blocks)
+    model = PolicyValueNet(
+        board_size=board_size,
+        channels=channels,
+        blocks=blocks,
+        compute_dtype=compute_dtype,
+        param_dtype=param_dtype,
+    )
 
     eval_fn = build_eval_vs_random_fn(
         model=model,

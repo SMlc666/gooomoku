@@ -18,6 +18,17 @@ from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 
 
+def _dtype_from_name(name: str):
+    table = {
+        "float32": jnp.float32,
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+    }
+    if name not in table:
+        raise ValueError(f"unsupported dtype: {name}")
+    return table[name]
+
+
 @dataclass
 class TrainingExample:
     observation: jnp.ndarray
@@ -260,12 +271,20 @@ def main() -> None:
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--compute-dtype", type=str, default="float32")
+    parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    model = PolicyValueNet(board_size=args.board_size)
+    compute_dtype = _dtype_from_name(args.compute_dtype)
+    param_dtype = _dtype_from_name(args.param_dtype)
+    model = PolicyValueNet(
+        board_size=args.board_size,
+        compute_dtype=compute_dtype,
+        param_dtype=param_dtype,
+    )
     init_key, game_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=jnp.float32))
+    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
     samples, winner = play_one_game(
         params=params,
         model=model,

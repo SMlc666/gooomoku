@@ -50,6 +50,8 @@ PYTHONPATH=src python scripts/train.py \
   --arena-every-steps 10 \
   --arena-games 64 \
   --arena-replace-threshold 0.55 \
+  --compute-dtype bfloat16 \
+  --param-dtype float32 \
   --lr 1e-3 \
   --lr-warmup-steps 100 \
   --lr-end-value 1e-4 \

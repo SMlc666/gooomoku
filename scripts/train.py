@@ -21,6 +21,17 @@ from gooomoku.net import PolicyValueNet
 from scripts.self_play import build_play_many_games_fn
 
 
+def _dtype_from_name(name: str):
+    table = {
+        "float32": jnp.float32,
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+    }
+    if name not in table:
+        raise ValueError(f"unsupported dtype: {name}")
+    return table[name]
+
+
 def _l2_regularization(params) -> jnp.ndarray:
     return jax.tree_util.tree_reduce(
         lambda acc, x: acc + jnp.sum(jnp.square(x)),
@@ -33,7 +44,9 @@ def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTrans
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
-            logits, value = model.apply(trainable, obs)
+            logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+            logits = logits.astype(jnp.float32)
+            value = value.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
@@ -52,7 +65,9 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
-            logits, value = model.apply(trainable, obs)
+            logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+            logits = logits.astype(jnp.float32)
+            value = value.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
@@ -110,6 +125,8 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict:
         "lr": args.lr,
         "lr_warmup_steps": args.lr_warmup_steps,
         "lr_end_value": args.lr_end_value,
+        "compute_dtype": args.compute_dtype,
+        "param_dtype": args.param_dtype,
         "symmetry_augmentation": not args.disable_symmetry_augmentation,
         "arena_every_steps": args.arena_every_steps,
         "arena_games": args.arena_games,
@@ -293,6 +310,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--lr-end-value", type=float, default=1e-4)
+    parser.add_argument("--compute-dtype", type=str, default="bfloat16")
+    parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
@@ -314,6 +333,8 @@ def main() -> None:
 
     if args.updates_per_step < 1:
         raise ValueError("updates-per-step must be >= 1")
+    compute_dtype = _dtype_from_name(args.compute_dtype)
+    param_dtype = _dtype_from_name(args.param_dtype)
     if args.arena_every_steps < 0:
         raise ValueError("arena-every-steps must be >= 0")
     if args.arena_games < 2:
@@ -323,9 +344,15 @@ def main() -> None:
     if not (0.0 < args.arena_replace_threshold <= 1.0):
         raise ValueError("arena-replace-threshold must be in (0, 1]")
 
-    model = PolicyValueNet(board_size=args.board_size, channels=args.channels, blocks=args.blocks)
+    model = PolicyValueNet(
+        board_size=args.board_size,
+        channels=args.channels,
+        blocks=args.blocks,
+        compute_dtype=compute_dtype,
+        param_dtype=param_dtype,
+    )
     rng_key, init_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=jnp.float32))
+    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
 
     total_optimizer_updates = max(1, args.train_steps * args.updates_per_step)
     warmup_steps = max(0, min(args.lr_warmup_steps, total_optimizer_updates - 1))
@@ -377,14 +404,16 @@ def main() -> None:
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
         print(
             f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
-            f"selfplay_games_per_device={games_per_device}, updates_per_step={args.updates_per_step}"
+            f"selfplay_games_per_device={games_per_device}, updates_per_step={args.updates_per_step}, "
+            f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
         train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
         print(
-            f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}"
+            f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}, "
+            f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
     replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)

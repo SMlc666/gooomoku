@@ -45,6 +45,8 @@ def _apply_root_dirichlet_noise(
 def root_output(params, model: PolicyValueNet, states: env.GomokuState) -> mctx.RootFnOutput:
     obs = env.batch_encode_states(states)
     logits, value = model.apply(params, obs)
+    logits = logits.astype(jnp.float32)
+    value = value.astype(jnp.float32)
     legal = env.batch_legal_action_mask(states)
     prior_logits = _masked_logits(logits, legal)
     return mctx.RootFnOutput(prior_logits=prior_logits, value=value, embedding=states)
@@ -55,6 +57,8 @@ def recurrent_fn(params, rng_key, action, embedding: env.GomokuState, *, model: 
     next_state, reward, done = env.batch_step(embedding, action)
     obs = env.batch_encode_states(next_state)
     logits, value = model.apply(params, obs)
+    logits = logits.astype(jnp.float32)
+    value = value.astype(jnp.float32)
     legal = env.batch_legal_action_mask(next_state)
     prior_logits = _masked_logits(logits, legal)
     discount = jnp.where(done, jnp.float32(0.0), jnp.float32(-1.0))
