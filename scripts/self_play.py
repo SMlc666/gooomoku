@@ -8,12 +8,13 @@ from typing import List, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
-from gooomoku.mctx_adapter import run_gumbel_search
+from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 
 
@@ -28,11 +29,107 @@ def _add_batch_dim(state: env.GomokuState) -> env.GomokuState:
     return jax.tree_util.tree_map(lambda x: x[None, ...], state)
 
 
-def _sample_action(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperature: float) -> int:
-    if temperature <= 1e-6:
-        return int(jnp.argmax(visit_probs))
-    logits = jnp.log(visit_probs + 1e-8) / jnp.float32(temperature)
-    return int(jax.random.categorical(rng_key, logits))
+def _sample_action_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperature: jnp.ndarray) -> jnp.ndarray:
+    def greedy(_):
+        return jnp.argmax(visit_probs).astype(jnp.int32)
+
+    def sample(_):
+        safe_probs = jnp.maximum(visit_probs, 1e-8)
+        logits = jnp.log(safe_probs) / temperature
+        return jax.random.categorical(rng_key, logits).astype(jnp.int32)
+
+    return jax.lax.cond(temperature <= 1e-6, greedy, sample, operand=None)
+
+
+def build_play_one_game_fn(
+    *,
+    model: PolicyValueNet,
+    board_size: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
+):
+    max_steps = board_size * board_size
+    num_actions = max_steps
+    search_fn = build_search_fn(
+        model=model,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+    )
+
+    @jax.jit
+    def play_one_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
+        state = env.reset(board_size)
+        obs_buf = jnp.zeros((max_steps, board_size, board_size, 4), dtype=jnp.float32)
+        pi_buf = jnp.zeros((max_steps, num_actions), dtype=jnp.float32)
+        to_play_buf = jnp.zeros((max_steps,), dtype=jnp.int8)
+
+        def cond_fn(carry):
+            cur_state, _, step_idx, _, _, _ = carry
+            return (step_idx < max_steps) & (~cur_state.terminated)
+
+        def body_fn(carry):
+            cur_state, cur_key, step_idx, cur_obs, cur_pi, cur_to_play = carry
+            cur_key, search_key, sample_key = jax.random.split(cur_key, 3)
+
+            policy_output = search_fn(params, _add_batch_dim(cur_state), search_key)
+            visit_probs = policy_output.action_weights[0]
+            action = _sample_action_jax(visit_probs, sample_key, temperature)
+
+            obs = env.encode_state(cur_state)
+            next_obs = cur_obs.at[step_idx].set(obs)
+            next_pi = cur_pi.at[step_idx].set(visit_probs)
+            next_to_play = cur_to_play.at[step_idx].set(cur_state.to_play)
+
+            next_state, _, _ = env.step(cur_state, action)
+            return (next_state, cur_key, step_idx + 1, next_obs, next_pi, next_to_play)
+
+        state, _, steps, obs_buf, pi_buf, to_play_buf = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (state, rng_key, jnp.int32(0), obs_buf, pi_buf, to_play_buf),
+        )
+
+        winner = state.winner.astype(jnp.int8)
+        mask = jnp.arange(max_steps, dtype=jnp.int32) < steps
+        signed_values = jnp.where(
+            winner == 0,
+            jnp.float32(0.0),
+            jnp.where(to_play_buf == winner, jnp.float32(1.0), jnp.float32(-1.0)),
+        )
+        value_buf = jnp.where(mask, signed_values, jnp.float32(0.0))
+        pi_buf = jnp.where(mask[:, None], pi_buf, jnp.float32(0.0))
+        return obs_buf, pi_buf, value_buf, mask, steps, winner
+
+    return play_one_fn
+
+
+def build_play_many_games_fn(
+    *,
+    model: PolicyValueNet,
+    board_size: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_games: int,
+):
+    play_one_fn = build_play_one_game_fn(
+        model=model,
+        board_size=board_size,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+    )
+
+    @jax.jit
+    def play_many_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
+        def body_fn(carry, _):
+            cur_key = carry
+            cur_key, game_key = jax.random.split(cur_key)
+            outputs = play_one_fn(params, game_key, temperature)
+            return cur_key, outputs
+
+        _, outputs = jax.lax.scan(body_fn, rng_key, xs=None, length=num_games)
+        return outputs
+
+    return play_many_fn
 
 
 def play_one_game(
@@ -45,37 +142,30 @@ def play_one_game(
     max_num_considered_actions: int,
     temperature: float,
 ) -> Tuple[List[TrainingExample], int]:
-    state = env.reset(board_size)
-    trajectory: List[Tuple[jnp.ndarray, jnp.ndarray, int]] = []
+    compiled = build_play_one_game_fn(
+        model=model,
+        board_size=board_size,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+    )
+    obs_buf, pi_buf, value_buf, mask, _, winner = compiled(params, rng_key, jnp.float32(temperature))
 
-    for _ in range(board_size * board_size):
-        if bool(state.terminated):
-            break
+    obs_np = jax.device_get(obs_buf)
+    pi_np = jax.device_get(pi_buf)
+    value_np = jax.device_get(value_buf)
+    mask_np = jax.device_get(mask)
 
-        rng_key, search_key, sample_key = jax.random.split(rng_key, 3)
-        policy_output = run_gumbel_search(
-            params=params,
-            model=model,
-            states=_add_batch_dim(state),
-            rng_key=search_key,
-            num_simulations=num_simulations,
-            max_num_considered_actions=max_num_considered_actions,
-        )
-
-        visit_probs = policy_output.action_weights[0]
-        action = _sample_action(visit_probs, sample_key, temperature=temperature)
-        trajectory.append((env.encode_state(state), visit_probs, int(state.to_play)))
-        state, _, _ = env.step(state, jnp.int32(action))
-
-    winner = int(state.winner)
+    valid_idx = np.flatnonzero(mask_np).tolist()
     examples: List[TrainingExample] = []
-    for obs, pi, to_play in trajectory:
-        if winner == 0:
-            value = 0.0
-        else:
-            value = 1.0 if winner == to_play else -1.0
-        examples.append(TrainingExample(observation=obs, policy_target=pi, value_target=value))
-    return examples, winner
+    for idx in valid_idx:
+        examples.append(
+            TrainingExample(
+                observation=obs_np[idx],
+                policy_target=pi_np[idx],
+                value_target=float(value_np[idx]),
+            )
+        )
+    return examples, int(winner)
 
 
 def play_many_games(
@@ -89,26 +179,36 @@ def play_many_games(
     max_num_considered_actions: int,
     temperature: float,
 ) -> Tuple[List[TrainingExample], dict]:
+    play_many_fn = build_play_many_games_fn(
+        model=model,
+        board_size=board_size,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        num_games=num_games,
+    )
+    obs, pi, value, mask, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
+    obs = jax.device_get(obs)
+    pi = jax.device_get(pi)
+    value = jax.device_get(value)
+    mask = jax.device_get(mask)
+    winners = jax.device_get(winners)
+
     all_examples: List[TrainingExample] = []
-    stats = {"black_win": 0, "white_win": 0, "draw": 0}
-    for _ in range(num_games):
-        rng_key, game_key = jax.random.split(rng_key)
-        examples, winner = play_one_game(
-            params=params,
-            model=model,
-            rng_key=game_key,
-            board_size=board_size,
-            num_simulations=num_simulations,
-            max_num_considered_actions=max_num_considered_actions,
-            temperature=temperature,
+    flat_obs = obs.reshape((-1, board_size, board_size, 4))
+    flat_pi = pi.reshape((-1, board_size * board_size))
+    flat_value = value.reshape((-1,))
+    flat_mask = mask.reshape((-1,))
+    valid_idx = np.flatnonzero(flat_mask).tolist()
+    for idx in valid_idx:
+        all_examples.append(
+            TrainingExample(
+                observation=flat_obs[idx],
+                policy_target=flat_pi[idx],
+                value_target=float(flat_value[idx]),
+            )
         )
-        all_examples.extend(examples)
-        if winner == 1:
-            stats["black_win"] += 1
-        elif winner == -1:
-            stats["white_win"] += 1
-        else:
-            stats["draw"] += 1
+
+    stats = {"black_win": int((winners == 1).sum()), "white_win": int((winners == -1).sum()), "draw": int((winners == 0).sum())}
     return all_examples, stats
 
 

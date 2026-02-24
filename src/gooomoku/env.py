@@ -17,6 +17,17 @@ class GomokuState:
     winner: jnp.ndarray
 
 
+_DIRECTIONS = jnp.asarray(
+    [
+        [1, 0],
+        [0, 1],
+        [1, 1],
+        [1, -1],
+    ],
+    dtype=jnp.int32,
+)
+
+
 def reset(board_size: int) -> GomokuState:
     return GomokuState(
         board=jnp.zeros((board_size, board_size), dtype=jnp.int8),
@@ -74,15 +85,17 @@ def _has_five(
     col: jnp.ndarray,
     player: jnp.ndarray,
 ) -> jnp.ndarray:
-    win = jnp.bool_(False)
-    for dr, dc in ((1, 0), (0, 1), (1, 1), (1, -1)):
+    def has_line(direction: jnp.ndarray) -> jnp.ndarray:
+        dr = direction[0]
+        dc = direction[1]
         streak = (
             jnp.int32(1)
             + _count_in_direction(board, row, col, dr, dc, player)
             + _count_in_direction(board, row, col, -dr, -dc, player)
         )
-        win = win | (streak >= 5)
-    return win
+        return streak >= 5
+
+    return jnp.any(jax.vmap(has_line)(_DIRECTIONS))
 
 
 def step(state: GomokuState, action: jnp.ndarray) -> Tuple[GomokuState, jnp.ndarray, jnp.ndarray]:
@@ -159,6 +172,10 @@ def encode_state(state: GomokuState) -> jnp.ndarray:
     side_to_move = jnp.full((board_size, board_size), (state.to_play == 1).astype(jnp.float32), dtype=jnp.float32)
     return jnp.stack([mine, opp, last_plane, side_to_move], axis=-1)
 
+
+legal_action_mask = jax.jit(legal_action_mask)
+step = jax.jit(step)
+encode_state = jax.jit(encode_state)
 
 batch_legal_action_mask = jax.vmap(legal_action_mask)
 batch_encode_states = jax.vmap(encode_state)

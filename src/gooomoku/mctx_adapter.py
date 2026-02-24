@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 
+import jax
 import jax.numpy as jnp
 import mctx
 
@@ -61,3 +62,30 @@ def run_gumbel_search(
         max_num_considered_actions=max_num_considered_actions,
         gumbel_scale=gumbel_scale,
     )
+
+
+def build_search_fn(
+    *,
+    model: PolicyValueNet,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    gumbel_scale: float = 1.0,
+):
+    recurrent = functools.partial(recurrent_fn, model=model)
+
+    @jax.jit
+    def search_fn(params, states: env.GomokuState, rng_key):
+        root = root_output(params=params, model=model, states=states)
+        invalid_actions = ~env.batch_legal_action_mask(states)
+        return mctx.gumbel_muzero_policy(
+            params=params,
+            rng_key=rng_key,
+            root=root,
+            recurrent_fn=recurrent,
+            num_simulations=num_simulations,
+            invalid_actions=invalid_actions,
+            max_num_considered_actions=max_num_considered_actions,
+            gumbel_scale=gumbel_scale,
+        )
+
+    return search_fn

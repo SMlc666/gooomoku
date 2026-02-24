@@ -27,8 +27,15 @@ class PolicyValueNet(nn.Module):
         x = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME")(obs)
         x = nn.relu(x)
 
-        for _ in range(self.blocks):
-            x = ResidualBlock(channels=self.channels)(x)
+        residual_stack = nn.scan(
+            ResidualBlock,
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=nn.broadcast,
+            out_axes=nn.broadcast,
+            length=self.blocks,
+        )
+        x = residual_stack(channels=self.channels, name="residual_stack")(x)
 
         policy = nn.Conv(2, kernel_size=(1, 1), padding="SAME")(x)
         policy = nn.relu(policy)

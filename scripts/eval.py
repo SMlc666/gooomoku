@@ -7,13 +7,12 @@ import sys
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
-from gooomoku.mctx_adapter import run_gumbel_search
+from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 
 
@@ -29,66 +28,99 @@ def _load_checkpoint(path: Path):
     return params, config
 
 
-def _random_legal_action(state: env.GomokuState, rng: np.random.Generator) -> int:
-    legal = np.flatnonzero(np.asarray(env.legal_action_mask(state)))
-    if legal.size == 0:
-        return 0
-    return int(rng.choice(legal))
-
-
-def _agent_action(
+def build_play_vs_random_fn(
     *,
-    state: env.GomokuState,
-    params,
     model: PolicyValueNet,
-    rng_key,
-    num_simulations: int,
-    max_num_considered_actions: int,
-) -> int:
-    policy_output = run_gumbel_search(
-        params=params,
-        model=model,
-        states=_add_batch_dim(state),
-        rng_key=rng_key,
-        num_simulations=num_simulations,
-        max_num_considered_actions=max_num_considered_actions,
-    )
-    return int(jnp.argmax(policy_output.action_weights[0]))
-
-
-def play_vs_random(
-    *,
-    params,
-    model: PolicyValueNet,
-    seed: int,
     board_size: int,
     num_simulations: int,
     max_num_considered_actions: int,
-    agent_color: int,
-) -> int:
-    state = env.reset(board_size)
-    np_rng = np.random.default_rng(seed)
-    jax_key = jax.random.PRNGKey(seed)
+) -> callable:
+    max_steps = board_size * board_size
+    search_fn = build_search_fn(
+        model=model,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+    )
 
-    for _ in range(board_size * board_size):
-        if bool(state.terminated):
-            break
+    @jax.jit
+    def play_vs_random_fn(params, rng_key: jnp.ndarray, agent_color: jnp.ndarray):
+        state = env.reset(board_size)
 
-        if int(state.to_play) == agent_color:
-            jax_key, key = jax.random.split(jax_key)
-            action = _agent_action(
-                state=state,
-                params=params,
-                model=model,
-                rng_key=key,
-                num_simulations=num_simulations,
-                max_num_considered_actions=max_num_considered_actions,
+        def cond_fn(carry):
+            cur_state, _, step_idx = carry
+            return (step_idx < max_steps) & (~cur_state.terminated)
+
+        def body_fn(carry):
+            cur_state, cur_key, step_idx = carry
+            cur_key, agent_key, random_key = jax.random.split(cur_key, 3)
+
+            def agent_action(_):
+                policy_output = search_fn(params, _add_batch_dim(cur_state), agent_key)
+                return jnp.argmax(policy_output.action_weights[0]).astype(jnp.int32)
+
+            def random_action(_):
+                legal = env.legal_action_mask(cur_state)
+                logits = jnp.where(legal, jnp.float32(0.0), jnp.float32(-1e9))
+                return jax.random.categorical(random_key, logits).astype(jnp.int32)
+
+            action = jax.lax.cond(
+                cur_state.to_play == agent_color,
+                agent_action,
+                random_action,
+                operand=None,
             )
-        else:
-            action = _random_legal_action(state, np_rng)
+            next_state, _, _ = env.step(cur_state, action)
+            return (next_state, cur_key, step_idx + 1)
 
-        state, _, _ = env.step(state, jnp.int32(action))
-    return int(state.winner)
+        state, _, _ = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (state, rng_key, jnp.int32(0)),
+        )
+        return state.winner.astype(jnp.int8)
+
+    return play_vs_random_fn
+
+
+def build_eval_vs_random_fn(
+    *,
+    model: PolicyValueNet,
+    board_size: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_games: int,
+) -> callable:
+    play_vs_random_fn = build_play_vs_random_fn(
+        model=model,
+        board_size=board_size,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+    )
+
+    @jax.jit
+    def eval_fn(params, rng_key: jnp.ndarray):
+        game_indices = jnp.arange(num_games, dtype=jnp.int32)
+
+        def body_fn(carry, game_idx):
+            cur_key, win, loss, draw = carry
+            cur_key, game_key = jax.random.split(cur_key)
+            agent_color = jnp.where((game_idx % 2) == 0, jnp.int8(1), jnp.int8(-1))
+            winner = play_vs_random_fn(params, game_key, agent_color)
+            is_draw = winner == 0
+            is_win = winner == agent_color
+            win = win + is_win.astype(jnp.int32)
+            draw = draw + is_draw.astype(jnp.int32)
+            loss = loss + ((~is_draw) & (~is_win)).astype(jnp.int32)
+            return (cur_key, win, loss, draw), winner
+
+        (_, win, loss, draw), winners = jax.lax.scan(
+            body_fn,
+            (rng_key, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
+            game_indices,
+        )
+        return win, loss, draw, winners
+
+    return eval_fn
 
 
 def main() -> None:
@@ -112,26 +144,17 @@ def main() -> None:
 
     model = PolicyValueNet(board_size=board_size, channels=channels, blocks=blocks)
 
-    win = 0
-    loss = 0
-    draw = 0
-    for game_idx in range(args.games):
-        agent_color = 1 if (game_idx % 2 == 0) else -1
-        winner = play_vs_random(
-            params=params,
-            model=model,
-            seed=args.seed + game_idx,
-            board_size=board_size,
-            num_simulations=num_simulations,
-            max_num_considered_actions=max_num_considered_actions,
-            agent_color=agent_color,
-        )
-        if winner == 0:
-            draw += 1
-        elif winner == agent_color:
-            win += 1
-        else:
-            loss += 1
+    eval_fn = build_eval_vs_random_fn(
+        model=model,
+        board_size=board_size,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        num_games=args.games,
+    )
+    win, loss, draw, _ = eval_fn(params, jax.random.PRNGKey(args.seed))
+    win = int(win)
+    loss = int(loss)
+    draw = int(draw)
 
     print(
         f"games={args.games} win={win} loss={loss} draw={draw} "

@@ -4,7 +4,6 @@ import argparse
 import pickle
 from pathlib import Path
 import sys
-from typing import List
 
 import jax
 import jax.numpy as jnp
@@ -16,11 +15,15 @@ sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku.net import PolicyValueNet
-from scripts.self_play import TrainingExample, play_one_game, stack_examples
+from scripts.self_play import build_play_many_games_fn
 
 
 def _l2_regularization(params) -> jnp.ndarray:
-    return sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(params))
+    return jax.tree_util.tree_reduce(
+        lambda acc, x: acc + jnp.sum(jnp.square(x)),
+        params,
+        initializer=jnp.float32(0.0),
+    )
 
 
 def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
@@ -72,6 +75,36 @@ def _save_checkpoint(path: Path, params, config: dict) -> None:
         pickle.dump(payload, fp)
 
 
+def _extract_host_params(params, use_pmap: bool):
+    return jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
+
+
+def _append_replay(
+    replay_obs: np.ndarray,
+    replay_policy: np.ndarray,
+    replay_value: np.ndarray,
+    new_obs: np.ndarray,
+    new_policy: np.ndarray,
+    new_value: np.ndarray,
+    replay_size: int,
+):
+    if replay_obs.size == 0:
+        merged_obs = new_obs
+        merged_policy = new_policy
+        merged_value = new_value
+    else:
+        merged_obs = np.concatenate([replay_obs, new_obs], axis=0)
+        merged_policy = np.concatenate([replay_policy, new_policy], axis=0)
+        merged_value = np.concatenate([replay_value, new_value], axis=0)
+
+    if merged_obs.shape[0] > replay_size:
+        start = merged_obs.shape[0] - replay_size
+        merged_obs = merged_obs[start:]
+        merged_policy = merged_policy[start:]
+        merged_value = merged_value[start:]
+    return merged_obs, merged_policy, merged_value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Minimal JAX+mctx gomoku trainer.")
     parser.add_argument("--board-size", type=int, default=9)
@@ -97,6 +130,13 @@ def main() -> None:
 
     optimizer = optax.adam(learning_rate=args.lr)
     opt_state = optimizer.init(params)
+    play_many_games_fn = build_play_many_games_fn(
+        model=model,
+        board_size=args.board_size,
+        num_simulations=args.num_simulations,
+        max_num_considered_actions=args.max_num_considered_actions,
+        num_games=args.games_per_step,
+    )
 
     local_devices = jax.local_device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
@@ -115,43 +155,52 @@ def main() -> None:
         per_device_batch = args.batch_size
         print(f"single-device mode: local_device_count={local_devices}")
 
-    replay: List[TrainingExample] = []
+    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)
+    replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
+    replay_value = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
 
     for step in range(1, args.train_steps + 1):
-        stats = {"black_win": 0, "white_win": 0, "draw": 0, "examples": 0}
-        current_params = jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
+        current_params = _extract_host_params(params, use_pmap=use_pmap)
+        rng_key, collect_key = jax.random.split(rng_key)
+        obs, policy, value, mask, _, winners = play_many_games_fn(
+            current_params,
+            collect_key,
+            jnp.float32(args.temperature),
+        )
 
-        for _ in range(args.games_per_step):
-            rng_key, game_key = jax.random.split(rng_key)
-            examples, winner = play_one_game(
-                params=current_params,
-                model=model,
-                rng_key=game_key,
-                board_size=args.board_size,
-                num_simulations=args.num_simulations,
-                max_num_considered_actions=args.max_num_considered_actions,
-                temperature=args.temperature,
-            )
-            replay.extend(examples)
-            stats["examples"] += len(examples)
-            if winner == 1:
-                stats["black_win"] += 1
-            elif winner == -1:
-                stats["white_win"] += 1
-            else:
-                stats["draw"] += 1
+        obs_np = np.asarray(jax.device_get(obs))
+        policy_np = np.asarray(jax.device_get(policy))
+        value_np = np.asarray(jax.device_get(value))
+        mask_np = np.asarray(jax.device_get(mask))
+        winners_np = np.asarray(jax.device_get(winners))
 
-        if len(replay) > args.replay_size:
-            replay = replay[-args.replay_size :]
+        flat_obs = obs_np.reshape((-1, args.board_size, args.board_size, 4))
+        flat_policy = policy_np.reshape((-1, args.board_size * args.board_size))
+        flat_value = value_np.reshape((-1,))
+        valid = mask_np.reshape((-1,)).astype(bool)
 
-        if len(replay) < args.batch_size:
-            print(f"step={step} replay={len(replay)} waiting for enough samples")
+        new_obs = flat_obs[valid]
+        new_policy = flat_policy[valid]
+        new_value = flat_value[valid]
+        replay_obs, replay_policy, replay_value = _append_replay(
+            replay_obs,
+            replay_policy,
+            replay_value,
+            new_obs,
+            new_policy,
+            new_value,
+            replay_size=args.replay_size,
+        )
+
+        if replay_obs.shape[0] < args.batch_size:
+            print(f"step={step} replay={replay_obs.shape[0]} waiting for enough samples")
             continue
 
-        sample_ids = np_rng.integers(0, len(replay), size=args.batch_size)
-        batch = [replay[idx] for idx in sample_ids]
-        obs, policy_target, value_target = stack_examples(batch)
+        sample_ids = np_rng.integers(0, replay_obs.shape[0], size=args.batch_size)
+        obs = jnp.asarray(replay_obs[sample_ids], dtype=jnp.float32)
+        policy_target = jnp.asarray(replay_policy[sample_ids], dtype=jnp.float32)
+        value_target = jnp.asarray(replay_value[sample_ids], dtype=jnp.float32)
 
         if use_pmap:
             obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
@@ -167,13 +216,18 @@ def main() -> None:
             pol_val = float(policy_loss)
             val_val = float(value_loss)
 
+        black_win = int((winners_np == 1).sum())
+        white_win = int((winners_np == -1).sum())
+        draw = int((winners_np == 0).sum())
+        new_examples = int(valid.sum())
+
         print(
             f"step={step} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
-            f"replay={len(replay)} new_examples={stats['examples']} "
-            f"bw={stats['black_win']} ww={stats['white_win']} d={stats['draw']}"
+            f"replay={replay_obs.shape[0]} new_examples={new_examples} "
+            f"bw={black_win} ww={white_win} d={draw}"
         )
 
-    final_params = jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
+    final_params = _extract_host_params(params, use_pmap=use_pmap)
     cfg = {
         "board_size": args.board_size,
         "channels": args.channels,
