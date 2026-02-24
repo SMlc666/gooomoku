@@ -28,7 +28,7 @@ def _l2_regularization(params) -> jnp.ndarray:
 
 
 def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
-    @jax.jit
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
             logits, value = model.apply(trainable, obs)
@@ -47,7 +47,7 @@ def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTrans
 
 
 def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
-    @functools.partial(jax.pmap, axis_name="device")
+    @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
             logits, value = model.apply(trainable, obs)
@@ -67,6 +67,14 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
         return new_params, new_opt_state, loss, policy_loss, value_loss
 
     return train_step
+
+
+def make_pmap_collect_step(play_many_games_fn):
+    @functools.partial(jax.pmap, axis_name="device")
+    def collect_step(params, rng_key, temperature):
+        return play_many_games_fn(params, rng_key, temperature)
+
+    return collect_step
 
 
 def _save_checkpoint(path: Path, params, config: dict) -> None:
@@ -135,32 +143,40 @@ def main() -> None:
 
     optimizer = optax.adam(learning_rate=args.lr)
     opt_state = optimizer.init(params)
+    local_devices = jax.local_device_count()
+    use_pmap = (not args.disable_pmap) and local_devices > 1
+    if use_pmap and (args.batch_size % local_devices != 0):
+        raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
+    if use_pmap and (args.games_per_step % local_devices != 0):
+        raise ValueError(f"games-per-step must be divisible by local_device_count={local_devices}")
+
+    games_per_device = args.games_per_step // local_devices if use_pmap else args.games_per_step
     play_many_games_fn = build_play_many_games_fn(
         model=model,
         board_size=args.board_size,
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
-        num_games=args.games_per_step,
+        num_games=games_per_device,
         temperature_drop_move=args.temperature_drop_move,
         final_temperature=args.final_temperature,
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
     )
 
-    local_devices = jax.local_device_count()
-    use_pmap = (not args.disable_pmap) and local_devices > 1
-    if use_pmap and (args.batch_size % local_devices != 0):
-        raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
-
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
         train_step = make_pmap_train_step(model, optimizer, weight_decay=args.weight_decay)
+        collect_step = make_pmap_collect_step(play_many_games_fn)
         devices = jax.local_devices()
         params = jax.device_put_replicated(params, devices)
         opt_state = jax.device_put_replicated(opt_state, devices)
-        print(f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}")
+        print(
+            f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
+            f"selfplay_games_per_device={games_per_device}"
+        )
     else:
         train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
+        collect_step = play_many_games_fn
         per_device_batch = args.batch_size
         print(f"single-device mode: local_device_count={local_devices}")
 
@@ -170,19 +186,28 @@ def main() -> None:
     np_rng = np.random.default_rng(args.seed + 13)
 
     for step in range(1, args.train_steps + 1):
-        current_params = _extract_host_params(params, use_pmap=use_pmap)
         rng_key, collect_key = jax.random.split(rng_key)
-        obs, policy, value, mask, _, winners = play_many_games_fn(
-            current_params,
-            collect_key,
-            jnp.float32(args.temperature),
-        )
+        if use_pmap:
+            collect_keys = jax.random.split(collect_key, local_devices)
+            collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
+            obs, policy, value, mask, _, winners = collect_step(
+                params,
+                collect_keys,
+                collect_temperature,
+            )
+        else:
+            obs, policy, value, mask, _, winners = collect_step(
+                params,
+                collect_key,
+                jnp.float32(args.temperature),
+            )
 
-        obs_np = np.asarray(jax.device_get(obs))
-        policy_np = np.asarray(jax.device_get(policy))
-        value_np = np.asarray(jax.device_get(value))
-        mask_np = np.asarray(jax.device_get(mask))
-        winners_np = np.asarray(jax.device_get(winners))
+        obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+        obs_np = np.asarray(obs_np)
+        policy_np = np.asarray(policy_np)
+        value_np = np.asarray(value_np)
+        mask_np = np.asarray(mask_np)
+        winners_np = np.asarray(winners_np)
 
         flat_obs = obs_np.reshape((-1, args.board_size, args.board_size, 4))
         flat_policy = policy_np.reshape((-1, args.board_size * args.board_size))
