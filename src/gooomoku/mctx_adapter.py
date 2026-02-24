@@ -57,7 +57,7 @@ def recurrent_fn(params, rng_key, action, embedding: env.GomokuState, *, model: 
     logits, value = model.apply(params, obs)
     legal = env.batch_legal_action_mask(next_state)
     prior_logits = _masked_logits(logits, legal)
-    discount = jnp.where(done, jnp.float32(0.0), jnp.float32(1.0))
+    discount = jnp.where(done, jnp.float32(0.0), jnp.float32(-1.0))
     output = mctx.RecurrentFnOutput(
         reward=reward,
         discount=discount,

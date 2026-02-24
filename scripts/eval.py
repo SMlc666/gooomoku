@@ -40,6 +40,8 @@ def build_play_vs_random_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        root_dirichlet_fraction=0.0,
+        root_dirichlet_alpha=0.03,
     )
 
     @jax.jit
@@ -140,7 +142,7 @@ def main() -> None:
     channels = args.channels or int(config.get("channels", 64))
     blocks = args.blocks or int(config.get("blocks", 6))
     num_simulations = args.num_simulations or int(config.get("num_simulations", 64))
-    max_num_considered_actions = args.max_num_considered_actions or int(config.get("max_num_considered_actions", 16))
+    max_num_considered_actions = args.max_num_considered_actions or int(config.get("max_num_considered_actions", 24))
 
     model = PolicyValueNet(board_size=board_size, channels=channels, blocks=blocks)
 

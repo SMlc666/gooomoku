@@ -258,7 +258,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run minimal JAX+mctx gomoku self-play.")
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--num-simulations", type=int, default=64)
-    parser.add_argument("--max-num-considered-actions", type=int, default=16)
+    parser.add_argument("--max-num-considered-actions", type=int, default=24)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

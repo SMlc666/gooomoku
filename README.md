@@ -42,9 +42,14 @@ PYTHONPATH=src python scripts/self_play.py --board-size 9 --num-simulations 32
 PYTHONPATH=src python scripts/train.py \
   --board-size 9 \
   --train-steps 20 \
-  --games-per-step 8 \
+  --games-per-step 16 \
+  --updates-per-step 8 \
   --batch-size 256 \
   --num-simulations 32 \
+  --max-num-considered-actions 24 \
+  --lr 1e-3 \
+  --lr-warmup-steps 100 \
+  --lr-end-value 1e-4 \
   --output checkpoints/latest.pkl
 ```
 

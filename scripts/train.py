@@ -88,6 +88,56 @@ def _extract_host_params(params, use_pmap: bool):
     return jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
 
 
+def _replicate_tree_for_pmap(tree, local_devices: int):
+    return jax.tree_util.tree_map(
+        lambda x: jnp.broadcast_to(jnp.asarray(x), (local_devices,) + x.shape),
+        tree,
+    )
+
+
+def _apply_dihedral_symmetry_obs(obs: np.ndarray, symmetry_id: int) -> np.ndarray:
+    transformed = obs
+    if symmetry_id >= 4:
+        transformed = np.flip(transformed, axis=2)
+        symmetry_id -= 4
+    if symmetry_id > 0:
+        transformed = np.rot90(transformed, k=symmetry_id, axes=(1, 2))
+    return transformed
+
+
+def _apply_dihedral_symmetry_policy(policy_grid: np.ndarray, symmetry_id: int) -> np.ndarray:
+    transformed = policy_grid
+    if symmetry_id >= 4:
+        transformed = np.flip(transformed, axis=2)
+        symmetry_id -= 4
+    if symmetry_id > 0:
+        transformed = np.rot90(transformed, k=symmetry_id, axes=(1, 2))
+    return transformed
+
+
+def _augment_batch_with_random_symmetry(
+    obs: np.ndarray,
+    policy: np.ndarray,
+    board_size: int,
+    np_rng: np.random.Generator,
+):
+    batch_size = obs.shape[0]
+    symmetry_ids = np_rng.integers(0, 8, size=batch_size, dtype=np.int32)
+
+    augmented_obs = np.empty_like(obs)
+    policy_grid = policy.reshape((-1, board_size, board_size))
+    augmented_policy_grid = np.empty_like(policy_grid)
+
+    for symmetry_id in range(8):
+        indices = np.nonzero(symmetry_ids == symmetry_id)[0]
+        if indices.size == 0:
+            continue
+        augmented_obs[indices] = _apply_dihedral_symmetry_obs(obs[indices], symmetry_id)
+        augmented_policy_grid[indices] = _apply_dihedral_symmetry_policy(policy_grid[indices], symmetry_id)
+
+    return augmented_obs, augmented_policy_grid.reshape((-1, board_size * board_size))
+
+
 def _append_replay(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
@@ -122,26 +172,43 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--games-per-step", type=int, default=8)
+    parser.add_argument("--updates-per-step", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-size", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-warmup-steps", type=int, default=100)
+    parser.add_argument("--lr-end-value", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-simulations", type=int, default=64)
-    parser.add_argument("--max-num-considered-actions", type=int, default=16)
+    parser.add_argument("--max-num-considered-actions", type=int, default=24)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--temperature-drop-move", type=int, default=12)
     parser.add_argument("--final-temperature", type=float, default=0.0)
     parser.add_argument("--root-dirichlet-fraction", type=float, default=0.25)
     parser.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
+    parser.add_argument("--disable-symmetry-augmentation", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
     args = parser.parse_args()
+
+    if args.updates_per_step < 1:
+        raise ValueError("updates-per-step must be >= 1")
 
     model = PolicyValueNet(board_size=args.board_size, channels=args.channels, blocks=args.blocks)
     rng_key, init_key = jax.random.split(jax.random.PRNGKey(args.seed))
     params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=jnp.float32))
 
-    optimizer = optax.adam(learning_rate=args.lr)
+    total_optimizer_updates = max(1, args.train_steps * args.updates_per_step)
+    warmup_steps = max(0, min(args.lr_warmup_steps, total_optimizer_updates - 1))
+    decay_steps = max(total_optimizer_updates, warmup_steps + 1)
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=args.lr,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        end_value=args.lr_end_value,
+    )
+    optimizer = optax.adam(learning_rate=lr_schedule)
     opt_state = optimizer.init(params)
     local_devices = jax.local_device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
@@ -167,23 +234,25 @@ def main() -> None:
         per_device_batch = args.batch_size // local_devices
         train_step = make_pmap_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = make_pmap_collect_step(play_many_games_fn)
-        devices = jax.local_devices()
-        params = jax.device_put_replicated(params, devices)
-        opt_state = jax.device_put_replicated(opt_state, devices)
+        params = _replicate_tree_for_pmap(params, local_devices=local_devices)
+        opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
         print(
             f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
-            f"selfplay_games_per_device={games_per_device}"
+            f"selfplay_games_per_device={games_per_device}, updates_per_step={args.updates_per_step}"
         )
     else:
         train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
-        print(f"single-device mode: local_device_count={local_devices}")
+        print(
+            f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}"
+        )
 
     replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)
     replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
     replay_value = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
+    optimizer_updates = 0
 
     for step in range(1, args.train_steps + 1):
         rng_key, collect_key = jax.random.split(rng_key)
@@ -231,24 +300,58 @@ def main() -> None:
             print(f"step={step} replay={replay_obs.shape[0]} waiting for enough samples")
             continue
 
-        sample_ids = np_rng.integers(0, replay_obs.shape[0], size=args.batch_size)
-        obs = jnp.asarray(replay_obs[sample_ids], dtype=jnp.float32)
-        policy_target = jnp.asarray(replay_policy[sample_ids], dtype=jnp.float32)
-        value_target = jnp.asarray(replay_value[sample_ids], dtype=jnp.float32)
+        loss_sum = 0.0
+        policy_sum = 0.0
+        value_sum = 0.0
+        for _ in range(args.updates_per_step):
+            sample_ids = np_rng.integers(0, replay_obs.shape[0], size=args.batch_size)
+            obs_batch = replay_obs[sample_ids]
+            policy_batch = replay_policy[sample_ids]
+            value_batch = replay_value[sample_ids]
 
-        if use_pmap:
-            obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
-            policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
-            value_target = value_target.reshape((local_devices, per_device_batch))
-            params, opt_state, loss, policy_loss, value_loss = train_step(params, opt_state, obs, policy_target, value_target)
-            loss_val = float(loss[0])
-            pol_val = float(policy_loss[0])
-            val_val = float(value_loss[0])
-        else:
-            params, opt_state, loss, policy_loss, value_loss = train_step(params, opt_state, obs, policy_target, value_target)
-            loss_val = float(loss)
-            pol_val = float(policy_loss)
-            val_val = float(value_loss)
+            if not args.disable_symmetry_augmentation:
+                obs_batch, policy_batch = _augment_batch_with_random_symmetry(
+                    obs_batch,
+                    policy_batch,
+                    board_size=args.board_size,
+                    np_rng=np_rng,
+                )
+
+            obs = jnp.asarray(obs_batch, dtype=jnp.float32)
+            policy_target = jnp.asarray(policy_batch, dtype=jnp.float32)
+            value_target = jnp.asarray(value_batch, dtype=jnp.float32)
+
+            if use_pmap:
+                obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
+                value_target = value_target.reshape((local_devices, per_device_batch))
+                params, opt_state, loss, policy_loss, value_loss = train_step(
+                    params,
+                    opt_state,
+                    obs,
+                    policy_target,
+                    value_target,
+                )
+                loss_sum += float(loss[0])
+                policy_sum += float(policy_loss[0])
+                value_sum += float(value_loss[0])
+            else:
+                params, opt_state, loss, policy_loss, value_loss = train_step(
+                    params,
+                    opt_state,
+                    obs,
+                    policy_target,
+                    value_target,
+                )
+                loss_sum += float(loss)
+                policy_sum += float(policy_loss)
+                value_sum += float(value_loss)
+            optimizer_updates += 1
+
+        loss_val = loss_sum / args.updates_per_step
+        pol_val = policy_sum / args.updates_per_step
+        val_val = value_sum / args.updates_per_step
+        lr_val = float(lr_schedule(jnp.asarray(max(optimizer_updates - 1, 0), dtype=jnp.int32)))
 
         black_win = int((winners_np == 1).sum())
         white_win = int((winners_np == -1).sum())
@@ -256,7 +359,7 @@ def main() -> None:
         new_examples = int(valid.sum())
 
         print(
-            f"step={step} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
+            f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
             f"replay={replay_obs.shape[0]} new_examples={new_examples} "
             f"bw={black_win} ww={white_win} d={draw}"
         )
@@ -268,11 +371,16 @@ def main() -> None:
         "blocks": args.blocks,
         "num_simulations": args.num_simulations,
         "max_num_considered_actions": args.max_num_considered_actions,
+        "updates_per_step": args.updates_per_step,
         "temperature": args.temperature,
         "temperature_drop_move": args.temperature_drop_move,
         "final_temperature": args.final_temperature,
         "root_dirichlet_fraction": args.root_dirichlet_fraction,
         "root_dirichlet_alpha": args.root_dirichlet_alpha,
+        "lr": args.lr,
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_end_value": args.lr_end_value,
+        "symmetry_augmentation": not args.disable_symmetry_augmentation,
     }
     _save_checkpoint(args.output, final_params, cfg)
     print(f"saved checkpoint to {args.output}")
