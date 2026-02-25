@@ -62,6 +62,15 @@ PYTHONPATH=src python scripts/train.py \
 PYTHONPATH=src python scripts/eval.py --checkpoint checkpoints/latest.pkl --games 20
 ```
 
+Resume from checkpoint:
+
+```bash
+PYTHONPATH=src python scripts/train.py \
+  --resume-from checkpoints/latest.pkl \
+  --train-steps 200 \
+  --output checkpoints/latest.pkl
+```
+
 ## TPU notes
 
 - Keep `--batch-size` divisible by `jax.local_device_count()` in pmap mode.

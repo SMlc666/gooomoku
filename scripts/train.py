@@ -94,14 +94,55 @@ def make_pmap_collect_step(play_many_games_fn):
     return collect_step
 
 
-def _save_checkpoint(path: Path, params, config: dict) -> None:
+def _save_model_checkpoint(path: Path, params, config: dict) -> None:
     payload = {"params": jax.device_get(params), "config": config}
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fp:
         pickle.dump(payload, fp)
 
 
-def _extract_host_params(params, use_pmap: bool):
+def _save_training_checkpoint(
+    path: Path,
+    *,
+    params,
+    opt_state,
+    config: dict,
+    step: int,
+    optimizer_updates: int,
+    rng_key,
+    np_rng_state,
+    replay_obs: np.ndarray,
+    replay_policy: np.ndarray,
+    replay_value: np.ndarray,
+    best_params,
+    best_step: int,
+) -> None:
+    payload = {
+        "format_version": 2,
+        "params": jax.device_get(params),
+        "opt_state": jax.device_get(opt_state),
+        "config": config,
+        "step": int(step),
+        "optimizer_updates": int(optimizer_updates),
+        "rng_key": jax.device_get(rng_key),
+        "np_rng_state": np_rng_state,
+        "replay_obs": replay_obs,
+        "replay_policy": replay_policy,
+        "replay_value": replay_value,
+        "best_params": jax.device_get(best_params),
+        "best_step": int(best_step),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fp:
+        pickle.dump(payload, fp)
+
+
+def _load_checkpoint_payload(path: Path):
+    with path.open("rb") as fp:
+        return pickle.load(fp)
+
+
+def _extract_host_tree(params, use_pmap: bool):
     return jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
 
 
@@ -134,6 +175,7 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict:
         "arena_num_simulations": args.arena_num_simulations,
         "arena_max_num_considered_actions": args.arena_max_num_considered_actions,
         "arena_temperature": args.arena_temperature,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
         "optimizer_updates": optimizer_updates,
         "best_step": best_step,
     }
@@ -327,6 +369,8 @@ def main() -> None:
     parser.add_argument("--arena-num-simulations", type=int, default=None)
     parser.add_argument("--arena-max-num-considered-actions", type=int, default=None)
     parser.add_argument("--arena-temperature", type=float, default=0.0)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=10)
+    parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
     args = parser.parse_args()
@@ -343,6 +387,8 @@ def main() -> None:
         raise ValueError("arena-games must be even")
     if not (0.0 < args.arena_replace_threshold <= 1.0):
         raise ValueError("arena-replace-threshold must be in (0, 1]")
+    if args.checkpoint_every_steps < 0:
+        raise ValueError("checkpoint-every-steps must be >= 0")
 
     model = PolicyValueNet(
         board_size=args.board_size,
@@ -366,6 +412,60 @@ def main() -> None:
     )
     optimizer = optax.adam(learning_rate=lr_schedule)
     opt_state = optimizer.init(params)
+    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)
+    replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
+    replay_value = np.zeros((0,), dtype=np.float32)
+    np_rng = np.random.default_rng(args.seed + 13)
+    optimizer_updates = 0
+    best_params = params
+    best_step = 0
+    start_step = 1
+
+    if args.resume_from is not None:
+        payload = _load_checkpoint_payload(args.resume_from)
+        resume_cfg = payload.get("config", {})
+        for key in ("board_size", "channels", "blocks", "compute_dtype", "param_dtype"):
+            cfg_val = resume_cfg.get(key)
+            arg_val = getattr(args, key)
+            if cfg_val is not None and str(cfg_val) != str(arg_val):
+                raise ValueError(
+                    f"resume config mismatch for {key}: checkpoint={cfg_val} current={arg_val}"
+                )
+
+        if "params" not in payload:
+            raise ValueError(f"invalid resume checkpoint (missing params): {args.resume_from}")
+        params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+        if "opt_state" in payload:
+            opt_state = jax.tree_util.tree_map(jnp.asarray, payload["opt_state"])
+        else:
+            opt_state = optimizer.init(params)
+
+        if "rng_key" in payload:
+            rng_key = jnp.asarray(payload["rng_key"], dtype=jnp.uint32)
+
+        if "replay_obs" in payload and "replay_policy" in payload and "replay_value" in payload:
+            replay_obs = np.asarray(payload["replay_obs"], dtype=np.float32)
+            replay_policy = np.asarray(payload["replay_policy"], dtype=np.float32)
+            replay_value = np.asarray(payload["replay_value"], dtype=np.float32)
+
+        np_rng = np.random.default_rng(args.seed + 13)
+        if "np_rng_state" in payload:
+            np_rng.bit_generator.state = payload["np_rng_state"]
+
+        optimizer_updates = int(payload.get("optimizer_updates", 0))
+        last_step = int(payload.get("step", 0))
+        start_step = max(1, last_step + 1)
+        if "best_params" in payload:
+            best_params = jax.tree_util.tree_map(jnp.asarray, payload["best_params"])
+        else:
+            best_params = params
+        best_step = int(payload.get("best_step", 0))
+
+        print(
+            f"resumed from {args.resume_from}: last_step={last_step} start_step={start_step} "
+            f"optimizer_updates={optimizer_updates} replay={replay_obs.shape[0]}"
+        )
+
     local_devices = jax.local_device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
     if use_pmap and (args.batch_size % local_devices != 0):
@@ -416,16 +516,40 @@ def main() -> None:
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
-    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)
-    replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
-    replay_value = np.zeros((0,), dtype=np.float32)
-    np_rng = np.random.default_rng(args.seed + 13)
-    optimizer_updates = 0
-    best_params = _extract_host_params(params, use_pmap=use_pmap)
-    best_step = 0
+    best_params = jax.tree_util.tree_map(jnp.asarray, best_params)
     best_path = args.output.parent / f"{args.output.stem}.best{args.output.suffix}"
 
-    for step in range(1, args.train_steps + 1):
+    def maybe_save_training_checkpoint(step: int, reason: str) -> None:
+        if args.checkpoint_every_steps <= 0 or (step % args.checkpoint_every_steps != 0):
+            return
+        current_params = _extract_host_tree(params, use_pmap=use_pmap)
+        current_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
+        cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
+        _save_training_checkpoint(
+            args.output,
+            params=current_params,
+            opt_state=current_opt_state,
+            config=cfg,
+            step=step,
+            optimizer_updates=optimizer_updates,
+            rng_key=rng_key,
+            np_rng_state=np_rng.bit_generator.state,
+            replay_obs=replay_obs,
+            replay_policy=replay_policy,
+            replay_value=replay_value,
+            best_params=best_params,
+            best_step=best_step,
+        )
+        print(f"saved training checkpoint ({reason}) to {args.output}")
+
+    completed_step = start_step - 1
+    if start_step > args.train_steps:
+        print(
+            f"resume start_step={start_step} is beyond train_steps={args.train_steps}; "
+            "skipping update loop and saving checkpoint."
+        )
+    for step in range(start_step, args.train_steps + 1):
+        completed_step = step
         rng_key, collect_key = jax.random.split(rng_key)
         if use_pmap:
             collect_keys = jax.random.split(collect_key, local_devices)
@@ -469,6 +593,7 @@ def main() -> None:
 
         if replay_obs.shape[0] < args.batch_size:
             print(f"step={step} replay={replay_obs.shape[0]} waiting for enough samples")
+            maybe_save_training_checkpoint(step, "replay-wait")
             continue
 
         loss_sum = 0.0
@@ -536,7 +661,7 @@ def main() -> None:
         )
 
         if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
-            current_params = _extract_host_params(params, use_pmap=use_pmap)
+            current_params = _extract_host_tree(params, use_pmap=use_pmap)
             rng_key, arena_key = jax.random.split(rng_key)
             arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
             arena_wins = int(arena_wins)
@@ -551,14 +676,31 @@ def main() -> None:
                 best_params = current_params
                 best_step = step
                 best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
-                _save_checkpoint(best_path, best_params, best_cfg)
+                _save_model_checkpoint(best_path, best_params, best_cfg)
                 print(f"arena promoted candidate at step={step} -> {best_path}")
 
-    final_params = _extract_host_params(params, use_pmap=use_pmap)
+        maybe_save_training_checkpoint(step, "periodic")
+
+    final_params = _extract_host_tree(params, use_pmap=use_pmap)
+    final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
     cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
-    _save_checkpoint(args.output, final_params, cfg)
-    print(f"saved checkpoint to {args.output}")
-    _save_checkpoint(best_path, best_params, cfg)
+    _save_training_checkpoint(
+        args.output,
+        params=final_params,
+        opt_state=final_opt_state,
+        config=cfg,
+        step=completed_step,
+        optimizer_updates=optimizer_updates,
+        rng_key=rng_key,
+        np_rng_state=np_rng.bit_generator.state,
+        replay_obs=replay_obs,
+        replay_policy=replay_policy,
+        replay_value=replay_value,
+        best_params=best_params,
+        best_step=best_step,
+    )
+    print(f"saved training checkpoint to {args.output}")
+    _save_model_checkpoint(best_path, best_params, cfg)
     print(f"saved best checkpoint to {best_path}")
 
 
