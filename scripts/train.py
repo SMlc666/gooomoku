@@ -94,6 +94,14 @@ def make_pmap_collect_step(play_many_games_fn):
     return collect_step
 
 
+def make_pmap_arena_step(arena_fn):
+    @functools.partial(jax.pmap, axis_name="device")
+    def arena_step(params_a, params_b, rng_key):
+        return arena_fn(params_a, params_b, rng_key)
+
+    return arena_step
+
+
 def _save_model_checkpoint(path: Path, params, config: dict) -> None:
     payload = {"params": jax.device_get(params), "config": config}
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,6 +480,8 @@ def main() -> None:
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
     if use_pmap and (args.games_per_step % local_devices != 0):
         raise ValueError(f"games-per-step must be divisible by local_device_count={local_devices}")
+    if use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
+        raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
 
     games_per_device = args.games_per_step // local_devices if use_pmap else args.games_per_step
     play_many_games_fn = build_play_many_games_fn(
@@ -487,14 +497,16 @@ def main() -> None:
     )
     arena_num_simulations = args.arena_num_simulations or args.num_simulations
     arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
+    arena_games_per_device = args.arena_games // local_devices if use_pmap else args.arena_games
     arena_fn = build_arena_fn(
         model=model,
         board_size=args.board_size,
         num_simulations=arena_num_simulations,
         max_num_considered_actions=arena_max_num_considered_actions,
-        num_games=args.arena_games,
+        num_games=arena_games_per_device,
         temperature=args.arena_temperature,
     )
+    pmap_arena_step = make_pmap_arena_step(arena_fn) if use_pmap else None
 
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
@@ -502,6 +514,7 @@ def main() -> None:
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
+        best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
         print(
             f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
             f"selfplay_games_per_device={games_per_device}, updates_per_step={args.updates_per_step}, "
@@ -511,6 +524,7 @@ def main() -> None:
         train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
+        best_params_repl = None
         print(
             f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
@@ -661,12 +675,20 @@ def main() -> None:
         )
 
         if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
-            current_params = _extract_host_tree(params, use_pmap=use_pmap)
             rng_key, arena_key = jax.random.split(rng_key)
-            arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
-            arena_wins = int(arena_wins)
-            arena_losses = int(arena_losses)
-            arena_draws = int(arena_draws)
+            if use_pmap:
+                arena_keys = jax.random.split(arena_key, local_devices)
+                arena_wins, arena_losses, arena_draws = pmap_arena_step(params, best_params_repl, arena_keys)
+                arena_wins = int(np.asarray(jax.device_get(arena_wins)).sum())
+                arena_losses = int(np.asarray(jax.device_get(arena_losses)).sum())
+                arena_draws = int(np.asarray(jax.device_get(arena_draws)).sum())
+                current_params = _extract_host_tree(params, use_pmap=use_pmap)
+            else:
+                current_params = _extract_host_tree(params, use_pmap=use_pmap)
+                arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
+                arena_wins = int(arena_wins)
+                arena_losses = int(arena_losses)
+                arena_draws = int(arena_draws)
             arena_win_rate = arena_wins / args.arena_games
             print(
                 f"arena step={step} candidate_w={arena_wins} candidate_l={arena_losses} "
@@ -674,6 +696,8 @@ def main() -> None:
             )
             if arena_win_rate >= args.arena_replace_threshold:
                 best_params = current_params
+                if use_pmap:
+                    best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
                 best_step = step
                 best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
                 _save_model_checkpoint(best_path, best_params, best_cfg)
