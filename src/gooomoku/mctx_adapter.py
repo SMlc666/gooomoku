@@ -347,7 +347,7 @@ def root_output(
     model: PolicyValueNet,
     states: env.GomokuState,
     *,
-    force_defense_heuristic: bool = False,
+    force_defense_at_root: bool = False,
 ) -> mctx.RootFnOutput:
     obs = env.batch_encode_states(states)
     logits, value = model.apply(params, obs)
@@ -355,7 +355,7 @@ def root_output(
     value = value.astype(jnp.float32)
     legal = env.batch_legal_action_mask(states)
     prior_logits = _masked_logits(logits, legal)
-    if force_defense_heuristic:
+    if force_defense_at_root:
         prior_logits = _force_defense_prior_logits(prior_logits, states)
     return mctx.RootFnOutput(prior_logits=prior_logits, value=value, embedding=states)
 
@@ -367,7 +367,7 @@ def recurrent_fn(
     embedding: env.GomokuState,
     *,
     model: PolicyValueNet,
-    force_defense_heuristic: bool = True,
+    force_defense_in_recurrent: bool = False,
 ):
     del rng_key
     next_state, reward, done = env.batch_step(embedding, action)
@@ -377,7 +377,7 @@ def recurrent_fn(
     value = value.astype(jnp.float32)
     legal = env.batch_legal_action_mask(next_state)
     prior_logits = _masked_logits(logits, legal)
-    if force_defense_heuristic:
+    if force_defense_in_recurrent:
         prior_logits = _force_defense_prior_logits(prior_logits, next_state)
     discount = jnp.where(done, jnp.float32(0.0), jnp.float32(-1.0))
     output = mctx.RecurrentFnOutput(
@@ -398,13 +398,14 @@ def run_gumbel_search(
     num_simulations: int,
     max_num_considered_actions: int,
     gumbel_scale: float = 1.0,
-    force_defense_heuristic: bool = False,
+    force_defense_at_root: bool = False,
+    force_defense_in_recurrent: bool = False,
 ):
     root = root_output(
         params=params,
         model=model,
         states=states,
-        force_defense_heuristic=force_defense_heuristic,
+        force_defense_at_root=force_defense_at_root,
     )
     invalid_actions = ~env.batch_legal_action_mask(states)
     return mctx.gumbel_muzero_policy(
@@ -414,7 +415,7 @@ def run_gumbel_search(
         recurrent_fn=functools.partial(
             recurrent_fn,
             model=model,
-            force_defense_heuristic=force_defense_heuristic,
+            force_defense_in_recurrent=force_defense_in_recurrent,
         ),
         num_simulations=num_simulations,
         invalid_actions=invalid_actions,
@@ -431,12 +432,13 @@ def build_search_fn(
     gumbel_scale: float = 1.0,
     root_dirichlet_fraction: float = 0.0,
     root_dirichlet_alpha: float = 0.03,
-    force_defense_heuristic: bool = True,
+    force_defense_at_root: bool = True,
+    force_defense_in_recurrent: bool = False,
 ):
     recurrent = functools.partial(
         recurrent_fn,
         model=model,
-        force_defense_heuristic=force_defense_heuristic,
+        force_defense_in_recurrent=force_defense_in_recurrent,
     )
     use_root_noise = root_dirichlet_fraction > 0.0
 
@@ -447,7 +449,7 @@ def build_search_fn(
             params=params,
             model=model,
             states=states,
-            force_defense_heuristic=force_defense_heuristic,
+            force_defense_at_root=force_defense_at_root,
         )
         invalid_actions = ~env.batch_legal_action_mask(states)
         if use_root_noise:
