@@ -52,6 +52,19 @@ def _sample_action_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperatu
     return jax.lax.cond(temperature <= 1e-6, greedy, sample, operand=None)
 
 
+def _sample_actions_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperature: jnp.ndarray) -> jnp.ndarray:
+    def greedy(_):
+        return jnp.argmax(visit_probs, axis=-1).astype(jnp.int32)
+
+    def sample(_):
+        safe_probs = jnp.maximum(visit_probs, 1e-8)
+        logits = jnp.log(safe_probs) / temperature
+        keys = jax.random.split(rng_key, visit_probs.shape[0])
+        return jax.vmap(lambda key, row: jax.random.categorical(key, row).astype(jnp.int32))(keys, logits)
+
+    return jax.lax.cond(temperature <= 1e-6, greedy, sample, operand=None)
+
+
 def build_play_one_game_fn(
     *,
     model: PolicyValueNet,
@@ -137,27 +150,94 @@ def build_play_many_games_fn(
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
 ):
-    play_one_fn = build_play_one_game_fn(
+    max_steps = board_size * board_size
+    num_actions = max_steps
+    init_state = env.reset(board_size)
+    batched_init_state = jax.tree_util.tree_map(
+        lambda x: jnp.broadcast_to(x, (num_games,) + x.shape),
+        init_state,
+    )
+    search_fn = build_search_fn(
         model=model,
         board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
-        temperature_drop_move=temperature_drop_move,
-        final_temperature=final_temperature,
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
     )
 
     @jax.jit
     def play_many_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
-        def body_fn(carry, _):
-            cur_key = carry
-            cur_key, game_key = jax.random.split(cur_key)
-            outputs = play_one_fn(params, game_key, temperature)
-            return cur_key, outputs
+        obs_buf = jnp.zeros((num_games, max_steps, board_size, board_size, 4), dtype=jnp.float32)
+        pi_buf = jnp.zeros((num_games, max_steps, num_actions), dtype=jnp.float32)
+        to_play_buf = jnp.zeros((num_games, max_steps), dtype=jnp.int8)
+        mask_buf = jnp.zeros((num_games, max_steps), dtype=jnp.bool_)
+        steps = jnp.zeros((num_games,), dtype=jnp.int32)
 
-        _, outputs = jax.lax.scan(body_fn, rng_key, xs=None, length=num_games)
-        return outputs
+        def cond_fn(carry):
+            cur_state, _, step_idx, _, _, _, _, _ = carry
+            return (step_idx < max_steps) & jnp.any(~cur_state.terminated)
+
+        def body_fn(carry):
+            cur_state, cur_key, step_idx, cur_obs, cur_pi, cur_to_play, cur_mask, cur_steps = carry
+            cur_key, search_key, sample_key = jax.random.split(cur_key, 3)
+
+            active = ~cur_state.terminated
+
+            def _replace_terminated(field, init_field):
+                mask = active
+                while mask.ndim < field.ndim:
+                    mask = mask[..., None]
+                return jnp.where(mask, field, init_field)
+
+            search_state = jax.tree_util.tree_map(_replace_terminated, cur_state, batched_init_state)
+            policy_output = search_fn(params, search_state, search_key)
+            visit_probs = policy_output.action_weights
+            move_temperature = jnp.where(
+                step_idx < jnp.int32(temperature_drop_move),
+                temperature,
+                jnp.float32(final_temperature),
+            )
+            action = _sample_actions_jax(visit_probs, sample_key, move_temperature)
+
+            obs = env.batch_encode_states(cur_state)
+            obs_to_store = jnp.where(active[:, None, None, None], obs, jnp.float32(0.0))
+            pi_to_store = jnp.where(active[:, None], visit_probs, jnp.float32(0.0))
+            to_play_to_store = jnp.where(active, cur_state.to_play, jnp.int8(0))
+
+            next_obs = cur_obs.at[:, step_idx].set(obs_to_store)
+            next_pi = cur_pi.at[:, step_idx].set(pi_to_store)
+            next_to_play = cur_to_play.at[:, step_idx].set(to_play_to_store)
+            next_mask = cur_mask.at[:, step_idx].set(active)
+            next_steps = cur_steps + active.astype(jnp.int32)
+
+            next_state, _, _ = env.batch_step(cur_state, action)
+            return (next_state, cur_key, step_idx + 1, next_obs, next_pi, next_to_play, next_mask, next_steps)
+
+        state, _, _, obs_buf, pi_buf, to_play_buf, mask_buf, steps = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (
+                batched_init_state,
+                rng_key,
+                jnp.int32(0),
+                obs_buf,
+                pi_buf,
+                to_play_buf,
+                mask_buf,
+                steps,
+            ),
+        )
+
+        winners = state.winner.astype(jnp.int8)
+        signed_values = jnp.where(
+            winners[:, None] == 0,
+            jnp.float32(0.0),
+            jnp.where(to_play_buf == winners[:, None], jnp.float32(1.0), jnp.float32(-1.0)),
+        )
+        value_buf = jnp.where(mask_buf, signed_values, jnp.float32(0.0))
+        pi_buf = jnp.where(mask_buf[:, :, None], pi_buf, jnp.float32(0.0))
+        return obs_buf, pi_buf, value_buf, mask_buf, steps, winners
 
     return play_many_fn
 
