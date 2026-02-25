@@ -21,7 +21,7 @@ class GomokuState:
 
 
 @functools.lru_cache(maxsize=None)
-def _line_start_masks(board_size: int):
+def _line_start_masks_np(board_size: int):
     num_actions = board_size * board_size
     east = np.zeros((num_actions,), dtype=np.bool_)
     south = np.zeros((num_actions,), dtype=np.bool_)
@@ -35,6 +35,11 @@ def _line_start_masks(board_size: int):
         diag_dr[idx[: board_size - 4, : board_size - 4].reshape(-1)] = True
         diag_dl[idx[: board_size - 4, 4:].reshape(-1)] = True
 
+    return east, south, diag_dr, diag_dl
+
+
+def _line_start_masks(board_size: int):
+    east, south, diag_dr, diag_dl = _line_start_masks_np(board_size)
     return (
         jnp.asarray(east),
         jnp.asarray(south),
