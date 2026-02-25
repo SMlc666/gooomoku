@@ -159,7 +159,6 @@ def build_play_many_games_fn(
     )
     search_fn = build_search_fn(
         model=model,
-        board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         root_dirichlet_fraction=root_dirichlet_fraction,
