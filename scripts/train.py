@@ -297,6 +297,55 @@ def _apply_dihedral_symmetry_policy(policy_grid: np.ndarray, symmetry_id: int) -
     return transformed
 
 
+def _apply_dihedral_symmetry_obs_jax(obs: jnp.ndarray, symmetry_id: jnp.ndarray) -> jnp.ndarray:
+    return jax.lax.switch(
+        symmetry_id,
+        (
+            lambda x: x,
+            lambda x: jnp.rot90(x, k=1, axes=(0, 1)),
+            lambda x: jnp.rot90(x, k=2, axes=(0, 1)),
+            lambda x: jnp.rot90(x, k=3, axes=(0, 1)),
+            lambda x: jnp.flip(x, axis=1),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=1, axes=(0, 1)),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=2, axes=(0, 1)),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=3, axes=(0, 1)),
+        ),
+        obs,
+    )
+
+
+def _apply_dihedral_symmetry_policy_jax(policy_grid: jnp.ndarray, symmetry_id: jnp.ndarray) -> jnp.ndarray:
+    return jax.lax.switch(
+        symmetry_id,
+        (
+            lambda x: x,
+            lambda x: jnp.rot90(x, k=1, axes=(0, 1)),
+            lambda x: jnp.rot90(x, k=2, axes=(0, 1)),
+            lambda x: jnp.rot90(x, k=3, axes=(0, 1)),
+            lambda x: jnp.flip(x, axis=1),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=1, axes=(0, 1)),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=2, axes=(0, 1)),
+            lambda x: jnp.rot90(jnp.flip(x, axis=1), k=3, axes=(0, 1)),
+        ),
+        policy_grid,
+    )
+
+
+@jax.jit
+def _augment_batch_with_random_symmetry_jax(
+    obs: jnp.ndarray,
+    policy: jnp.ndarray,
+    rng_key: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    batch_size = obs.shape[0]
+    board_size = obs.shape[1]
+    symmetry_ids = jax.random.randint(rng_key, (batch_size,), minval=0, maxval=8, dtype=jnp.int32)
+    policy_grid = policy.reshape((batch_size, board_size, board_size))
+    augmented_obs = jax.vmap(_apply_dihedral_symmetry_obs_jax)(obs, symmetry_ids)
+    augmented_policy_grid = jax.vmap(_apply_dihedral_symmetry_policy_jax)(policy_grid, symmetry_ids)
+    return augmented_obs, augmented_policy_grid.reshape((batch_size, board_size * board_size))
+
+
 def _augment_batch_with_random_symmetry(
     obs: np.ndarray,
     policy: np.ndarray,
@@ -344,6 +393,93 @@ def _append_replay(
         merged_policy = merged_policy[start:]
         merged_value = merged_value[start:]
     return merged_obs, merged_policy, merged_value
+
+
+def _init_device_replay(
+    replay_obs: np.ndarray,
+    replay_policy: np.ndarray,
+    replay_value: np.ndarray,
+    *,
+    replay_size: int,
+    board_size: int,
+):
+    num_actions = board_size * board_size
+    obs_dev = jnp.zeros((replay_size, board_size, board_size, 4), dtype=jnp.float32)
+    policy_dev = jnp.zeros((replay_size, num_actions), dtype=jnp.float32)
+    value_dev = jnp.zeros((replay_size,), dtype=jnp.float32)
+    replay_count = int(min(replay_obs.shape[0], replay_size))
+    replay_head = replay_count % replay_size if replay_size > 0 else 0
+    if replay_count > 0:
+        obs_dev = obs_dev.at[:replay_count].set(jnp.asarray(replay_obs[-replay_count:], dtype=jnp.float32))
+        policy_dev = policy_dev.at[:replay_count].set(jnp.asarray(replay_policy[-replay_count:], dtype=jnp.float32))
+        value_dev = value_dev.at[:replay_count].set(jnp.asarray(replay_value[-replay_count:], dtype=jnp.float32))
+    return obs_dev, policy_dev, value_dev, replay_head, replay_count
+
+
+def _append_replay_device(
+    replay_obs_dev: jnp.ndarray,
+    replay_policy_dev: jnp.ndarray,
+    replay_value_dev: jnp.ndarray,
+    *,
+    replay_head: int,
+    replay_count: int,
+    new_obs: np.ndarray,
+    new_policy: np.ndarray,
+    new_value: np.ndarray,
+):
+    capacity = int(replay_obs_dev.shape[0])
+    new_count = int(new_obs.shape[0])
+    if new_count <= 0 or capacity <= 0:
+        return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count
+
+    if new_count >= capacity:
+        tail_obs = jnp.asarray(new_obs[-capacity:], dtype=jnp.float32)
+        tail_policy = jnp.asarray(new_policy[-capacity:], dtype=jnp.float32)
+        tail_value = jnp.asarray(new_value[-capacity:], dtype=jnp.float32)
+        return tail_obs, tail_policy, tail_value, 0, capacity
+
+    first = min(new_count, capacity - replay_head)
+    if first > 0:
+        replay_obs_dev = replay_obs_dev.at[replay_head : replay_head + first].set(
+            jnp.asarray(new_obs[:first], dtype=jnp.float32)
+        )
+        replay_policy_dev = replay_policy_dev.at[replay_head : replay_head + first].set(
+            jnp.asarray(new_policy[:first], dtype=jnp.float32)
+        )
+        replay_value_dev = replay_value_dev.at[replay_head : replay_head + first].set(
+            jnp.asarray(new_value[:first], dtype=jnp.float32)
+        )
+
+    remaining = new_count - first
+    if remaining > 0:
+        replay_obs_dev = replay_obs_dev.at[:remaining].set(jnp.asarray(new_obs[first:], dtype=jnp.float32))
+        replay_policy_dev = replay_policy_dev.at[:remaining].set(jnp.asarray(new_policy[first:], dtype=jnp.float32))
+        replay_value_dev = replay_value_dev.at[:remaining].set(jnp.asarray(new_value[first:], dtype=jnp.float32))
+
+    replay_head = (replay_head + new_count) % capacity
+    replay_count = min(capacity, replay_count + new_count)
+    return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count
+
+
+def _materialize_replay_from_device(
+    replay_obs_dev: jnp.ndarray,
+    replay_policy_dev: jnp.ndarray,
+    replay_value_dev: jnp.ndarray,
+    *,
+    replay_count: int,
+):
+    if replay_count <= 0:
+        obs_shape = replay_obs_dev.shape[1:]
+        policy_dim = replay_policy_dev.shape[1]
+        return (
+            np.zeros((0,) + obs_shape, dtype=np.float32),
+            np.zeros((0, policy_dim), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    obs_np = np.asarray(jax.device_get(replay_obs_dev[:replay_count]), dtype=np.float32)
+    policy_np = np.asarray(jax.device_get(replay_policy_dev[:replay_count]), dtype=np.float32)
+    value_np = np.asarray(jax.device_get(replay_value_dev[:replay_count]), dtype=np.float32)
+    return obs_np, policy_np, value_np
 
 
 def main() -> None:
@@ -531,6 +667,13 @@ def main() -> None:
         )
 
     best_params = jax.tree_util.tree_map(jnp.asarray, best_params)
+    replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _init_device_replay(
+        replay_obs,
+        replay_policy,
+        replay_value,
+        replay_size=args.replay_size,
+        board_size=args.board_size,
+    )
     best_path = args.output.parent / f"{args.output.stem}.best{args.output.suffix}"
 
     def maybe_save_training_checkpoint(step: int, reason: str) -> None:
@@ -538,6 +681,12 @@ def main() -> None:
             return
         current_params = _extract_host_tree(params, use_pmap=use_pmap)
         current_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
+        replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_device(
+            replay_obs_dev,
+            replay_policy_dev,
+            replay_value_dev,
+            replay_count=replay_count,
+        )
         cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
         _save_training_checkpoint(
             args.output,
@@ -548,9 +697,9 @@ def main() -> None:
             optimizer_updates=optimizer_updates,
             rng_key=rng_key,
             np_rng_state=np_rng.bit_generator.state,
-            replay_obs=replay_obs,
-            replay_policy=replay_policy,
-            replay_value=replay_value,
+            replay_obs=replay_obs_np,
+            replay_policy=replay_policy_np,
+            replay_value=replay_value_np,
             best_params=best_params,
             best_step=best_step,
         )
@@ -595,18 +744,19 @@ def main() -> None:
         new_obs = flat_obs[valid]
         new_policy = flat_policy[valid]
         new_value = flat_value[valid]
-        replay_obs, replay_policy, replay_value = _append_replay(
-            replay_obs,
-            replay_policy,
-            replay_value,
-            new_obs,
-            new_policy,
-            new_value,
-            replay_size=args.replay_size,
+        replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
+            replay_obs_dev,
+            replay_policy_dev,
+            replay_value_dev,
+            replay_head=replay_head,
+            replay_count=replay_count,
+            new_obs=new_obs,
+            new_policy=new_policy,
+            new_value=new_value,
         )
 
-        if replay_obs.shape[0] < args.batch_size:
-            print(f"step={step} replay={replay_obs.shape[0]} waiting for enough samples")
+        if replay_count < args.batch_size:
+            print(f"step={step} replay={replay_count} waiting for enough samples")
             maybe_save_training_checkpoint(step, "replay-wait")
             continue
 
@@ -614,22 +764,20 @@ def main() -> None:
         policy_sum = 0.0
         value_sum = 0.0
         for _ in range(args.updates_per_step):
-            sample_ids = np_rng.integers(0, replay_obs.shape[0], size=args.batch_size)
-            obs_batch = replay_obs[sample_ids]
-            policy_batch = replay_policy[sample_ids]
-            value_batch = replay_value[sample_ids]
-
+            rng_key, sample_key = jax.random.split(rng_key)
+            sample_ids = jax.random.randint(
+                sample_key,
+                shape=(args.batch_size,),
+                minval=0,
+                maxval=replay_count,
+                dtype=jnp.int32,
+            )
+            obs = replay_obs_dev[sample_ids]
+            policy_target = replay_policy_dev[sample_ids]
+            value_target = replay_value_dev[sample_ids]
             if not args.disable_symmetry_augmentation:
-                obs_batch, policy_batch = _augment_batch_with_random_symmetry(
-                    obs_batch,
-                    policy_batch,
-                    board_size=args.board_size,
-                    np_rng=np_rng,
-                )
-
-            obs = jnp.asarray(obs_batch, dtype=jnp.float32)
-            policy_target = jnp.asarray(policy_batch, dtype=jnp.float32)
-            value_target = jnp.asarray(value_batch, dtype=jnp.float32)
+                rng_key, aug_key = jax.random.split(rng_key)
+                obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
 
             if use_pmap:
                 obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
@@ -670,7 +818,7 @@ def main() -> None:
 
         print(
             f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
-            f"replay={replay_obs.shape[0]} new_examples={new_examples} "
+            f"replay={replay_count} new_examples={new_examples} "
             f"bw={black_win} ww={white_win} d={draw}"
         )
 
@@ -707,6 +855,12 @@ def main() -> None:
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
     final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
+    replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_device(
+        replay_obs_dev,
+        replay_policy_dev,
+        replay_value_dev,
+        replay_count=replay_count,
+    )
     cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
     _save_training_checkpoint(
         args.output,
@@ -717,9 +871,9 @@ def main() -> None:
         optimizer_updates=optimizer_updates,
         rng_key=rng_key,
         np_rng_state=np_rng.bit_generator.state,
-        replay_obs=replay_obs,
-        replay_policy=replay_policy,
-        replay_value=replay_value,
+        replay_obs=replay_obs_np,
+        replay_policy=replay_policy_np,
+        replay_value=replay_value_np,
         best_params=best_params,
         best_step=best_step,
     )
