@@ -6,9 +6,12 @@ import os
 import pickle
 import queue as queue_lib
 from pathlib import Path
+from pathlib import PurePosixPath
+import subprocess
 import sys
 import threading
 import time
+import tempfile
 from typing import Any
 
 import jax
@@ -110,15 +113,89 @@ def make_pmap_arena_step(arena_fn):
     return arena_step
 
 
-def _save_model_checkpoint(path: Path, params, config: dict[str, Any]) -> None:
-    payload = {"params": jax.device_get(params), "config": config}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as fp:
+def _is_gcs_uri(path: str) -> bool:
+    return path.startswith("gs://")
+
+
+def _gcs_object_path(path: str) -> tuple[str, str]:
+    rest = path[5:]
+    if "/" not in rest:
+        raise ValueError(f"GCS path must include object name: {path}")
+    bucket, obj = rest.split("/", 1)
+    if not bucket or not obj:
+        raise ValueError(f"invalid GCS path: {path}")
+    return bucket, obj
+
+
+def _best_checkpoint_path(path: str) -> str:
+    if _is_gcs_uri(path):
+        bucket, obj = _gcs_object_path(path)
+        pure_obj = PurePosixPath(obj)
+        suffix = pure_obj.suffix
+        if suffix:
+            best_name = f"{pure_obj.stem}.best{suffix}"
+        else:
+            best_name = f"{pure_obj.name}.best"
+        best_obj = str(pure_obj.with_name(best_name))
+        return f"gs://{bucket}/{best_obj}"
+    local_path = Path(path)
+    return str(local_path.parent / f"{local_path.stem}.best{local_path.suffix}")
+
+
+def _write_pickle(path: str, payload: dict[str, Any]) -> None:
+    if _is_gcs_uri(path):
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            pickle.dump(payload, tmp)
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", str(tmp_path), path],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("gcloud CLI is required for gs:// checkpoint writes") from exc
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
+
+    local_path = Path(path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with local_path.open("wb") as fp:
         pickle.dump(payload, fp)
 
 
+def _read_pickle(path: str):
+    if _is_gcs_uri(path):
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            try:
+                subprocess.run(
+                    ["gcloud", "storage", "cp", path, str(tmp_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("gcloud CLI is required for gs:// checkpoint reads") from exc
+            with tmp_path.open("rb") as fp:
+                return pickle.load(fp)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    with Path(path).open("rb") as fp:
+        return pickle.load(fp)
+
+
+def _save_model_checkpoint(path: str, params, config: dict[str, Any]) -> None:
+    payload = {"params": jax.device_get(params), "config": config}
+    _write_pickle(path, payload)
+
+
 def _save_training_checkpoint(
-    path: Path,
+    path: str,
     *,
     params,
     opt_state,
@@ -148,14 +225,11 @@ def _save_training_checkpoint(
         "best_params": jax.device_get(best_params),
         "best_step": int(best_step),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as fp:
-        pickle.dump(payload, fp)
+    _write_pickle(path, payload)
 
 
-def _load_checkpoint_payload(path: Path):
-    with path.open("rb") as fp:
-        return pickle.load(fp)
+def _load_checkpoint_payload(path: str):
+    return _read_pickle(path)
 
 
 def _extract_host_tree(params, use_pmap: bool):
@@ -525,8 +599,8 @@ def main() -> None:
     parser.add_argument("--arena-max-num-considered-actions", type=int, default=None)
     parser.add_argument("--arena-temperature", type=float, default=0.0)
     parser.add_argument("--checkpoint-every-steps", type=int, default=10)
-    parser.add_argument("--resume-from", type=Path, default=None)
-    parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
+    parser.add_argument("--resume-from", type=str, default=None)
+    parser.add_argument("--output", type=str, default="checkpoints/latest.pkl")
     parser.add_argument("--disable-pmap", action="store_true")
     parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--async-selfplay", action="store_true")
@@ -726,7 +800,7 @@ def main() -> None:
         replay_size=args.replay_size,
         board_size=args.board_size,
     )
-    best_path = args.output.parent / f"{args.output.stem}.best{args.output.suffix}"
+    best_path = _best_checkpoint_path(args.output)
 
     def maybe_save_training_checkpoint(step: int, reason: str) -> None:
         if not is_chief:

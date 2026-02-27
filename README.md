@@ -71,6 +71,16 @@ PYTHONPATH=src python scripts/train.py \
   --output checkpoints/latest.pkl
 ```
 
+Native Cloud Storage checkpoints are also supported (without gcsfuse mount) by using `gs://` paths:
+
+```bash
+PYTHONPATH=src python scripts/train.py \
+  --resume-from gs://your-bucket/checkpoints/latest.pkl \
+  --output gs://your-bucket/checkpoints/latest.pkl
+```
+
+When using `gs://` paths, `gcloud` CLI must be available on the runtime host.
+
 ## TPU notes
 
 - Keep `--batch-size` divisible by `jax.local_device_count()` in pmap mode.
