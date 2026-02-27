@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import functools
 import pickle
+import queue as queue_lib
 from pathlib import Path
 import sys
+import threading
+import time
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +23,9 @@ from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 from scripts.self_play import build_play_many_games_fn
+
+SelfPlayBatch = tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
+ActorError = tuple[int, BaseException]
 
 
 def _dtype_from_name(name: str):
@@ -102,7 +109,7 @@ def make_pmap_arena_step(arena_fn):
     return arena_step
 
 
-def _save_model_checkpoint(path: Path, params, config: dict) -> None:
+def _save_model_checkpoint(path: Path, params, config: dict[str, Any]) -> None:
     payload = {"params": jax.device_get(params), "config": config}
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fp:
@@ -114,7 +121,7 @@ def _save_training_checkpoint(
     *,
     params,
     opt_state,
-    config: dict,
+    config: dict[str, Any],
     step: int,
     optimizer_updates: int,
     rng_key,
@@ -158,7 +165,7 @@ def _add_batch_dim_state(state: env.GomokuState) -> env.GomokuState:
     return jax.tree_util.tree_map(lambda x: x[None, ...], state)
 
 
-def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict:
+def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str, Any]:
     return {
         "board_size": args.board_size,
         "channels": args.channels,
@@ -184,6 +191,9 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict:
         "arena_max_num_considered_actions": args.arena_max_num_considered_actions,
         "arena_temperature": args.arena_temperature,
         "checkpoint_every_steps": args.checkpoint_every_steps,
+        "async_selfplay": args.async_selfplay,
+        "selfplay_actors": args.selfplay_actors,
+        "actor_param_sync_updates": args.actor_param_sync_updates,
         "optimizer_updates": optimizer_updates,
         "best_step": best_step,
     }
@@ -517,6 +527,11 @@ def main() -> None:
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
+    parser.add_argument("--async-selfplay", action="store_true")
+    parser.add_argument("--async-selfplay-queue-size", type=int, default=4)
+    parser.add_argument("--selfplay-actors", type=int, default=1)
+    parser.add_argument("--actor-param-sync-updates", type=int, default=1)
+    parser.add_argument("--selfplay-batch-games", type=int, default=None)
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
@@ -533,6 +548,12 @@ def main() -> None:
         raise ValueError("arena-replace-threshold must be in (0, 1]")
     if args.checkpoint_every_steps < 0:
         raise ValueError("checkpoint-every-steps must be >= 0")
+    if args.async_selfplay_queue_size < 1:
+        raise ValueError("async-selfplay-queue-size must be >= 1")
+    if args.selfplay_actors < 1:
+        raise ValueError("selfplay-actors must be >= 1")
+    if args.actor_param_sync_updates < 1:
+        raise ValueError("actor-param-sync-updates must be >= 1")
 
     model = PolicyValueNet(
         board_size=args.board_size,
@@ -614,12 +635,15 @@ def main() -> None:
     use_pmap = (not args.disable_pmap) and local_devices > 1
     if use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
-    if use_pmap and (args.games_per_step % local_devices != 0):
+    selfplay_batch_games = args.selfplay_batch_games or args.games_per_step
+    if selfplay_batch_games < 1:
+        raise ValueError("selfplay-batch-games must be >= 1")
+    if use_pmap and (selfplay_batch_games % local_devices != 0):
         raise ValueError(f"games-per-step must be divisible by local_device_count={local_devices}")
     if use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
         raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
 
-    games_per_device = args.games_per_step // local_devices if use_pmap else args.games_per_step
+    games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
     play_many_games_fn = build_play_many_games_fn(
         model=model,
         board_size=args.board_size,
@@ -653,7 +677,9 @@ def main() -> None:
         best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
         print(
             f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
-            f"selfplay_games_per_device={games_per_device}, updates_per_step={args.updates_per_step}, "
+            f"selfplay_games_per_device={games_per_device}, async_selfplay={args.async_selfplay}, "
+            f"selfplay_actors={args.selfplay_actors}, actor_param_sync_updates={args.actor_param_sync_updates}, "
+            f"updates_per_step={args.updates_per_step}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
@@ -663,6 +689,8 @@ def main() -> None:
         best_params_repl = None
         print(
             f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}, "
+            f"async_selfplay={args.async_selfplay}, selfplay_actors={args.selfplay_actors}, "
+            f"actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
@@ -706,26 +734,32 @@ def main() -> None:
         print(f"saved training checkpoint ({reason}) to {args.output}")
 
     completed_step = start_step - 1
-    if start_step > args.train_steps:
-        print(
-            f"resume start_step={start_step} is beyond train_steps={args.train_steps}; "
-            "skipping update loop and saving checkpoint."
-        )
-    for step in range(start_step, args.train_steps + 1):
-        completed_step = step
-        rng_key, collect_key = jax.random.split(rng_key)
+    replay_queue: queue_lib.Queue[SelfPlayBatch] | None = None
+    actor_stop: threading.Event | None = None
+    actor_errors: list[ActorError] = []
+    params_ref_lock: threading.Lock | None = None
+    params_ref: list[Any] | None = None
+    actor_threads: list[threading.Thread] = []
+    actor_stats_lock = threading.Lock()
+    actor_batches_total = 0
+    actor_examples_total = 0
+    learner_wait_total_sec = 0.0
+    learner_wait_count = 0
+    train_start_time = time.perf_counter()
+
+    def collect_new_examples(params_for_collect, collect_rng_key):
         if use_pmap:
-            collect_keys = jax.random.split(collect_key, local_devices)
+            collect_keys = jax.random.split(collect_rng_key, local_devices)
             collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
             obs, policy, value, mask, _, winners = collect_step(
-                params,
+                params_for_collect,
                 collect_keys,
                 collect_temperature,
             )
         else:
             obs, policy, value, mask, _, winners = collect_step(
-                params,
-                collect_key,
+                params_for_collect,
+                collect_rng_key,
                 jnp.float32(args.temperature),
             )
 
@@ -741,117 +775,247 @@ def main() -> None:
         flat_value = value_np.reshape((-1,))
         valid = mask_np.reshape((-1,)).astype(bool)
 
-        new_obs = flat_obs[valid]
-        new_policy = flat_policy[valid]
-        new_value = flat_value[valid]
-        replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
-            replay_obs_dev,
-            replay_policy_dev,
-            replay_value_dev,
-            replay_head=replay_head,
-            replay_count=replay_count,
-            new_obs=new_obs,
-            new_policy=new_policy,
-            new_value=new_value,
+        return (
+            flat_obs[valid],
+            flat_policy[valid],
+            flat_value[valid],
+            int((winners_np == 1).sum()),
+            int((winners_np == -1).sum()),
+            int((winners_np == 0).sum()),
+            int(valid.sum()),
         )
 
-        if replay_count < args.batch_size:
-            print(f"step={step} replay={replay_count} waiting for enough samples")
-            maybe_save_training_checkpoint(step, "replay-wait")
-            continue
+    if args.async_selfplay:
+        replay_queue = queue_lib.Queue(maxsize=args.async_selfplay_queue_size)
+        actor_stop = threading.Event()
+        params_ref_lock = threading.Lock()
+        params_ref = [params]
 
-        loss_sum = 0.0
-        policy_sum = 0.0
-        value_sum = 0.0
-        for _ in range(args.updates_per_step):
-            rng_key, sample_key = jax.random.split(rng_key)
-            sample_ids = jax.random.randint(
-                sample_key,
-                shape=(args.batch_size,),
-                minval=0,
-                maxval=replay_count,
-                dtype=jnp.int32,
+        def actor_loop(actor_idx: int) -> None:
+            nonlocal actor_batches_total, actor_examples_total
+            actor_rng = jax.random.PRNGKey(args.seed + 9973 + actor_idx * 100003)
+            while actor_stop is not None and (not actor_stop.is_set()):
+                try:
+                    if params_ref_lock is None or params_ref is None:
+                        break
+                    with params_ref_lock:
+                        collect_params = params_ref[0]
+                    actor_rng, collect_key = jax.random.split(actor_rng)
+                    payload = collect_new_examples(collect_params, collect_key)
+                    assert replay_queue is not None
+                    while actor_stop is not None and (not actor_stop.is_set()):
+                        try:
+                            replay_queue.put(payload, timeout=0.2)
+                            with actor_stats_lock:
+                                actor_batches_total += 1
+                                actor_examples_total += payload[6]
+                            break
+                        except queue_lib.Full:
+                            continue
+                except BaseException as exc:
+                    actor_errors.append((actor_idx, exc))
+                    if actor_stop is not None:
+                        actor_stop.set()
+                    break
+
+        for actor_idx in range(args.selfplay_actors):
+            actor_thread = threading.Thread(
+                target=actor_loop,
+                args=(actor_idx,),
+                name=f"selfplay-actor-{actor_idx}",
+                daemon=True,
             )
-            obs = replay_obs_dev[sample_ids]
-            policy_target = replay_policy_dev[sample_ids]
-            value_target = replay_value_dev[sample_ids]
-            if not args.disable_symmetry_augmentation:
-                rng_key, aug_key = jax.random.split(rng_key)
-                obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
+            actor_thread.start()
+            actor_threads.append(actor_thread)
 
-            if use_pmap:
-                obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
-                policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
-                value_target = value_target.reshape((local_devices, per_device_batch))
-                params, opt_state, loss, policy_loss, value_loss = train_step(
-                    params,
-                    opt_state,
-                    obs,
-                    policy_target,
-                    value_target,
-                )
-                loss_sum += float(loss[0])
-                policy_sum += float(policy_loss[0])
-                value_sum += float(value_loss[0])
-            else:
-                params, opt_state, loss, policy_loss, value_loss = train_step(
-                    params,
-                    opt_state,
-                    obs,
-                    policy_target,
-                    value_target,
-                )
-                loss_sum += float(loss)
-                policy_sum += float(policy_loss)
-                value_sum += float(value_loss)
-            optimizer_updates += 1
-
-        loss_val = loss_sum / args.updates_per_step
-        pol_val = policy_sum / args.updates_per_step
-        val_val = value_sum / args.updates_per_step
-        lr_val = float(lr_schedule(jnp.asarray(max(optimizer_updates - 1, 0), dtype=jnp.int32)))
-
-        black_win = int((winners_np == 1).sum())
-        white_win = int((winners_np == -1).sum())
-        draw = int((winners_np == 0).sum())
-        new_examples = int(valid.sum())
-
+    if start_step > args.train_steps:
         print(
-            f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
-            f"replay={replay_count} new_examples={new_examples} "
-            f"bw={black_win} ww={white_win} d={draw}"
+            f"resume start_step={start_step} is beyond train_steps={args.train_steps}; "
+            "skipping update loop and saving checkpoint."
         )
+    try:
+        for step in range(start_step, args.train_steps + 1):
+            completed_step = step
+            step_start = time.perf_counter()
+            collect_wait_ms = 0.0
+            if actor_errors:
+                actor_idx, exc = actor_errors[0]
+                raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
 
-        if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
-            rng_key, arena_key = jax.random.split(rng_key)
-            if use_pmap:
-                arena_keys = jax.random.split(arena_key, local_devices)
-                arena_wins, arena_losses, arena_draws = pmap_arena_step(params, best_params_repl, arena_keys)
-                arena_wins = int(np.asarray(jax.device_get(arena_wins)).sum())
-                arena_losses = int(np.asarray(jax.device_get(arena_losses)).sum())
-                arena_draws = int(np.asarray(jax.device_get(arena_draws)).sum())
-                current_params = _extract_host_tree(params, use_pmap=use_pmap)
+            if args.async_selfplay:
+                assert replay_queue is not None
+                assert actor_stop is not None
+                wait_start = time.perf_counter()
+                while True:
+                    if actor_errors:
+                        actor_idx, exc = actor_errors[0]
+                        raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
+                    try:
+                        (
+                            new_obs,
+                            new_policy,
+                            new_value,
+                            black_win,
+                            white_win,
+                            draw,
+                            new_examples,
+                        ) = replay_queue.get(timeout=0.5)
+                        break
+                    except queue_lib.Empty:
+                        if actor_stop.is_set() and actor_errors:
+                            actor_idx, exc = actor_errors[0]
+                            raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
+                        continue
+                wait_sec = time.perf_counter() - wait_start
+                collect_wait_ms = wait_sec * 1000.0
+                learner_wait_total_sec += wait_sec
+                learner_wait_count += 1
             else:
-                current_params = _extract_host_tree(params, use_pmap=use_pmap)
-                arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
-                arena_wins = int(arena_wins)
-                arena_losses = int(arena_losses)
-                arena_draws = int(arena_draws)
-            arena_win_rate = arena_wins / args.arena_games
-            print(
-                f"arena step={step} candidate_w={arena_wins} candidate_l={arena_losses} "
-                f"draw={arena_draws} win_rate={arena_win_rate:.3f} threshold={args.arena_replace_threshold:.3f}"
-            )
-            if arena_win_rate >= args.arena_replace_threshold:
-                best_params = current_params
-                if use_pmap:
-                    best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
-                best_step = step
-                best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
-                _save_model_checkpoint(best_path, best_params, best_cfg)
-                print(f"arena promoted candidate at step={step} -> {best_path}")
+                rng_key, collect_key = jax.random.split(rng_key)
+                collect_start = time.perf_counter()
+                (
+                    new_obs,
+                    new_policy,
+                    new_value,
+                    black_win,
+                    white_win,
+                    draw,
+                    new_examples,
+                ) = collect_new_examples(params, collect_key)
+                collect_wait_ms = (time.perf_counter() - collect_start) * 1000.0
 
-        maybe_save_training_checkpoint(step, "periodic")
+            replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
+                replay_obs_dev,
+                replay_policy_dev,
+                replay_value_dev,
+                replay_head=replay_head,
+                replay_count=replay_count,
+                new_obs=new_obs,
+                new_policy=new_policy,
+                new_value=new_value,
+            )
+
+            if replay_count < args.batch_size:
+                print(f"step={step} replay={replay_count} waiting for enough samples")
+                maybe_save_training_checkpoint(step, "replay-wait")
+                continue
+
+            loss_sum = 0.0
+            policy_sum = 0.0
+            value_sum = 0.0
+            for _ in range(args.updates_per_step):
+                rng_key, sample_key = jax.random.split(rng_key)
+                sample_ids = jax.random.randint(
+                    sample_key,
+                    shape=(args.batch_size,),
+                    minval=0,
+                    maxval=replay_count,
+                    dtype=jnp.int32,
+                )
+                obs = replay_obs_dev[sample_ids]
+                policy_target = replay_policy_dev[sample_ids]
+                value_target = replay_value_dev[sample_ids]
+                if not args.disable_symmetry_augmentation:
+                    rng_key, aug_key = jax.random.split(rng_key)
+                    obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
+
+                if use_pmap:
+                    obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                    policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
+                    value_target = value_target.reshape((local_devices, per_device_batch))
+                    params, opt_state, loss, policy_loss, value_loss = train_step(
+                        params,
+                        opt_state,
+                        obs,
+                        policy_target,
+                        value_target,
+                    )
+                    loss_sum += float(loss[0])
+                    policy_sum += float(policy_loss[0])
+                    value_sum += float(value_loss[0])
+                else:
+                    params, opt_state, loss, policy_loss, value_loss = train_step(
+                        params,
+                        opt_state,
+                        obs,
+                        policy_target,
+                        value_target,
+                    )
+                    loss_sum += float(loss)
+                    policy_sum += float(policy_loss)
+                    value_sum += float(value_loss)
+                optimizer_updates += 1
+
+                if (
+                    args.async_selfplay
+                    and params_ref_lock is not None
+                    and params_ref is not None
+                    and (optimizer_updates % args.actor_param_sync_updates == 0)
+                ):
+                    with params_ref_lock:
+                        params_ref[0] = params
+
+            loss_val = loss_sum / args.updates_per_step
+            pol_val = policy_sum / args.updates_per_step
+            val_val = value_sum / args.updates_per_step
+            lr_val = float(lr_schedule(jnp.asarray(max(optimizer_updates - 1, 0), dtype=jnp.int32)))
+            step_ms = (time.perf_counter() - step_start) * 1000.0
+            elapsed_sec = max(time.perf_counter() - train_start_time, 1e-6)
+            with actor_stats_lock:
+                actor_batches_snapshot = actor_batches_total
+                actor_examples_snapshot = actor_examples_total
+            actor_examples_per_sec = actor_examples_snapshot / elapsed_sec
+            actor_batches_per_sec = actor_batches_snapshot / elapsed_sec
+            avg_wait_ms = (
+                (learner_wait_total_sec / learner_wait_count) * 1000.0 if learner_wait_count > 0 else 0.0
+            )
+            queue_size = replay_queue.qsize() if replay_queue is not None else 0
+
+            print(
+                f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
+                f"replay={replay_count} new_examples={new_examples} "
+                f"bw={black_win} ww={white_win} d={draw} "
+                f"step_ms={step_ms:.1f} collect_ms={collect_wait_ms:.1f} wait_avg_ms={avg_wait_ms:.1f} "
+                f"qsize={queue_size} actor_batches={actor_batches_snapshot} actor_examples={actor_examples_snapshot} "
+                f"actor_bps={actor_batches_per_sec:.2f} actor_eps={actor_examples_per_sec:.1f}"
+            )
+
+            if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
+                rng_key, arena_key = jax.random.split(rng_key)
+                if use_pmap:
+                    arena_keys = jax.random.split(arena_key, local_devices)
+                    assert pmap_arena_step is not None
+                    arena_wins, arena_losses, arena_draws = pmap_arena_step(params, best_params_repl, arena_keys)
+                    arena_wins = int(np.asarray(jax.device_get(arena_wins)).sum())
+                    arena_losses = int(np.asarray(jax.device_get(arena_losses)).sum())
+                    arena_draws = int(np.asarray(jax.device_get(arena_draws)).sum())
+                    current_params = _extract_host_tree(params, use_pmap=use_pmap)
+                else:
+                    current_params = _extract_host_tree(params, use_pmap=use_pmap)
+                    arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
+                    arena_wins = int(arena_wins)
+                    arena_losses = int(arena_losses)
+                    arena_draws = int(arena_draws)
+                arena_win_rate = arena_wins / args.arena_games
+                print(
+                    f"arena step={step} candidate_w={arena_wins} candidate_l={arena_losses} "
+                    f"draw={arena_draws} win_rate={arena_win_rate:.3f} threshold={args.arena_replace_threshold:.3f}"
+                )
+                if arena_win_rate >= args.arena_replace_threshold:
+                    best_params = current_params
+                    if use_pmap:
+                        best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
+                    best_step = step
+                    best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
+                    _save_model_checkpoint(best_path, best_params, best_cfg)
+                    print(f"arena promoted candidate at step={step} -> {best_path}")
+
+            maybe_save_training_checkpoint(step, "periodic")
+    finally:
+        if actor_stop is not None:
+            actor_stop.set()
+        for actor_thread in actor_threads:
+            actor_thread.join(timeout=5.0)
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
     final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
