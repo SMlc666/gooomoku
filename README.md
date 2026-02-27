@@ -75,6 +75,8 @@ PYTHONPATH=src python scripts/train.py \
 
 - Keep `--batch-size` divisible by `jax.local_device_count()` in pmap mode.
 - To force single-device fallback: add `--disable-pmap`.
+- For multi-host TPU slices (for example v4-16 with 2 workers), launch `scripts/train.py` on **all workers** and keep `--distributed-init auto` (default) or set `--distributed-init on` to require `jax.distributed.initialize()`.
+- Training checkpoint writes are chief-only (`process_index == 0`) in distributed mode to avoid multi-host file write races.
 - This is a minimal baseline focused on structure and correctness, not peak throughput.
 
 ## Suggested next upgrades

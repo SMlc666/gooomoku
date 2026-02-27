@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 import pickle
 import queue as queue_lib
 from pathlib import Path
@@ -527,6 +528,7 @@ def main() -> None:
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--disable-pmap", action="store_true")
+    parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--async-selfplay", action="store_true")
     parser.add_argument("--async-selfplay-queue-size", type=int, default=4)
     parser.add_argument("--selfplay-actors", type=int, default=1)
@@ -554,6 +556,20 @@ def main() -> None:
         raise ValueError("selfplay-actors must be >= 1")
     if args.actor_param_sync_updates < 1:
         raise ValueError("actor-param-sync-updates must be >= 1")
+
+    distributed_initialized = False
+    if args.distributed_init != "off":
+        should_try_distributed = args.distributed_init == "on" or any(
+            k in os.environ for k in ("TPU_WORKER_ID", "CLOUD_TPU_TASK_ID", "MEGASCALE_COORDINATOR_ADDRESS")
+        )
+        if should_try_distributed:
+            try:
+                jax.distributed.initialize()
+                distributed_initialized = True
+            except RuntimeError as exc:
+                if args.distributed_init == "on":
+                    raise
+                print(f"distributed-init skipped: {exc}")
 
     model = PolicyValueNet(
         board_size=args.board_size,
@@ -631,7 +647,11 @@ def main() -> None:
             f"optimizer_updates={optimizer_updates} replay={replay_obs.shape[0]}"
         )
 
+    process_count = jax.process_count()
+    process_index = jax.process_index()
+    is_chief = process_index == 0
     local_devices = jax.local_device_count()
+    global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
     if use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
@@ -676,7 +696,9 @@ def main() -> None:
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
         best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
         print(
-            f"pmap enabled: local_device_count={local_devices}, per_device_batch={per_device_batch}, "
+            f"pmap enabled: process={process_index}/{process_count}, local_device_count={local_devices}, "
+            f"global_device_count={global_devices}, distributed_initialized={distributed_initialized}, "
+            f"per_device_batch={per_device_batch}, "
             f"selfplay_games_per_device={games_per_device}, async_selfplay={args.async_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"updates_per_step={args.updates_per_step}, "
@@ -688,7 +710,9 @@ def main() -> None:
         per_device_batch = args.batch_size
         best_params_repl = None
         print(
-            f"single-device mode: local_device_count={local_devices}, updates_per_step={args.updates_per_step}, "
+            f"single-device mode: process={process_index}/{process_count}, local_device_count={local_devices}, "
+            f"global_device_count={global_devices}, distributed_initialized={distributed_initialized}, "
+            f"updates_per_step={args.updates_per_step}, "
             f"async_selfplay={args.async_selfplay}, selfplay_actors={args.selfplay_actors}, "
             f"actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
@@ -705,6 +729,8 @@ def main() -> None:
     best_path = args.output.parent / f"{args.output.stem}.best{args.output.suffix}"
 
     def maybe_save_training_checkpoint(step: int, reason: str) -> None:
+        if not is_chief:
+            return
         if args.checkpoint_every_steps <= 0 or (step % args.checkpoint_every_steps != 0):
             return
         current_params = _extract_host_tree(params, use_pmap=use_pmap)
@@ -1006,9 +1032,10 @@ def main() -> None:
                     if use_pmap:
                         best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
                     best_step = step
-                    best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
-                    _save_model_checkpoint(best_path, best_params, best_cfg)
-                    print(f"arena promoted candidate at step={step} -> {best_path}")
+                    if is_chief:
+                        best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
+                        _save_model_checkpoint(best_path, best_params, best_cfg)
+                        print(f"arena promoted candidate at step={step} -> {best_path}")
 
             maybe_save_training_checkpoint(step, "periodic")
     finally:
@@ -1026,24 +1053,25 @@ def main() -> None:
         replay_count=replay_count,
     )
     cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
-    _save_training_checkpoint(
-        args.output,
-        params=final_params,
-        opt_state=final_opt_state,
-        config=cfg,
-        step=completed_step,
-        optimizer_updates=optimizer_updates,
-        rng_key=rng_key,
-        np_rng_state=np_rng.bit_generator.state,
-        replay_obs=replay_obs_np,
-        replay_policy=replay_policy_np,
-        replay_value=replay_value_np,
-        best_params=best_params,
-        best_step=best_step,
-    )
-    print(f"saved training checkpoint to {args.output}")
-    _save_model_checkpoint(best_path, best_params, cfg)
-    print(f"saved best checkpoint to {best_path}")
+    if is_chief:
+        _save_training_checkpoint(
+            args.output,
+            params=final_params,
+            opt_state=final_opt_state,
+            config=cfg,
+            step=completed_step,
+            optimizer_updates=optimizer_updates,
+            rng_key=rng_key,
+            np_rng_state=np_rng.bit_generator.state,
+            replay_obs=replay_obs_np,
+            replay_policy=replay_policy_np,
+            replay_value=replay_value_np,
+            best_params=best_params,
+            best_step=best_step,
+        )
+        print(f"saved training checkpoint to {args.output}")
+        _save_model_checkpoint(best_path, best_params, cfg)
+        print(f"saved best checkpoint to {best_path}")
 
 
 if __name__ == "__main__":
