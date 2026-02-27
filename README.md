@@ -82,3 +82,70 @@ PYTHONPATH=src python scripts/train.py \
 1. Batched self-play actors with `lax.scan` and device sharding.
 2. Replay prioritization and better temperature schedule.
 3. Arena evaluation and best-model gating.
+
+## Web PvAI platform (JAX GPU inference)
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+For NVIDIA GPU inference, install CUDA-enabled JAX wheel first (example for CUDA 12):
+
+```bash
+pip install -U "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```
+
+Run web service (model artifact can be `.pkl` or `.tar.gz` containing a `.pkl` checkpoint):
+
+```bash
+PYTHONPATH=src python scripts/web_play.py \
+  --model-artifact "/home/shenmo/Downloads/sb (2).tar.gz" \
+  --board-size 15 \
+  --channels 96 \
+  --blocks 8 \
+  --num-simulations 256 \
+  --max-num-considered-actions 64 \
+  --compute-dtype bfloat16 \
+  --param-dtype float32 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Optional: verify artifact integrity with SHA256:
+
+```bash
+sha256sum "/home/shenmo/Downloads/sb (2).tar.gz"
+PYTHONPATH=src python scripts/web_play.py \
+  --model-artifact "/home/shenmo/Downloads/sb (2).tar.gz" \
+  --artifact-sha256 "<sha256-of-artifact>"
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Health endpoint:
+
+```text
+http://127.0.0.1:8000/api/health
+```
+
+### Parameter mapping from your training command
+
+Your training command contains these architecture/search arguments that must match for inference:
+
+- `--board-size 15`
+- `--channels 96`
+- `--blocks 8`
+- `--num-simulations 256`
+- `--max-num-considered-actions 64`
+- `--compute-dtype bfloat16`
+- `--param-dtype float32`
+
+`scripts/web_play.py` will prefer checkpoint `config` values if present, otherwise it falls back to the CLI values above.
+
+Security note: model artifacts are loaded via pickle payload schema; only use trusted artifacts. You can enable SHA256 verification with `--artifact-sha256`.

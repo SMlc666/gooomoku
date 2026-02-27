@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>gooomoku 网页对弈</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #111827;
+        color: #f9fafb;
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      .panel {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+      button {
+        border: none;
+        padding: 8px 14px;
+        border-radius: 8px;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button.secondary {
+        background: #334155;
+      }
+      #status {
+        margin: 10px 0;
+        color: #cbd5e1;
+      }
+      .board {
+        display: grid;
+        gap: 1px;
+        background: #334155;
+        width: fit-content;
+        border: 1px solid #475569;
+      }
+      .cell {
+        width: 34px;
+        height: 34px;
+        background: #f1f5f9;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+      }
+      .stone {
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+      }
+      .black {
+        background: #111827;
+      }
+      .white {
+        background: #f8fafc;
+        border: 1px solid #cbd5e1;
+      }
+      .hint {
+        color: #94a3b8;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>gooomoku 网页端人机对弈</h1>
+      <div class="panel">
+        <button id="newBlack">新局（我执黑先手）</button>
+        <button id="newWhite" class="secondary">新局（我执白后手）</button>
+      </div>
+      <div id="status">初始化中...</div>
+      <div id="board" class="board"></div>
+      <div class="hint">点击空位落子，AI 会自动应手。</div>
+    </div>
+
+    <script>
+      let board = [];
+      let history = [];
+      let humanColor = 1;
+      let boardSize = 15;
+      let busy = false;
+      let terminated = false;
+
+      function actionToRC(action) {
+        return { r: Math.floor(action / boardSize), c: action % boardSize };
+      }
+
+      function rcToAction(r, c) {
+        return r * boardSize + c;
+      }
+
+      function setStatus(text) {
+        document.getElementById("status").textContent = text;
+      }
+
+      function renderBoard() {
+        const boardEl = document.getElementById("board");
+        boardEl.style.gridTemplateColumns = `repeat(${boardSize}, 34px)`;
+        boardEl.innerHTML = "";
+
+        for (let r = 0; r < boardSize; r += 1) {
+          for (let c = 0; c < boardSize; c += 1) {
+            const cell = document.createElement("div");
+            cell.className = "cell";
+            const v = board[r][c];
+            if (v !== 0) {
+              const stone = document.createElement("div");
+              stone.className = `stone ${v === 1 ? "black" : "white"}`;
+              cell.appendChild(stone);
+            }
+            cell.addEventListener("click", () => onClickCell(r, c));
+            boardEl.appendChild(cell);
+          }
+        }
+      }
+
+      function winnerText(winner) {
+        if (winner === 1) return "黑胜";
+        if (winner === -1) return "白胜";
+        return "和棋";
+      }
+
+      async function startNewGame(color) {
+        busy = true;
+        humanColor = color;
+        setStatus("正在创建新对局...");
+        const resp = await fetch(`/api/new?human_color=${color}`, { method: "POST" });
+        if (!resp.ok) {
+          setStatus(`新局失败: ${await resp.text()}`);
+          busy = false;
+          return;
+        }
+
+        const data = await resp.json();
+        board = data.board;
+        history = data.history;
+        boardSize = board.length;
+        terminated = data.status !== "ongoing";
+        renderBoard();
+        if (terminated) {
+          setStatus(`对局结束：${winnerText(data.winner)}`);
+        } else {
+          setStatus(`新局开始：你执${humanColor === 1 ? "黑" : "白"}`);
+        }
+        busy = false;
+      }
+
+      async function onClickCell(r, c) {
+        if (busy || terminated) return;
+        const action = rcToAction(r, c);
+        if (board[r][c] !== 0) {
+          setStatus("该位置已有棋子");
+          return;
+        }
+
+        busy = true;
+        setStatus("AI 思考中...");
+        const resp = await fetch("/api/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            history,
+            human_action: action,
+            human_color: humanColor,
+          }),
+        });
+
+        if (!resp.ok) {
+          setStatus(`落子失败: ${await resp.text()}`);
+          busy = false;
+          return;
+        }
+
+        const data = await resp.json();
+        board = data.board;
+        history = data.history;
+        terminated = data.terminated;
+        renderBoard();
+        if (terminated) {
+          setStatus(`对局结束：${winnerText(data.winner)}`);
+        } else {
+          const aiText = data.ai_action == null ? "无" : `${actionToRC(data.ai_action).r + 1},${actionToRC(data.ai_action).c + 1}`;
+          setStatus(`你已落子，AI 应手坐标: ${aiText}`);
+        }
+        busy = false;
+      }
+
+      document.getElementById("newBlack").addEventListener("click", () => startNewGame(1));
+      document.getElementById("newWhite").addEventListener("click", () => startNewGame(-1));
+
+      startNewGame(1);
+    </script>
+  </body>
+</html>
