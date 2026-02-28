@@ -1551,6 +1551,12 @@ def main() -> None:
     parser.add_argument("--replay-port", type=int, default=19091)
     parser.add_argument("--param-sync-port", type=int, default=19092)
     parser.add_argument("--remote-replay-queue-size", type=int, default=64)
+    parser.add_argument(
+        "--learner-drain-max-batches",
+        type=int,
+        default=16,
+        help="Max additional network replay batches drained per learner step.",
+    )
     parser.add_argument("--replay-connect-retry-seconds", type=float, default=2.0)
     parser.add_argument("--actor-param-source", choices=("auto", "network", "checkpoint"), default="auto")
     parser.add_argument("--param-sync-every-steps", type=int, default=1)
@@ -1593,6 +1599,8 @@ def main() -> None:
         raise ValueError("replay-fixed-update-size must be >= 0")
     if args.remote_replay_queue_size < 1:
         raise ValueError("remote-replay-queue-size must be >= 1")
+    if args.learner_drain_max_batches < 0:
+        raise ValueError("learner-drain-max-batches must be >= 0")
     if args.replay_port <= 0:
         raise ValueError("replay-port must be > 0")
     if args.param_sync_port <= 0:
@@ -2210,6 +2218,25 @@ def main() -> None:
                 collect_wait_ms = wait_sec * 1000.0
                 learner_wait_total_sec += wait_sec
                 learner_wait_count += 1
+                payloads_to_append: list[SelfPlayBatch] = [
+                    (new_obs, new_policy, new_value, black_win, white_win, draw, new_examples)
+                ]
+                if args.learner_drain_max_batches > 0:
+                    drained = 0
+                    while drained < args.learner_drain_max_batches:
+                        try:
+                            drained_payload = replay_queue.get_nowait()
+                        except queue_lib.Empty:
+                            break
+                        payloads_to_append.append(drained_payload)
+                        with actor_stats_lock:
+                            actor_batches_total += 1
+                            actor_examples_total += drained_payload[6]
+                        drained += 1
+                new_examples = int(sum(item[6] for item in payloads_to_append))
+                black_win = int(sum(item[3] for item in payloads_to_append))
+                white_win = int(sum(item[4] for item in payloads_to_append))
+                draw = int(sum(item[5] for item in payloads_to_append))
             elif args.async_selfplay:
                 assert actor_stop is not None
                 wait_start = time.perf_counter()
@@ -2281,16 +2308,29 @@ def main() -> None:
                 collect_wait_ms = (time.perf_counter() - collect_start) * 1000.0
 
             replay_append_start = time.perf_counter()
-            replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
-                replay_obs_dev,
-                replay_policy_dev,
-                replay_value_dev,
-                replay_head=replay_head,
-                replay_count=replay_count,
-                new_obs=new_obs,
-                new_policy=new_policy,
-                new_value=new_value,
-            )
+            if args.role == "learner":
+                for payload in payloads_to_append:
+                    replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
+                        replay_obs_dev,
+                        replay_policy_dev,
+                        replay_value_dev,
+                        replay_head=replay_head,
+                        replay_count=replay_count,
+                        new_obs=payload[0],
+                        new_policy=payload[1],
+                        new_value=payload[2],
+                    )
+            else:
+                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
+                    replay_obs_dev,
+                    replay_policy_dev,
+                    replay_value_dev,
+                    replay_head=replay_head,
+                    replay_count=replay_count,
+                    new_obs=new_obs,
+                    new_policy=new_policy,
+                    new_value=new_value,
+                )
             replay_append_ms = (time.perf_counter() - replay_append_start) * 1000.0
 
             if replay_count < args.batch_size:
