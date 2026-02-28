@@ -2299,6 +2299,14 @@ def main() -> None:
                 obs_stack = jnp.stack(obs_batches, axis=0)
                 policy_stack = jnp.stack(policy_batches, axis=0)
                 value_stack = jnp.stack(value_batches, axis=0)
+                if use_pmap:
+                    # pmap maps over leading axis (local_devices). For fused updates we first
+                    # stack by update index, so move device axis to front before calling pmap.
+                    # Before: [updates_per_step, local_devices, per_device_batch, ...]
+                    # After:  [local_devices, updates_per_step, per_device_batch, ...]
+                    obs_stack = jnp.swapaxes(obs_stack, 0, 1)
+                    policy_stack = jnp.swapaxes(policy_stack, 0, 1)
+                    value_stack = jnp.swapaxes(value_stack, 0, 1)
                 params, opt_state, loss_mean, policy_mean, value_mean = train_step_multi(
                     params,
                     opt_state,
