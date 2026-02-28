@@ -1864,7 +1864,7 @@ def main() -> None:
         else:
             actor_stop = threading.Event()
             params_ref_lock = threading.Lock()
-            params_ref = [params]
+            params_ref = [_clone_tree(params)]
             actor_collect_steps = None
             if use_pmap:
                 assert actor_device_groups is not None
@@ -2135,7 +2135,7 @@ def main() -> None:
                                 pass
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
-                            params_ref[0] = params
+                            params_ref[0] = _clone_tree(params)
 
             if (
                 args.role == "learner"
