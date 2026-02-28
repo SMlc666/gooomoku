@@ -1255,10 +1255,16 @@ def _start_remote_replay_listener(host: str, port: int, queue_size: int):
                 try:
                     payload = recv_selfplay_batch(conn)
                 except ReplayWireError as exc:
+                    if "socket closed while receiving replay frame" in str(exc):
+                        # Peer closed connection gracefully between frames.
+                        break
                     if not stop_event.is_set():
                         listener_errors.append(RuntimeError(f"replay wire error from {addr}: {exc}"))
                     break
                 except OSError as exc:
+                    if exc.errno in (32, 104):
+                        # Broken pipe / connection reset from actor shutdown.
+                        break
                     if not stop_event.is_set():
                         listener_errors.append(RuntimeError(f"socket error from {addr}: {exc}"))
                     break
@@ -1702,6 +1708,7 @@ def main() -> None:
     train_start_time = time.perf_counter()
     remote_stop_event: threading.Event | None = None
     remote_listener_errors: list[BaseException] = []
+    remote_listener_error_count = 0
     remote_server_sock: socket.socket | None = None
     remote_accept_thread: threading.Thread | None = None
     remote_client_threads: list[threading.Thread] = []
@@ -1710,10 +1717,13 @@ def main() -> None:
     param_sync_snapshot_state: dict[str, Any] | None = None
     param_sync_stop_event: threading.Event | None = None
     param_sync_errors: list[BaseException] = []
+    param_sync_error_count = 0
     param_sync_server_sock: socket.socket | None = None
     param_sync_accept_thread: threading.Thread | None = None
     param_sync_client_threads: list[threading.Thread] = []
     param_sync_client_threads_lock: threading.Lock | None = None
+    learner_wait_log_interval_sec = 30.0
+    learner_last_wait_log_at = time.perf_counter()
 
     def collect_new_examples(params_for_collect, collect_rng_key):
         if use_pmap:
@@ -1948,9 +1958,15 @@ def main() -> None:
                 wait_start = time.perf_counter()
                 while True:
                     if remote_listener_errors:
-                        raise RuntimeError(f"remote replay listener failed: {remote_listener_errors[0]}")
+                        if len(remote_listener_errors) > remote_listener_error_count:
+                            latest = remote_listener_errors[-1]
+                            remote_listener_error_count = len(remote_listener_errors)
+                            print(f"learner replay listener warning: {latest}")
                     if param_sync_errors:
-                        raise RuntimeError(f"param sync server failed: {param_sync_errors[0]}")
+                        if len(param_sync_errors) > param_sync_error_count:
+                            latest = param_sync_errors[-1]
+                            param_sync_error_count = len(param_sync_errors)
+                            print(f"learner param-sync warning: {latest}")
                     try:
                         (
                             new_obs,
@@ -1966,6 +1982,15 @@ def main() -> None:
                             actor_examples_total += new_examples
                         break
                     except queue_lib.Empty:
+                        now = time.perf_counter()
+                        if now - learner_last_wait_log_at >= learner_wait_log_interval_sec:
+                            learner_last_wait_log_at = now
+                            print(
+                                "learner waiting for replay batch "
+                                f"qsize={replay_queue.qsize()} "
+                                f"listener_warnings={remote_listener_error_count} "
+                                f"param_sync_warnings={param_sync_error_count}"
+                            )
                         continue
                 wait_sec = time.perf_counter() - wait_start
                 collect_wait_ms = wait_sec * 1000.0
