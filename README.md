@@ -97,6 +97,7 @@ When diagnosing intermittent stalls (for example long gaps between `step=...` li
 - `--wait-log-interval-seconds` (default `30.0`): heartbeat interval while waiting for replay batches.
 - `--phase-log-threshold-ms` (default `5000.0`): emits `phase-slow` logs when collect/replay-append/train-updates/param-snapshot/arena/checkpoint exceeds this latency.
 - `--detailed-step-log`: adds per-step phase timings (`replay_append_ms`, `train_updates_ms`, `param_snapshot_ms`) to the regular `step=...` line.
+- Multi-update training now runs in a fused JAX step by default when `updates-per-step > 1` (higher training throughput without changing CLI commands). Use `--disable-fused-train-updates` only for A/B debugging.
 - `--replay-fixed-update-size` (default `0`): if set (for example `4096`), each self-play payload is normalized to a fixed example count (truncate/repeat valid rows) to stabilize replay append tensor shapes and reduce repeated JAX recompiles caused by variable `new_examples`.
 
 Example (more verbose diagnostics):

@@ -229,6 +229,86 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
     return train_step
 
 
+def make_single_multi_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
+    def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
+        def one_update(carry, inputs):
+            current_params, current_opt_state = carry
+            obs, policy_target, value_target = inputs
+
+            def loss_fn(trainable):
+                logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+                logits = logits.astype(jnp.float32)
+                value = value.astype(jnp.float32)
+                policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
+                value_loss = jnp.mean(jnp.square(value - value_target))
+                reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
+                total_loss = policy_loss + value_loss + reg
+                return total_loss, (policy_loss, value_loss)
+
+            (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
+            updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
+            next_params = optax.apply_updates(current_params, updates)
+            return (next_params, next_opt_state), (loss, policy_loss, value_loss)
+
+        (new_params, new_opt_state), (losses, policy_losses, value_losses) = jax.lax.scan(
+            one_update,
+            (params, opt_state),
+            (obs_batches, policy_batches, value_batches),
+        )
+        return (
+            new_params,
+            new_opt_state,
+            jnp.mean(losses),
+            jnp.mean(policy_losses),
+            jnp.mean(value_losses),
+        )
+
+    return train_step
+
+
+def make_pmap_multi_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+    @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
+    def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
+        def one_update(carry, inputs):
+            current_params, current_opt_state = carry
+            obs, policy_target, value_target = inputs
+
+            def loss_fn(trainable):
+                logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+                logits = logits.astype(jnp.float32)
+                value = value.astype(jnp.float32)
+                policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
+                value_loss = jnp.mean(jnp.square(value - value_target))
+                reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
+                total_loss = policy_loss + value_loss + reg
+                return total_loss, (policy_loss, value_loss)
+
+            (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
+            grads = jax.lax.pmean(grads, axis_name="device")
+            loss = jax.lax.pmean(loss, axis_name="device")
+            policy_loss = jax.lax.pmean(policy_loss, axis_name="device")
+            value_loss = jax.lax.pmean(value_loss, axis_name="device")
+            updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
+            next_params = optax.apply_updates(current_params, updates)
+            return (next_params, next_opt_state), (loss, policy_loss, value_loss)
+
+        (new_params, new_opt_state), (losses, policy_losses, value_losses) = jax.lax.scan(
+            one_update,
+            (params, opt_state),
+            (obs_batches, policy_batches, value_batches),
+        )
+        return (
+            new_params,
+            new_opt_state,
+            jnp.mean(losses),
+            jnp.mean(policy_losses),
+            jnp.mean(value_losses),
+        )
+
+    return train_step
+
+
 def make_pmap_collect_step(play_many_games_fn, *, devices=None):
     def collect_step(params, rng_key, temperature):
         return play_many_games_fn(params, rng_key, temperature)
@@ -1450,6 +1530,11 @@ def main() -> None:
     parser.add_argument("--wait-log-interval-seconds", type=float, default=30.0)
     parser.add_argument("--phase-log-threshold-ms", type=float, default=5000.0)
     parser.add_argument("--detailed-step-log", action="store_true")
+    parser.add_argument(
+        "--disable-fused-train-updates",
+        action="store_true",
+        help="Disable fused multi-update train step and keep one-jit-call-per-update behavior.",
+    )
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
@@ -1645,6 +1730,7 @@ def main() -> None:
         return
 
     games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
+    fused_train_updates = args.updates_per_step > 1 and (not args.disable_fused_train_updates)
     actor_device_groups = None
     actor_devices_per_group = 0
     if args.async_selfplay and (not args.cross_process_selfplay) and use_pmap:
@@ -1690,6 +1776,7 @@ def main() -> None:
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
         train_step = make_pmap_train_step(model, optimizer, weight_decay=args.weight_decay)
+        train_step_multi = make_pmap_multi_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
@@ -1702,11 +1789,13 @@ def main() -> None:
             f"cross_process_selfplay={args.cross_process_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"updates_per_step={args.updates_per_step}, "
+            f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
         train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
+        train_step_multi = make_single_multi_train_step(model, optimizer, weight_decay=args.weight_decay)
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
         best_params_repl = None
@@ -1717,6 +1806,7 @@ def main() -> None:
             f"async_selfplay={args.async_selfplay}, cross_process_selfplay={args.cross_process_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, "
             f"actor_param_sync_updates={args.actor_param_sync_updates}, "
+            f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
@@ -2172,53 +2262,63 @@ def main() -> None:
             policy_sum = 0.0
             value_sum = 0.0
             train_updates_start = time.perf_counter()
-            for _ in range(args.updates_per_step):
-                rng_key, sample_key = jax.random.split(rng_key)
-                sample_ids = jax.random.randint(
-                    sample_key,
-                    shape=(args.batch_size,),
-                    minval=0,
-                    maxval=replay_count,
-                    dtype=jnp.int32,
+            if fused_train_updates:
+                obs_batches = []
+                policy_batches = []
+                value_batches = []
+                for _ in range(args.updates_per_step):
+                    rng_key, sample_key = jax.random.split(rng_key)
+                    sample_ids = jax.random.randint(
+                        sample_key,
+                        shape=(args.batch_size,),
+                        minval=0,
+                        maxval=replay_count,
+                        dtype=jnp.int32,
+                    )
+                    obs = replay_obs_dev[sample_ids]
+                    policy_target = replay_policy_dev[sample_ids]
+                    value_target = replay_value_dev[sample_ids]
+                    if not args.disable_symmetry_augmentation:
+                        rng_key, aug_key = jax.random.split(rng_key)
+                        obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
+
+                    if use_pmap:
+                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                        policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
+                        value_target = value_target.reshape((local_devices, per_device_batch))
+
+                    obs_batches.append(obs)
+                    policy_batches.append(policy_target)
+                    value_batches.append(value_target)
+
+                obs_stack = jnp.stack(obs_batches, axis=0)
+                policy_stack = jnp.stack(policy_batches, axis=0)
+                value_stack = jnp.stack(value_batches, axis=0)
+                params, opt_state, loss_mean, policy_mean, value_mean = train_step_multi(
+                    params,
+                    opt_state,
+                    obs_stack,
+                    policy_stack,
+                    value_stack,
                 )
-                obs = replay_obs_dev[sample_ids]
-                policy_target = replay_policy_dev[sample_ids]
-                value_target = replay_value_dev[sample_ids]
-                if not args.disable_symmetry_augmentation:
-                    rng_key, aug_key = jax.random.split(rng_key)
-                    obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
-
                 if use_pmap:
-                    obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
-                    policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
-                    value_target = value_target.reshape((local_devices, per_device_batch))
-                    params, opt_state, loss, policy_loss, value_loss = train_step(
-                        params,
-                        opt_state,
-                        obs,
-                        policy_target,
-                        value_target,
-                    )
-                    loss_sum += float(loss[0])
-                    policy_sum += float(policy_loss[0])
-                    value_sum += float(value_loss[0])
+                    loss_scalar = float(loss_mean[0])
+                    policy_scalar = float(policy_mean[0])
+                    value_scalar = float(value_mean[0])
                 else:
-                    params, opt_state, loss, policy_loss, value_loss = train_step(
-                        params,
-                        opt_state,
-                        obs,
-                        policy_target,
-                        value_target,
-                    )
-                    loss_sum += float(loss)
-                    policy_sum += float(policy_loss)
-                    value_sum += float(value_loss)
-                optimizer_updates += 1
-
-                if (
+                    loss_scalar = float(loss_mean)
+                    policy_scalar = float(policy_mean)
+                    value_scalar = float(value_mean)
+                loss_sum = loss_scalar * args.updates_per_step
+                policy_sum = policy_scalar * args.updates_per_step
+                value_sum = value_scalar * args.updates_per_step
+                prev_optimizer_updates = optimizer_updates
+                optimizer_updates += args.updates_per_step
+                should_sync_actor_params = (
                     args.async_selfplay
-                    and (optimizer_updates % args.actor_param_sync_updates == 0)
-                ):
+                    and ((prev_optimizer_updates // args.actor_param_sync_updates) != (optimizer_updates // args.actor_param_sync_updates))
+                )
+                if should_sync_actor_params:
                     if args.cross_process_selfplay:
                         params_host = _extract_host_tree(params, use_pmap=use_pmap)
                         params_host = jax.device_get(params_host)
@@ -2235,6 +2335,70 @@ def main() -> None:
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
                             params_ref[0] = _clone_tree(params)
+            else:
+                for _ in range(args.updates_per_step):
+                    rng_key, sample_key = jax.random.split(rng_key)
+                    sample_ids = jax.random.randint(
+                        sample_key,
+                        shape=(args.batch_size,),
+                        minval=0,
+                        maxval=replay_count,
+                        dtype=jnp.int32,
+                    )
+                    obs = replay_obs_dev[sample_ids]
+                    policy_target = replay_policy_dev[sample_ids]
+                    value_target = replay_value_dev[sample_ids]
+                    if not args.disable_symmetry_augmentation:
+                        rng_key, aug_key = jax.random.split(rng_key)
+                        obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
+
+                    if use_pmap:
+                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                        policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
+                        value_target = value_target.reshape((local_devices, per_device_batch))
+                        params, opt_state, loss, policy_loss, value_loss = train_step(
+                            params,
+                            opt_state,
+                            obs,
+                            policy_target,
+                            value_target,
+                        )
+                        loss_sum += float(loss[0])
+                        policy_sum += float(policy_loss[0])
+                        value_sum += float(value_loss[0])
+                    else:
+                        params, opt_state, loss, policy_loss, value_loss = train_step(
+                            params,
+                            opt_state,
+                            obs,
+                            policy_target,
+                            value_target,
+                        )
+                        loss_sum += float(loss)
+                        policy_sum += float(policy_loss)
+                        value_sum += float(value_loss)
+                    optimizer_updates += 1
+
+                    if (
+                        args.async_selfplay
+                        and (optimizer_updates % args.actor_param_sync_updates == 0)
+                    ):
+                        if args.cross_process_selfplay:
+                            params_host = _extract_host_tree(params, use_pmap=use_pmap)
+                            params_host = jax.device_get(params_host)
+                            for param_q in actor_params_queues:
+                                try:
+                                    while True:
+                                        param_q.get_nowait()
+                                except queue_lib.Empty:
+                                    pass
+                                try:
+                                    param_q.put_nowait(params_host)
+                                except queue_lib.Full:
+                                    pass
+                        elif params_ref_lock is not None and params_ref is not None:
+                            with params_ref_lock:
+                                params_ref[0] = _clone_tree(params)
             train_updates_ms = (time.perf_counter() - train_updates_start) * 1000.0
 
             if (
