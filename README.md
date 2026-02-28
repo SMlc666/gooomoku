@@ -90,6 +90,44 @@ When using `gs://` paths, `gcloud` CLI must be available on the runtime host.
 - Training checkpoint writes are chief-only (`process_index == 0`) in distributed mode to avoid multi-host file write races.
 - This is a minimal baseline focused on structure and correctness, not peak throughput.
 
+### Role-separated learner/actor mode (TPU actors)
+
+`scripts/train.py` now supports `--role all|learner|actor` (default `all`).
+
+- `--role learner`: receives self-play batches from network (`--replay-host/--replay-port`) and trains.
+- `--role actor`: runs self-play and pushes batches to learner over TCP; can use TPU in-process (`pmap`) because it is no longer cross-process in the same VM.
+
+Example split deployment:
+
+```bash
+# learner host
+PYTHONPATH=src python scripts/train.py \
+  --role learner \
+  --replay-host 0.0.0.0 \
+  --replay-port 19091 \
+  --train-steps 500 \
+  --batch-size 1024 \
+  --updates-per-step 16 \
+  --checkpoint-every-steps 20 \
+  --output checkpoints/latest.pkl
+
+# actor host (TPU-enabled)
+PYTHONPATH=src python scripts/train.py \
+  --role actor \
+  --jax-platforms tpu \
+  --replay-host <learner-ip> \
+  --replay-port 19091 \
+  --selfplay-batch-games 128 \
+  --num-simulations 64 \
+  --resume-from checkpoints/latest.pkl \
+  --actor-sync-every-batches 8
+```
+
+Notes:
+- Actor role syncs parameters by reloading `--resume-from` checkpoint periodically.
+- `--replay-host` can be wildcard (`0.0.0.0`) for learner bind, but actor must use a routable learner IP/hostname.
+- Existing `--role all` behavior is unchanged.
+
 ## Suggested next upgrades
 
 1. Batched self-play actors with `lax.scan` and device sharding.

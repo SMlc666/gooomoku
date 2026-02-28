@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import pickle
 import queue as queue_lib
+import socket
 from pathlib import Path
 from pathlib import PurePosixPath
 import subprocess
@@ -27,6 +28,10 @@ sys.path.append(str(REPO_ROOT / "src"))
 from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
+from gooomoku.replay_wire import ReplayWireError
+from gooomoku.replay_wire import connect_with_retry
+from gooomoku.replay_wire import recv_selfplay_batch
+from gooomoku.replay_wire import send_selfplay_batch
 from gooomoku.runtime import configure_jax_runtime
 from scripts.self_play import build_play_many_games_fn
 
@@ -720,6 +725,210 @@ def _pack_collect_payload(
     )
 
 
+def _maybe_reload_actor_params(
+    *,
+    resume_from: str | None,
+    use_pmap: bool,
+    local_devices: int,
+    last_optimizer_updates: int,
+):
+    if resume_from is None:
+        return None, last_optimizer_updates
+    payload = _load_checkpoint_payload(resume_from)
+    if "params" not in payload:
+        raise ValueError(f"invalid actor resume checkpoint (missing params): {resume_from}")
+    ckpt_optimizer_updates = int(payload.get("optimizer_updates", -1))
+    if ckpt_optimizer_updates >= 0 and ckpt_optimizer_updates <= last_optimizer_updates:
+        return None, last_optimizer_updates
+    loaded = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+    if use_pmap:
+        loaded = _replicate_tree_for_pmap(loaded, local_devices=local_devices)
+    return loaded, ckpt_optimizer_updates
+
+
+def _run_actor_role(
+    *,
+    args,
+    model: PolicyValueNet,
+    params,
+    use_pmap: bool,
+    local_devices: int,
+    process_index: int,
+    selfplay_batch_games: int,
+):
+    if args.replay_port <= 0:
+        raise ValueError("replay-port must be > 0 for --role actor")
+    if not args.replay_host.strip():
+        raise ValueError("replay-host must be non-empty for --role actor")
+    if args.replay_host.strip() in {"0.0.0.0", "::"}:
+        raise ValueError("--replay-host cannot be a wildcard address for --role actor; use learner hostname/IP")
+
+    games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
+    play_many_games_fn = build_play_many_games_fn(
+        model=model,
+        board_size=args.board_size,
+        num_simulations=args.num_simulations,
+        max_num_considered_actions=args.max_num_considered_actions,
+        num_games=games_per_device,
+        temperature_drop_move=args.temperature_drop_move,
+        final_temperature=args.final_temperature,
+        root_dirichlet_fraction=args.root_dirichlet_fraction,
+        root_dirichlet_alpha=args.root_dirichlet_alpha,
+    )
+    collect_step = make_pmap_collect_step(play_many_games_fn) if use_pmap else play_many_games_fn
+
+    if use_pmap:
+        params = _replicate_tree_for_pmap(params, local_devices=local_devices)
+
+    last_optimizer_updates = -1
+    loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
+        resume_from=args.resume_from,
+        use_pmap=use_pmap,
+        local_devices=local_devices,
+        last_optimizer_updates=last_optimizer_updates,
+    )
+    if loaded_params is not None:
+        params = loaded_params
+        print(f"actor[{process_index}] loaded params from {args.resume_from} optimizer_updates={last_optimizer_updates}")
+
+    sock = connect_with_retry(args.replay_host, args.replay_port, args.replay_connect_retry_seconds)
+    print(
+        f"actor[{process_index}] connected to learner replay endpoint {args.replay_host}:{args.replay_port} "
+        f"use_pmap={use_pmap} local_device_count={local_devices} games_per_batch={selfplay_batch_games}"
+    )
+
+    rng_key = jax.random.PRNGKey(args.seed + 300001 * (process_index + 1))
+    sent_batches = 0
+    sent_examples = 0
+    steps_limit = int(args.actor_steps)
+    sync_every = int(args.actor_sync_every_batches)
+    start_time = time.perf_counter()
+    try:
+        while steps_limit <= 0 or sent_batches < steps_limit:
+            rng_key, collect_key = jax.random.split(rng_key)
+            if use_pmap:
+                collect_keys = jax.random.split(collect_key, local_devices)
+                collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
+                obs, policy, value, mask, _, winners = collect_step(
+                    params,
+                    collect_keys,
+                    collect_temperature,
+                )
+            else:
+                obs, policy, value, mask, _, winners = collect_step(
+                    params,
+                    collect_key,
+                    jnp.float32(args.temperature),
+                )
+
+            payload = _pack_collect_payload(
+                obs=obs,
+                policy=policy,
+                value=value,
+                mask=mask,
+                winners=winners,
+                board_size=args.board_size,
+            )
+            send_selfplay_batch(sock, payload)
+            sent_batches += 1
+            sent_examples += payload[6]
+
+            if sync_every > 0 and args.resume_from is not None and (sent_batches % sync_every == 0):
+                loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
+                    resume_from=args.resume_from,
+                    use_pmap=use_pmap,
+                    local_devices=local_devices,
+                    last_optimizer_updates=last_optimizer_updates,
+                )
+                if loaded_params is not None:
+                    params = loaded_params
+                    print(
+                        f"actor[{process_index}] synced params from {args.resume_from} "
+                        f"optimizer_updates={last_optimizer_updates}"
+                    )
+
+            if sent_batches % 10 == 0:
+                elapsed = max(time.perf_counter() - start_time, 1e-6)
+                print(
+                    f"actor[{process_index}] sent_batches={sent_batches} sent_examples={sent_examples} "
+                    f"examples_per_sec={sent_examples / elapsed:.1f}"
+                )
+    finally:
+        sock.close()
+
+
+def _start_remote_replay_listener(host: str, port: int, queue_size: int):
+    replay_queue: queue_lib.Queue[SelfPlayBatch] = queue_lib.Queue(maxsize=queue_size)
+    stop_event = threading.Event()
+    listener_errors: list[BaseException] = []
+    client_threads: list[threading.Thread] = []
+    client_threads_lock = threading.Lock()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((host, port))
+    server_sock.listen()
+    server_sock.settimeout(1.0)
+
+    def client_loop(conn: socket.socket, addr: tuple[str, int]) -> None:
+        with conn:
+            while not stop_event.is_set():
+                try:
+                    payload = recv_selfplay_batch(conn)
+                except ReplayWireError as exc:
+                    if not stop_event.is_set():
+                        listener_errors.append(RuntimeError(f"replay wire error from {addr}: {exc}"))
+                    break
+                except OSError as exc:
+                    if not stop_event.is_set():
+                        listener_errors.append(RuntimeError(f"socket error from {addr}: {exc}"))
+                    break
+                while not stop_event.is_set():
+                    try:
+                        replay_queue.put(payload, timeout=0.2)
+                        break
+                    except queue_lib.Full:
+                        continue
+
+    def accept_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                conn, addr = server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not stop_event.is_set():
+                    listener_errors.append(RuntimeError(f"replay listener accept failed: {exc}"))
+                break
+            worker = threading.Thread(target=client_loop, args=(conn, addr), daemon=True, name=f"replay-client-{addr[0]}:{addr[1]}")
+            worker.start()
+            with client_threads_lock:
+                client_threads.append(worker)
+
+    accept_thread = threading.Thread(target=accept_loop, daemon=True, name="replay-listener")
+    accept_thread.start()
+    return replay_queue, stop_event, listener_errors, server_sock, accept_thread, client_threads, client_threads_lock
+
+
+def _stop_remote_replay_listener(
+    *,
+    stop_event,
+    server_sock: socket.socket | None,
+    accept_thread: threading.Thread | None,
+    client_threads: list[threading.Thread],
+    client_threads_lock: threading.Lock,
+) -> None:
+    stop_event.set()
+    if server_sock is not None:
+        server_sock.close()
+    if accept_thread is not None:
+        accept_thread.join(timeout=5.0)
+    with client_threads_lock:
+        snapshot = list(client_threads)
+    for worker in snapshot:
+        worker.join(timeout=1.0)
+
+
 def main() -> None:
     configure_jax_runtime(app_name="train", repo_root=REPO_ROOT)
     parser = argparse.ArgumentParser(description="Minimal JAX+mctx gomoku trainer.")
@@ -728,6 +937,7 @@ def main() -> None:
     parser.add_argument("--blocks", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-steps", type=int, default=50)
+    parser.add_argument("--role", choices=("all", "learner", "actor"), default="all")
     parser.add_argument("--games-per-step", type=int, default=8)
     parser.add_argument("--updates-per-step", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -775,6 +985,12 @@ def main() -> None:
     parser.add_argument("--selfplay-actors", type=int, default=1)
     parser.add_argument("--actor-param-sync-updates", type=int, default=1)
     parser.add_argument("--selfplay-batch-games", type=int, default=None)
+    parser.add_argument("--replay-host", type=str, default="0.0.0.0")
+    parser.add_argument("--replay-port", type=int, default=19091)
+    parser.add_argument("--remote-replay-queue-size", type=int, default=64)
+    parser.add_argument("--replay-connect-retry-seconds", type=float, default=2.0)
+    parser.add_argument("--actor-steps", type=int, default=0)
+    parser.add_argument("--actor-sync-every-batches", type=int, default=8)
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
@@ -797,6 +1013,20 @@ def main() -> None:
         raise ValueError("selfplay-actors must be >= 1")
     if args.actor_param_sync_updates < 1:
         raise ValueError("actor-param-sync-updates must be >= 1")
+    if args.remote_replay_queue_size < 1:
+        raise ValueError("remote-replay-queue-size must be >= 1")
+    if args.replay_port <= 0:
+        raise ValueError("replay-port must be > 0")
+    if args.replay_connect_retry_seconds <= 0:
+        raise ValueError("replay-connect-retry-seconds must be > 0")
+    if args.actor_steps < 0:
+        raise ValueError("actor-steps must be >= 0")
+    if args.actor_sync_every_batches < 0:
+        raise ValueError("actor-sync-every-batches must be >= 0")
+
+    if args.role in {"actor", "learner"}:
+        args.async_selfplay = False
+        args.cross_process_selfplay = False
     actor_jax_platforms = args.actor_jax_platforms.strip()
     learner_jax_platforms = args.jax_platforms.strip()
     if learner_jax_platforms:
@@ -923,15 +1153,27 @@ def main() -> None:
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
-    if use_pmap and (args.batch_size % local_devices != 0):
+    if args.role != "actor" and use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
     selfplay_batch_games = args.selfplay_batch_games or args.games_per_step
     if selfplay_batch_games < 1:
         raise ValueError("selfplay-batch-games must be >= 1")
     if use_pmap and (selfplay_batch_games % local_devices != 0):
         raise ValueError(f"games-per-step must be divisible by local_device_count={local_devices}")
-    if use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
+    if args.role != "actor" and use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
         raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
+
+    if args.role == "actor":
+        _run_actor_role(
+            args=args,
+            model=model,
+            params=params,
+            use_pmap=use_pmap,
+            local_devices=local_devices,
+            process_index=process_index,
+            selfplay_batch_games=selfplay_batch_games,
+        )
+        return
 
     games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
     actor_device_groups = None
@@ -1065,6 +1307,12 @@ def main() -> None:
     learner_wait_total_sec = 0.0
     learner_wait_count = 0
     train_start_time = time.perf_counter()
+    remote_stop_event: threading.Event | None = None
+    remote_listener_errors: list[BaseException] = []
+    remote_server_sock: socket.socket | None = None
+    remote_accept_thread: threading.Thread | None = None
+    remote_client_threads: list[threading.Thread] = []
+    remote_client_threads_lock: threading.Lock | None = None
 
     def collect_new_examples(params_for_collect, collect_rng_key):
         if use_pmap:
@@ -1090,7 +1338,26 @@ def main() -> None:
             board_size=args.board_size,
         )
 
-    if args.async_selfplay:
+    if args.role == "learner":
+        (
+            replay_queue,
+            remote_stop_event,
+            remote_listener_errors,
+            remote_server_sock,
+            remote_accept_thread,
+            remote_client_threads,
+            remote_client_threads_lock,
+        ) = _start_remote_replay_listener(
+            host=args.replay_host,
+            port=args.replay_port,
+            queue_size=args.remote_replay_queue_size,
+        )
+        if is_chief:
+            print(
+                f"learner replay listener ready at {args.replay_host}:{args.replay_port} "
+                f"queue_size={args.remote_replay_queue_size}"
+            )
+    elif args.async_selfplay:
         replay_queue = queue_lib.Queue(maxsize=args.async_selfplay_queue_size)
         if args.cross_process_selfplay:
             ctx = mp.get_context("spawn")
@@ -1233,7 +1500,33 @@ def main() -> None:
                 actor_idx, exc = actor_errors[0]
                 raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
 
-            if args.async_selfplay:
+            if args.role == "learner":
+                assert replay_queue is not None
+                wait_start = time.perf_counter()
+                while True:
+                    if remote_listener_errors:
+                        raise RuntimeError(f"remote replay listener failed: {remote_listener_errors[0]}")
+                    try:
+                        (
+                            new_obs,
+                            new_policy,
+                            new_value,
+                            black_win,
+                            white_win,
+                            draw,
+                            new_examples,
+                        ) = replay_queue.get(timeout=0.5)
+                        with actor_stats_lock:
+                            actor_batches_total += 1
+                            actor_examples_total += new_examples
+                        break
+                    except queue_lib.Empty:
+                        continue
+                wait_sec = time.perf_counter() - wait_start
+                collect_wait_ms = wait_sec * 1000.0
+                learner_wait_total_sec += wait_sec
+                learner_wait_count += 1
+            elif args.async_selfplay:
                 assert actor_stop is not None
                 wait_start = time.perf_counter()
                 while True:
@@ -1444,6 +1737,14 @@ def main() -> None:
                 actor_proc.terminate()
         for actor_thread in actor_threads:
             actor_thread.join(timeout=5.0)
+        if remote_stop_event is not None and remote_client_threads_lock is not None:
+            _stop_remote_replay_listener(
+                stop_event=remote_stop_event,
+                server_sock=remote_server_sock,
+                accept_thread=remote_accept_thread,
+                client_threads=remote_client_threads,
+                client_threads_lock=remote_client_threads_lock,
+            )
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
     final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
