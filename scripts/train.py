@@ -1544,10 +1544,6 @@ def main() -> None:
     process_index = jax.process_index()
     is_chief = process_index == 0
 
-    if process_count > 1 and args.async_selfplay and (not args.cross_process_selfplay):
-        if is_chief:
-            print("multi-host detected: enabling cross-process self-play for TPU runtime stability")
-        args.cross_process_selfplay = True
 
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
