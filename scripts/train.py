@@ -1318,6 +1318,8 @@ def _run_actor_role(
                 )
             print(f"actor[{process_index}] collect_done batch={next_batch_idx}")
 
+            print(f"actor[{process_index}] payload_start batch={next_batch_idx}")
+            payload_start = time.perf_counter()
             payload = _pack_collect_payload(
                 obs=obs,
                 policy=policy,
@@ -1327,9 +1329,20 @@ def _run_actor_role(
                 board_size=args.board_size,
                 fixed_examples=args.replay_fixed_update_size,
             )
-            print(f"actor[{process_index}] payload_done batch={next_batch_idx} examples={payload[6]}")
+            payload_ms = (time.perf_counter() - payload_start) * 1000.0
+            print(
+                f"actor[{process_index}] payload_done batch={next_batch_idx} "
+                f"examples={payload[6]} payload_ms={payload_ms:.1f}"
+            )
             collect_ms = (time.perf_counter() - collect_start) * 1000.0
+            print(f"actor[{process_index}] upload_start batch={next_batch_idx}")
+            upload_start = time.perf_counter()
             send_selfplay_batch(sock, payload)
+            upload_ms = (time.perf_counter() - upload_start) * 1000.0
+            print(
+                f"actor[{process_index}] upload_done batch={next_batch_idx} "
+                f"upload_ms={upload_ms:.1f}"
+            )
             sent_batches += 1
             sent_examples += payload[6]
 
