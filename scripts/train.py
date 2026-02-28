@@ -1165,7 +1165,17 @@ def _pack_collect_payload(
     board_size: int,
     fixed_examples: int,
 ) -> SelfPlayBatch:
+    print("pack_collect ready_start")
+    ready_start = time.perf_counter()
+    jax.block_until_ready((obs, policy, value, mask, winners))
+    ready_ms = (time.perf_counter() - ready_start) * 1000.0
+    print(f"pack_collect ready_done ready_ms={ready_ms:.1f}")
+
+    print("pack_collect device_get_start")
+    device_get_start = time.perf_counter()
     obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+    device_get_ms = (time.perf_counter() - device_get_start) * 1000.0
+    print(f"pack_collect device_get_done device_get_ms={device_get_ms:.1f}")
     obs_np = np.asarray(obs_np)
     policy_np = np.asarray(policy_np)
     value_np = np.asarray(value_np)
