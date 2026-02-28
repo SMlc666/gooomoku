@@ -173,6 +173,7 @@ class GameEngine:
             root_dirichlet_alpha=0.03,
             c_lcb=c_lcb,
         )
+        self.ai_temperature = float(ai_temperature)
         self.rng_key = jax.random.PRNGKey(seed)
         self._lock = threading.Lock()
         self._warmup()
