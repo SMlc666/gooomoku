@@ -1298,7 +1298,10 @@ def _run_actor_role(
     start_time = time.perf_counter()
     try:
         while steps_limit <= 0 or sent_batches < steps_limit:
+            next_batch_idx = sent_batches + 1
+            print(f"actor[{process_index}] collecting batch={next_batch_idx}")
             rng_key, collect_key = jax.random.split(rng_key)
+            collect_start = time.perf_counter()
             if use_pmap:
                 collect_keys = jax.random.split(collect_key, local_devices)
                 collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
@@ -1323,6 +1326,7 @@ def _run_actor_role(
                 board_size=args.board_size,
                 fixed_examples=args.replay_fixed_update_size,
             )
+            collect_ms = (time.perf_counter() - collect_start) * 1000.0
             send_selfplay_batch(sock, payload)
             sent_batches += 1
             sent_examples += payload[6]
@@ -1367,6 +1371,7 @@ def _run_actor_role(
             elapsed = max(time.perf_counter() - start_time, 1e-6)
             print(
                 f"actor[{process_index}] sent_batches={sent_batches} sent_examples={sent_examples} "
+                f"collect_ms={collect_ms:.1f} "
                 f"examples_per_sec={sent_examples / elapsed:.1f}"
             )
     finally:
