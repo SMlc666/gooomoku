@@ -96,6 +96,8 @@ When using `gs://` paths, `gcloud` CLI must be available on the runtime host.
 
 - `--role learner`: receives self-play batches from network (`--replay-host/--replay-port`) and trains.
 - `--role actor`: runs self-play and pushes batches to learner over TCP; can use TPU in-process (`pmap`) because it is no longer cross-process in the same VM.
+- Actor can auto-discover learner endpoint from a shared endpoint file, so no manual learner IP is required.
+- On TPU multi-worker VMs, actor can auto-discover learner endpoint from TPU worker environment (no gs/ip required).
 
 Example split deployment:
 
@@ -103,30 +105,64 @@ Example split deployment:
 # learner host
 PYTHONPATH=src python scripts/train.py \
   --role learner \
-  --replay-host 0.0.0.0 \
-  --replay-port 19091 \
   --train-steps 500 \
   --batch-size 1024 \
   --updates-per-step 16 \
   --checkpoint-every-steps 20 \
-  --output checkpoints/latest.pkl
+  --output gs://your-bucket/checkpoints/latest.pkl
 
 # actor host (TPU-enabled)
 PYTHONPATH=src python scripts/train.py \
   --role actor \
   --jax-platforms tpu \
-  --replay-host <learner-ip> \
-  --replay-port 19091 \
   --selfplay-batch-games 128 \
   --num-simulations 64 \
-  --resume-from checkpoints/latest.pkl \
+  --resume-from gs://your-bucket/checkpoints/latest.pkl \
   --actor-sync-every-batches 8
 ```
 
 Notes:
-- Actor role syncs parameters by reloading `--resume-from` checkpoint periodically.
-- `--replay-host` can be wildcard (`0.0.0.0`) for learner bind, but actor must use a routable learner IP/hostname.
+- Actor role uses network param sync by default (`--actor-param-source auto`) and no longer requires shared checkpoint storage.
+- Fallback mode is still available via `--actor-param-source checkpoint --resume-from ...`.
+- Endpoint discovery file is auto-derived as `<output>.replay_endpoint.json` on learner and `<resume-from>.replay_endpoint.json` on actor.
+- If needed, override discovery path via `--replay-endpoint-uri`.
+- Learner advertises host automatically; override with `--replay-advertise-host` when auto-detection is not suitable.
 - Existing `--role all` behavior is unchanged.
+
+### TPU multi-worker without `gs://` and without manual IP
+
+Use TPU worker env auto-discovery (`TPU_WORKER_HOSTNAMES`) and keep `--replay-host` as default `auto`. Parameters are synchronized over network on `--param-sync-port` (default `19092`).
+
+```bash
+# learner on worker 0
+gcloud compute tpus tpu-vm ssh node-1 \
+  --zone=us-central2-b \
+  --project=<your-project> \
+  --worker=0 \
+  --command="cd gooomoku && PYTHONPATH=src stdbuf -oL python3 scripts/train.py \
+    --role learner \
+    --distributed-init off \
+    --board-size 15 --channels 96 --blocks 8 \
+    --train-steps 300 --updates-per-step 16 --batch-size 1024 \
+    --replay-size 100000 --num-simulations 64 --max-num-considered-actions 64 \
+    --compute-dtype bfloat16 --param-dtype float32 \
+    --checkpoint-every-steps 0 --arena-every-steps 0 \
+    --output /tmp/gooomoku_latest.pkl"
+
+# actors on remaining workers (no --replay-host)
+gcloud compute tpus tpu-vm ssh node-1 \
+  --zone=us-central2-b \
+  --project=<your-project> \
+  --worker=1,2,3 \
+  --command="cd gooomoku && PYTHONPATH=src stdbuf -oL python3 scripts/train.py \
+    --role actor \
+    --distributed-init off \
+    --board-size 15 --channels 96 --blocks 8 \
+    --selfplay-batch-games 128 \
+    --num-simulations 64 --max-num-considered-actions 64 \
+    --compute-dtype bfloat16 --param-dtype float32 \
+    --actor-sync-every-batches 8 --actor-steps 0"
+```
 
 ## Suggested next upgrades
 

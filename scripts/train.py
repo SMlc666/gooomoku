@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import multiprocessing as mp
 import os
 import pickle
 import queue as queue_lib
 import socket
+import struct
 from pathlib import Path
 from pathlib import PurePosixPath
 import subprocess
@@ -310,6 +312,339 @@ def _read_pickle(path: str):
 
     with Path(path).open("rb") as fp:
         return pickle.load(fp)
+
+
+def _write_text(path: str, content: str) -> None:
+    if _is_gcs_uri(path):
+        with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", encoding="utf-8", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(content)
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", str(tmp_path), path],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("gcloud CLI is required for gs:// text writes") from exc
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
+
+    local_path = Path(path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(content, encoding="utf-8")
+
+
+def _read_text(path: str) -> str:
+    if _is_gcs_uri(path):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            try:
+                subprocess.run(
+                    ["gcloud", "storage", "cp", path, str(tmp_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("gcloud CLI is required for gs:// text reads") from exc
+            return tmp_path.read_text(encoding="utf-8")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _derive_replay_endpoint_uri(*, role: str, replay_endpoint_uri: str, output: str, resume_from: str | None) -> str | None:
+    uri = replay_endpoint_uri.strip()
+    if uri:
+        return uri
+    if role == "actor":
+        anchor = resume_from or output
+    else:
+        anchor = output
+    if not anchor:
+        return None
+    return f"{anchor}.replay_endpoint.json"
+
+
+def _parse_tpu_worker_hosts_from_env() -> list[str]:
+    raw = os.environ.get("TPU_WORKER_HOSTNAMES", "").strip()
+    if not raw:
+        return []
+    hosts: list[str] = []
+    for item in raw.split(","):
+        host = item.strip()
+        if not host:
+            continue
+        if ":" in host:
+            host = host.split(":", 1)[0].strip()
+        if host:
+            hosts.append(host)
+    return hosts
+
+
+def _infer_learner_host_from_env() -> str | None:
+    explicit = os.environ.get("REPLAY_LEARNER_HOST", "").strip()
+    if explicit:
+        return explicit
+
+    worker_hosts = _parse_tpu_worker_hosts_from_env()
+    if worker_hosts:
+        return worker_hosts[0]
+
+    coordinator = os.environ.get("MEGASCALE_COORDINATOR_ADDRESS", "").strip()
+    if coordinator:
+        return coordinator.split(":", 1)[0].strip() or None
+    return None
+
+
+def _detect_advertise_host() -> str:
+    env_host = os.environ.get("REPLAY_ADVERTISE_HOST", "").strip()
+    if env_host:
+        return env_host
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+    hostname = socket.gethostname().strip()
+    if hostname:
+        try:
+            ip = socket.gethostbyname(hostname)
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        return hostname
+    return "127.0.0.1"
+
+
+def _publish_replay_endpoint(path: str, host: str, port: int) -> None:
+    payload = {
+        "schema": "gooomoku-replay-endpoint-v1",
+        "host": host,
+        "port": int(port),
+        "updated_at_unix": time.time(),
+    }
+    _write_text(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _load_replay_endpoint(path: str) -> tuple[str, int]:
+    data = json.loads(_read_text(path))
+    if data.get("schema") != "gooomoku-replay-endpoint-v1":
+        raise RuntimeError(f"unsupported replay endpoint schema in {path}: {data.get('schema')}")
+    host = str(data.get("host", "")).strip()
+    port = int(data.get("port", 0))
+    if not host:
+        raise RuntimeError(f"missing host in replay endpoint file: {path}")
+    if host in {"0.0.0.0", "::"}:
+        raise RuntimeError(f"replay endpoint file contains wildcard host: {host}")
+    if port <= 0:
+        raise RuntimeError(f"invalid port in replay endpoint file: {path}")
+    return host, port
+
+
+def _resolve_actor_replay_endpoint(args) -> tuple[str, int]:
+    host = args.replay_host.strip()
+    if host and host.lower() != "auto":
+        if host in {"0.0.0.0", "::"}:
+            raise ValueError("--replay-host cannot be a wildcard address for --role actor; use learner hostname/IP")
+        return host, args.replay_port
+
+    inferred_host = _infer_learner_host_from_env()
+    if inferred_host:
+        print(f"actor endpoint inferred from TPU env: {inferred_host}:{args.replay_port}")
+        return inferred_host, args.replay_port
+
+    endpoint_uri = _derive_replay_endpoint_uri(
+        role="actor",
+        replay_endpoint_uri=args.replay_endpoint_uri,
+        output=args.output,
+        resume_from=args.resume_from,
+    )
+    if endpoint_uri is None:
+        raise ValueError(
+            "actor auto-discovery requires TPU worker env (TPU_WORKER_HOSTNAMES/REPLAY_LEARNER_HOST) "
+            "or --replay-endpoint-uri / --resume-from / --output as discovery anchor"
+        )
+    wait_deadline = time.time() + max(float(args.replay_endpoint_wait_seconds), 0.1)
+    retry_sleep = max(float(args.replay_connect_retry_seconds), 0.1)
+    last_error: BaseException | None = None
+    while True:
+        try:
+            resolved_host, resolved_port = _load_replay_endpoint(endpoint_uri)
+            print(f"actor endpoint resolved from {endpoint_uri}: {resolved_host}:{resolved_port}")
+            return resolved_host, resolved_port
+        except BaseException as exc:  # retry until learner publishes endpoint
+            last_error = exc
+        if time.time() >= wait_deadline:
+            raise RuntimeError(
+                f"failed to resolve learner replay endpoint from {endpoint_uri} within "
+                f"{args.replay_endpoint_wait_seconds}s: {last_error}"
+            )
+        time.sleep(retry_sleep)
+
+
+_PARAM_FRAME_LEN_STRUCT = struct.Struct("!I")
+
+
+def _send_frame(sock: socket.socket, payload: bytes) -> None:
+    sock.sendall(_PARAM_FRAME_LEN_STRUCT.pack(len(payload)))
+    if payload:
+        sock.sendall(payload)
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise RuntimeError("socket closed while receiving frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _recv_frame(sock: socket.socket) -> bytes:
+    (size,) = _PARAM_FRAME_LEN_STRUCT.unpack(_recv_exact(sock, _PARAM_FRAME_LEN_STRUCT.size))
+    if size < 0:
+        raise RuntimeError("invalid negative frame size")
+    return _recv_exact(sock, size) if size > 0 else b""
+
+
+def _build_param_sync_blob(*, params, use_pmap: bool, optimizer_updates: int) -> bytes:
+    params_host = _extract_host_tree(params, use_pmap=use_pmap)
+    params_host = jax.device_get(params_host)
+    payload = {
+        "schema": "gooomoku-param-sync-v1",
+        "optimizer_updates": int(optimizer_updates),
+        "params": params_host,
+    }
+    return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _start_param_sync_server(*, host: str, port: int, snapshot_state: dict[str, Any], snapshot_lock: threading.Lock):
+    stop_event = threading.Event()
+    errors: list[BaseException] = []
+    client_threads: list[threading.Thread] = []
+    client_threads_lock = threading.Lock()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((host, port))
+    server_sock.listen()
+    server_sock.settimeout(1.0)
+
+    def client_loop(conn: socket.socket, addr: tuple[str, int]) -> None:
+        with conn:
+            try:
+                request = json.loads(_recv_frame(conn).decode("utf-8"))
+                last_seen = int(request.get("last_optimizer_updates", -1))
+                with snapshot_lock:
+                    cur_updates = int(snapshot_state["optimizer_updates"])
+                    cur_blob = snapshot_state["blob"]
+                if cur_updates <= last_seen:
+                    _send_frame(
+                        conn,
+                        json.dumps(
+                            {
+                                "status": "unchanged",
+                                "optimizer_updates": cur_updates,
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8"),
+                    )
+                else:
+                    _send_frame(
+                        conn,
+                        json.dumps(
+                            {
+                                "status": "update",
+                                "optimizer_updates": cur_updates,
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8"),
+                    )
+                    _send_frame(conn, cur_blob)
+            except BaseException as exc:
+                if not stop_event.is_set():
+                    errors.append(RuntimeError(f"param sync client error from {addr}: {exc}"))
+
+    def accept_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                conn, addr = server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not stop_event.is_set():
+                    errors.append(RuntimeError(f"param sync accept failed: {exc}"))
+                break
+            worker = threading.Thread(target=client_loop, args=(conn, addr), daemon=True, name=f"param-sync-{addr[0]}:{addr[1]}")
+            worker.start()
+            with client_threads_lock:
+                client_threads.append(worker)
+
+    accept_thread = threading.Thread(target=accept_loop, daemon=True, name="param-sync-listener")
+    accept_thread.start()
+    return stop_event, errors, server_sock, accept_thread, client_threads, client_threads_lock
+
+
+def _stop_param_sync_server(
+    *,
+    stop_event: threading.Event,
+    server_sock: socket.socket | None,
+    accept_thread: threading.Thread | None,
+    client_threads: list[threading.Thread],
+    client_threads_lock: threading.Lock,
+) -> None:
+    stop_event.set()
+    if server_sock is not None:
+        server_sock.close()
+    if accept_thread is not None:
+        accept_thread.join(timeout=5.0)
+    with client_threads_lock:
+        snapshot = list(client_threads)
+    for worker in snapshot:
+        worker.join(timeout=1.0)
+
+
+def _pull_params_from_network(*, host: str, port: int, last_optimizer_updates: int, retry_seconds: float):
+    sock = connect_with_retry(host, port, retry_seconds)
+    try:
+        _send_frame(
+            sock,
+            json.dumps(
+                {
+                    "last_optimizer_updates": int(last_optimizer_updates),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        header = json.loads(_recv_frame(sock).decode("utf-8"))
+        status = str(header.get("status", ""))
+        cur_updates = int(header.get("optimizer_updates", -1))
+        if status == "unchanged":
+            return None, max(last_optimizer_updates, cur_updates)
+        if status != "update":
+            raise RuntimeError(f"unknown param sync status: {status}")
+        blob = _recv_frame(sock)
+        payload = pickle.loads(blob)
+        if payload.get("schema") != "gooomoku-param-sync-v1":
+            raise RuntimeError(f"unknown param sync payload schema: {payload.get('schema')}")
+        pulled_updates = int(payload.get("optimizer_updates", -1))
+        pulled_params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+        return pulled_params, pulled_updates
+    finally:
+        sock.close()
 
 
 def _save_model_checkpoint(path: str, params, config: dict[str, Any]) -> None:
@@ -756,12 +1091,12 @@ def _run_actor_role(
     process_index: int,
     selfplay_batch_games: int,
 ):
-    if args.replay_port <= 0:
-        raise ValueError("replay-port must be > 0 for --role actor")
-    if not args.replay_host.strip():
-        raise ValueError("replay-host must be non-empty for --role actor")
-    if args.replay_host.strip() in {"0.0.0.0", "::"}:
-        raise ValueError("--replay-host cannot be a wildcard address for --role actor; use learner hostname/IP")
+    endpoint_host, endpoint_port = _resolve_actor_replay_endpoint(args)
+    param_endpoint_host = endpoint_host
+    param_endpoint_port = int(args.param_sync_port)
+    actor_param_source = str(args.actor_param_source).strip().lower()
+    use_network_sync = actor_param_source in {"auto", "network"}
+    use_checkpoint_sync = actor_param_source in {"auto", "checkpoint"} and (args.resume_from is not None)
 
     games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
     play_many_games_fn = build_play_many_games_fn(
@@ -781,19 +1116,40 @@ def _run_actor_role(
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
 
     last_optimizer_updates = -1
-    loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
-        resume_from=args.resume_from,
-        use_pmap=use_pmap,
-        local_devices=local_devices,
-        last_optimizer_updates=last_optimizer_updates,
-    )
-    if loaded_params is not None:
-        params = loaded_params
-        print(f"actor[{process_index}] loaded params from {args.resume_from} optimizer_updates={last_optimizer_updates}")
+    if use_network_sync:
+        try:
+            net_params, pulled_updates = _pull_params_from_network(
+                host=param_endpoint_host,
+                port=param_endpoint_port,
+                last_optimizer_updates=last_optimizer_updates,
+                retry_seconds=args.replay_connect_retry_seconds,
+            )
+            if net_params is not None:
+                params = _replicate_tree_for_pmap(net_params, local_devices=local_devices) if use_pmap else net_params
+                last_optimizer_updates = pulled_updates
+                print(
+                    f"actor[{process_index}] loaded params from network {param_endpoint_host}:{param_endpoint_port} "
+                    f"optimizer_updates={last_optimizer_updates}"
+                )
+        except BaseException as exc:
+            if actor_param_source == "network":
+                raise RuntimeError(f"actor network param sync init failed: {exc}") from exc
+            print(f"actor[{process_index}] network param sync unavailable, fallback to checkpoint: {exc}")
 
-    sock = connect_with_retry(args.replay_host, args.replay_port, args.replay_connect_retry_seconds)
+    if last_optimizer_updates < 0 and use_checkpoint_sync:
+        loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
+            resume_from=args.resume_from,
+            use_pmap=use_pmap,
+            local_devices=local_devices,
+            last_optimizer_updates=last_optimizer_updates,
+        )
+        if loaded_params is not None:
+            params = loaded_params
+            print(f"actor[{process_index}] loaded params from {args.resume_from} optimizer_updates={last_optimizer_updates}")
+
+    sock = connect_with_retry(endpoint_host, endpoint_port, args.replay_connect_retry_seconds)
     print(
-        f"actor[{process_index}] connected to learner replay endpoint {args.replay_host}:{args.replay_port} "
+        f"actor[{process_index}] connected to learner replay endpoint {endpoint_host}:{endpoint_port} "
         f"use_pmap={use_pmap} local_device_count={local_devices} games_per_batch={selfplay_batch_games}"
     )
 
@@ -833,19 +1189,42 @@ def _run_actor_role(
             sent_batches += 1
             sent_examples += payload[6]
 
-            if sync_every > 0 and args.resume_from is not None and (sent_batches % sync_every == 0):
-                loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
-                    resume_from=args.resume_from,
-                    use_pmap=use_pmap,
-                    local_devices=local_devices,
-                    last_optimizer_updates=last_optimizer_updates,
-                )
-                if loaded_params is not None:
-                    params = loaded_params
-                    print(
-                        f"actor[{process_index}] synced params from {args.resume_from} "
-                        f"optimizer_updates={last_optimizer_updates}"
+            if sync_every > 0 and (sent_batches % sync_every == 0):
+                synced = False
+                if use_network_sync:
+                    try:
+                        net_params, pulled_updates = _pull_params_from_network(
+                            host=param_endpoint_host,
+                            port=param_endpoint_port,
+                            last_optimizer_updates=last_optimizer_updates,
+                            retry_seconds=args.replay_connect_retry_seconds,
+                        )
+                        if net_params is not None:
+                            params = _replicate_tree_for_pmap(net_params, local_devices=local_devices) if use_pmap else net_params
+                            last_optimizer_updates = pulled_updates
+                            synced = True
+                            print(
+                                f"actor[{process_index}] synced params from network {param_endpoint_host}:{param_endpoint_port} "
+                                f"optimizer_updates={last_optimizer_updates}"
+                            )
+                    except BaseException as exc:
+                        if actor_param_source == "network":
+                            raise RuntimeError(f"actor network param sync failed: {exc}") from exc
+                        print(f"actor[{process_index}] network param sync skipped: {exc}")
+
+                if (not synced) and use_checkpoint_sync:
+                    loaded_params, last_optimizer_updates = _maybe_reload_actor_params(
+                        resume_from=args.resume_from,
+                        use_pmap=use_pmap,
+                        local_devices=local_devices,
+                        last_optimizer_updates=last_optimizer_updates,
                     )
+                    if loaded_params is not None:
+                        params = loaded_params
+                        print(
+                            f"actor[{process_index}] synced params from {args.resume_from} "
+                            f"optimizer_updates={last_optimizer_updates}"
+                        )
 
             if sent_batches % 10 == 0:
                 elapsed = max(time.perf_counter() - start_time, 1e-6)
@@ -985,10 +1364,16 @@ def main() -> None:
     parser.add_argument("--selfplay-actors", type=int, default=1)
     parser.add_argument("--actor-param-sync-updates", type=int, default=1)
     parser.add_argument("--selfplay-batch-games", type=int, default=None)
-    parser.add_argument("--replay-host", type=str, default="0.0.0.0")
+    parser.add_argument("--replay-host", type=str, default="auto")
     parser.add_argument("--replay-port", type=int, default=19091)
+    parser.add_argument("--param-sync-port", type=int, default=19092)
     parser.add_argument("--remote-replay-queue-size", type=int, default=64)
     parser.add_argument("--replay-connect-retry-seconds", type=float, default=2.0)
+    parser.add_argument("--actor-param-source", choices=("auto", "network", "checkpoint"), default="auto")
+    parser.add_argument("--param-sync-every-steps", type=int, default=1)
+    parser.add_argument("--replay-endpoint-uri", type=str, default="")
+    parser.add_argument("--replay-advertise-host", type=str, default="auto")
+    parser.add_argument("--replay-endpoint-wait-seconds", type=float, default=180.0)
     parser.add_argument("--actor-steps", type=int, default=0)
     parser.add_argument("--actor-sync-every-batches", type=int, default=8)
     args = parser.parse_args()
@@ -1017,12 +1402,20 @@ def main() -> None:
         raise ValueError("remote-replay-queue-size must be >= 1")
     if args.replay_port <= 0:
         raise ValueError("replay-port must be > 0")
+    if args.param_sync_port <= 0:
+        raise ValueError("param-sync-port must be > 0")
     if args.replay_connect_retry_seconds <= 0:
         raise ValueError("replay-connect-retry-seconds must be > 0")
+    if args.param_sync_every_steps < 1:
+        raise ValueError("param-sync-every-steps must be >= 1")
+    if args.replay_endpoint_wait_seconds <= 0:
+        raise ValueError("replay-endpoint-wait-seconds must be > 0")
     if args.actor_steps < 0:
         raise ValueError("actor-steps must be >= 0")
     if args.actor_sync_every_batches < 0:
         raise ValueError("actor-sync-every-batches must be >= 0")
+    if args.role == "actor" and args.actor_param_source == "checkpoint" and args.resume_from is None:
+        raise ValueError("--actor-param-source=checkpoint requires --resume-from")
 
     if args.role in {"actor", "learner"}:
         args.async_selfplay = False
@@ -1313,6 +1706,14 @@ def main() -> None:
     remote_accept_thread: threading.Thread | None = None
     remote_client_threads: list[threading.Thread] = []
     remote_client_threads_lock: threading.Lock | None = None
+    param_sync_snapshot_lock: threading.Lock | None = None
+    param_sync_snapshot_state: dict[str, Any] | None = None
+    param_sync_stop_event: threading.Event | None = None
+    param_sync_errors: list[BaseException] = []
+    param_sync_server_sock: socket.socket | None = None
+    param_sync_accept_thread: threading.Thread | None = None
+    param_sync_client_threads: list[threading.Thread] = []
+    param_sync_client_threads_lock: threading.Lock | None = None
 
     def collect_new_examples(params_for_collect, collect_rng_key):
         if use_pmap:
@@ -1339,6 +1740,23 @@ def main() -> None:
         )
 
     if args.role == "learner":
+        bind_host = args.replay_host.strip()
+        if (not bind_host) or bind_host.lower() == "auto":
+            bind_host = "0.0.0.0"
+        advertise_host = args.replay_advertise_host.strip()
+        if (not advertise_host) or advertise_host.lower() == "auto":
+            if bind_host not in {"0.0.0.0", "::"}:
+                advertise_host = bind_host
+            else:
+                advertise_host = _detect_advertise_host()
+        if advertise_host in {"0.0.0.0", "::"}:
+            advertise_host = _detect_advertise_host()
+        endpoint_uri = _derive_replay_endpoint_uri(
+            role="learner",
+            replay_endpoint_uri=args.replay_endpoint_uri,
+            output=args.output,
+            resume_from=args.resume_from,
+        )
         (
             replay_queue,
             remote_stop_event,
@@ -1348,14 +1766,39 @@ def main() -> None:
             remote_client_threads,
             remote_client_threads_lock,
         ) = _start_remote_replay_listener(
-            host=args.replay_host,
+            host=bind_host,
             port=args.replay_port,
             queue_size=args.remote_replay_queue_size,
         )
+        param_sync_snapshot_lock = threading.Lock()
+        param_sync_snapshot_state = {
+            "optimizer_updates": int(optimizer_updates),
+            "blob": _build_param_sync_blob(
+                params=params,
+                use_pmap=use_pmap,
+                optimizer_updates=optimizer_updates,
+            ),
+        }
+        (
+            param_sync_stop_event,
+            param_sync_errors,
+            param_sync_server_sock,
+            param_sync_accept_thread,
+            param_sync_client_threads,
+            param_sync_client_threads_lock,
+        ) = _start_param_sync_server(
+            host=bind_host,
+            port=args.param_sync_port,
+            snapshot_state=param_sync_snapshot_state,
+            snapshot_lock=param_sync_snapshot_lock,
+        )
+        if endpoint_uri is not None:
+            _publish_replay_endpoint(endpoint_uri, host=advertise_host, port=args.replay_port)
         if is_chief:
             print(
-                f"learner replay listener ready at {args.replay_host}:{args.replay_port} "
-                f"queue_size={args.remote_replay_queue_size}"
+                f"learner replay listener ready bind={bind_host}:{args.replay_port} "
+                f"advertise={advertise_host}:{args.replay_port} queue_size={args.remote_replay_queue_size} "
+                f"endpoint_uri={endpoint_uri} param_sync_port={args.param_sync_port}"
             )
     elif args.async_selfplay:
         replay_queue = queue_lib.Queue(maxsize=args.async_selfplay_queue_size)
@@ -1506,6 +1949,8 @@ def main() -> None:
                 while True:
                     if remote_listener_errors:
                         raise RuntimeError(f"remote replay listener failed: {remote_listener_errors[0]}")
+                    if param_sync_errors:
+                        raise RuntimeError(f"param sync server failed: {param_sync_errors[0]}")
                     try:
                         (
                             new_obs,
@@ -1671,6 +2116,20 @@ def main() -> None:
                         with params_ref_lock:
                             params_ref[0] = params
 
+            if (
+                args.role == "learner"
+                and param_sync_snapshot_lock is not None
+                and param_sync_snapshot_state is not None
+                and (step % args.param_sync_every_steps == 0)
+            ):
+                with param_sync_snapshot_lock:
+                    param_sync_snapshot_state["optimizer_updates"] = int(optimizer_updates)
+                    param_sync_snapshot_state["blob"] = _build_param_sync_blob(
+                        params=params,
+                        use_pmap=use_pmap,
+                        optimizer_updates=optimizer_updates,
+                    )
+
             loss_val = loss_sum / args.updates_per_step
             pol_val = policy_sum / args.updates_per_step
             val_val = value_sum / args.updates_per_step
@@ -1744,6 +2203,14 @@ def main() -> None:
                 accept_thread=remote_accept_thread,
                 client_threads=remote_client_threads,
                 client_threads_lock=remote_client_threads_lock,
+            )
+        if param_sync_stop_event is not None and param_sync_client_threads_lock is not None:
+            _stop_param_sync_server(
+                stop_event=param_sync_stop_event,
+                server_sock=param_sync_server_sock,
+                accept_thread=param_sync_accept_thread,
+                client_threads=param_sync_client_threads,
+                client_threads_lock=param_sync_client_threads_lock,
             )
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
