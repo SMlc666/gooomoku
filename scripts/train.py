@@ -489,13 +489,13 @@ def _init_device_replay(
     board_size: int,
 ):
     num_actions = board_size * board_size
-    obs_dev = jnp.zeros((replay_size, board_size, board_size, 4), dtype=jnp.float32)
+    obs_dev = jnp.zeros((replay_size, board_size, board_size, 4), dtype=jnp.uint8)
     policy_dev = jnp.zeros((replay_size, num_actions), dtype=jnp.float32)
     value_dev = jnp.zeros((replay_size,), dtype=jnp.float32)
     replay_count = int(min(replay_obs.shape[0], replay_size))
     replay_head = replay_count % replay_size if replay_size > 0 else 0
     if replay_count > 0:
-        obs_dev = obs_dev.at[:replay_count].set(jnp.asarray(replay_obs[-replay_count:], dtype=jnp.float32))
+        obs_dev = obs_dev.at[:replay_count].set(jnp.asarray(replay_obs[-replay_count:], dtype=jnp.uint8))
         policy_dev = policy_dev.at[:replay_count].set(jnp.asarray(replay_policy[-replay_count:], dtype=jnp.float32))
         value_dev = value_dev.at[:replay_count].set(jnp.asarray(replay_value[-replay_count:], dtype=jnp.float32))
     return obs_dev, policy_dev, value_dev, replay_head, replay_count
@@ -518,16 +518,14 @@ def _append_replay_device(
         return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count
 
     if new_count >= capacity:
-        tail_obs = jnp.asarray(new_obs[-capacity:], dtype=jnp.float32)
+        tail_obs = jnp.asarray(new_obs[-capacity:], dtype=jnp.uint8)
         tail_policy = jnp.asarray(new_policy[-capacity:], dtype=jnp.float32)
         tail_value = jnp.asarray(new_value[-capacity:], dtype=jnp.float32)
         return tail_obs, tail_policy, tail_value, 0, capacity
 
     first = min(new_count, capacity - replay_head)
     if first > 0:
-        replay_obs_dev = replay_obs_dev.at[replay_head : replay_head + first].set(
-            jnp.asarray(new_obs[:first], dtype=jnp.float32)
-        )
+        replay_obs_dev = replay_obs_dev.at[replay_head : replay_head + first].set(jnp.asarray(new_obs[:first], dtype=jnp.uint8))
         replay_policy_dev = replay_policy_dev.at[replay_head : replay_head + first].set(
             jnp.asarray(new_policy[:first], dtype=jnp.float32)
         )
@@ -537,7 +535,7 @@ def _append_replay_device(
 
     remaining = new_count - first
     if remaining > 0:
-        replay_obs_dev = replay_obs_dev.at[:remaining].set(jnp.asarray(new_obs[first:], dtype=jnp.float32))
+        replay_obs_dev = replay_obs_dev.at[:remaining].set(jnp.asarray(new_obs[first:], dtype=jnp.uint8))
         replay_policy_dev = replay_policy_dev.at[:remaining].set(jnp.asarray(new_policy[first:], dtype=jnp.float32))
         replay_value_dev = replay_value_dev.at[:remaining].set(jnp.asarray(new_value[first:], dtype=jnp.float32))
 
@@ -557,11 +555,11 @@ def _materialize_replay_from_device(
         obs_shape = replay_obs_dev.shape[1:]
         policy_dim = replay_policy_dev.shape[1]
         return (
-            np.zeros((0,) + obs_shape, dtype=np.float32),
+            np.zeros((0,) + obs_shape, dtype=np.uint8),
             np.zeros((0, policy_dim), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-    obs_np = np.asarray(jax.device_get(replay_obs_dev[:replay_count]), dtype=np.float32)
+    obs_np = np.asarray(jax.device_get(replay_obs_dev[:replay_count]), dtype=np.uint8)
     policy_np = np.asarray(jax.device_get(replay_policy_dev[:replay_count]), dtype=np.float32)
     value_np = np.asarray(jax.device_get(replay_value_dev[:replay_count]), dtype=np.float32)
     return obs_np, policy_np, value_np
@@ -667,7 +665,7 @@ def main() -> None:
     )
     optimizer = optax.adam(learning_rate=lr_schedule)
     opt_state = optimizer.init(params)
-    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.float32)
+    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.uint8)
     replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
     replay_value = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
@@ -699,7 +697,7 @@ def main() -> None:
             rng_key = jnp.asarray(payload["rng_key"], dtype=jnp.uint32)
 
         if "replay_obs" in payload and "replay_policy" in payload and "replay_value" in payload:
-            replay_obs = np.asarray(payload["replay_obs"], dtype=np.float32)
+            replay_obs = np.asarray(payload["replay_obs"], dtype=np.uint8)
             replay_policy = np.asarray(payload["replay_policy"], dtype=np.float32)
             replay_value = np.asarray(payload["replay_value"], dtype=np.float32)
 
