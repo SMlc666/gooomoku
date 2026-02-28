@@ -27,6 +27,7 @@ sys.path.append(str(REPO_ROOT / "src"))
 from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
+from gooomoku.runtime import configure_jax_runtime
 from scripts.self_play import build_play_many_games_fn
 
 SelfPlayBatch = tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
@@ -41,7 +42,12 @@ def _run_cross_process_actor(
     output_queue: mp.Queue,
     stop_event: Any,
 ) -> None:
-    jax.config.update("jax_platform_name", "cpu")
+    actor_jax_platforms = str(cfg.get("actor_jax_platforms", "cpu")).strip()
+    if actor_jax_platforms:
+        os.environ["JAX_PLATFORMS"] = actor_jax_platforms
+        os.environ.pop("JAX_PLATFORM_NAME", None)
+        jax.config.update("jax_platforms", actor_jax_platforms)
+    configure_jax_runtime(app_name=f"train-actor-{actor_idx}", repo_root=REPO_ROOT)
 
     model = PolicyValueNet(
         board_size=int(cfg["board_size"]),
@@ -175,12 +181,13 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
     return train_step
 
 
-def make_pmap_collect_step(play_many_games_fn):
-    @functools.partial(jax.pmap, axis_name="device")
+def make_pmap_collect_step(play_many_games_fn, *, devices=None):
     def collect_step(params, rng_key, temperature):
         return play_many_games_fn(params, rng_key, temperature)
 
-    return collect_step
+    if devices is None:
+        return jax.pmap(collect_step, axis_name="device")
+    return jax.pmap(collect_step, axis_name="device", devices=tuple(devices))
 
 
 def make_pmap_arena_step(arena_fn):
@@ -312,6 +319,10 @@ def _load_checkpoint_payload(path: str):
 
 def _extract_host_tree(params, use_pmap: bool):
     return jax.tree_util.tree_map(lambda x: x[0], params) if use_pmap else params
+
+
+def _clone_tree(tree):
+    return jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), tree)
 
 
 def _add_batch_dim_state(state: env.GomokuState) -> env.GomokuState:
@@ -644,7 +655,40 @@ def _materialize_replay_from_device(
     return obs_np, policy_np, value_np
 
 
+def _pack_collect_payload(
+    *,
+    obs,
+    policy,
+    value,
+    mask,
+    winners,
+    board_size: int,
+) -> SelfPlayBatch:
+    obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+    obs_np = np.asarray(obs_np)
+    policy_np = np.asarray(policy_np)
+    value_np = np.asarray(value_np)
+    mask_np = np.asarray(mask_np)
+    winners_np = np.asarray(winners_np)
+
+    flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
+    flat_policy = policy_np.reshape((-1, board_size * board_size))
+    flat_value = value_np.reshape((-1,))
+    valid = mask_np.reshape((-1,)).astype(bool)
+
+    return (
+        flat_obs[valid],
+        flat_policy[valid],
+        flat_value[valid],
+        int((winners_np == 1).sum()),
+        int((winners_np == -1).sum()),
+        int((winners_np == 0).sum()),
+        int(valid.sum()),
+    )
+
+
 def main() -> None:
+    configure_jax_runtime(app_name="train", repo_root=REPO_ROOT)
     parser = argparse.ArgumentParser(description="Minimal JAX+mctx gomoku trainer.")
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--channels", type=int, default=64)
@@ -682,6 +726,12 @@ def main() -> None:
     parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--async-selfplay", action="store_true")
     parser.add_argument("--cross-process-selfplay", action="store_true")
+    parser.add_argument(
+        "--actor-jax-platforms",
+        type=str,
+        default="cpu",
+        help="JAX_PLATFORMS for cross-process selfplay actors (e.g. 'cpu', 'tpu', 'gpu').",
+    )
     parser.add_argument("--async-selfplay-queue-size", type=int, default=4)
     parser.add_argument("--selfplay-actors", type=int, default=1)
     parser.add_argument("--actor-param-sync-updates", type=int, default=1)
@@ -708,6 +758,13 @@ def main() -> None:
         raise ValueError("selfplay-actors must be >= 1")
     if args.actor_param_sync_updates < 1:
         raise ValueError("actor-param-sync-updates must be >= 1")
+    actor_jax_platforms = args.actor_jax_platforms.strip()
+    if args.cross_process_selfplay and "tpu" in {p.strip() for p in actor_jax_platforms.split(",") if p.strip()}:
+        raise ValueError(
+            "cross-process selfplay actors cannot use TPU in this process model (libtpu is process-exclusive). "
+            "Use --actor-jax-platforms=cpu with --cross-process-selfplay; "
+            "if you need TPU selfplay, disable --cross-process-selfplay and run in-process async selfplay."
+        )
 
     distributed_initialized = False
     if args.distributed_init != "off":
@@ -750,7 +807,7 @@ def main() -> None:
     replay_value = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
     optimizer_updates = 0
-    best_params = params
+    best_params = _clone_tree(params)
     best_step = 0
     start_step = 1
 
@@ -791,7 +848,7 @@ def main() -> None:
         if "best_params" in payload:
             best_params = jax.tree_util.tree_map(jnp.asarray, payload["best_params"])
         else:
-            best_params = params
+            best_params = _clone_tree(params)
         best_step = int(payload.get("best_step", 0))
 
         print(
@@ -822,6 +879,24 @@ def main() -> None:
         raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
 
     games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
+    actor_device_groups = None
+    actor_devices_per_group = 0
+    if args.async_selfplay and (not args.cross_process_selfplay) and use_pmap:
+        if args.selfplay_actors > local_devices:
+            raise ValueError(
+                f"selfplay-actors={args.selfplay_actors} cannot exceed local_device_count={local_devices} in in-process TPU mode"
+            )
+        if local_devices % args.selfplay_actors != 0:
+            raise ValueError(
+                f"local_device_count={local_devices} must be divisible by selfplay-actors={args.selfplay_actors} "
+                "for in-process TPU device partitioning"
+            )
+        actor_devices_per_group = local_devices // args.selfplay_actors
+        local_device_list = list(jax.local_devices())
+        actor_device_groups = [
+            tuple(local_device_list[i * actor_devices_per_group : (i + 1) * actor_devices_per_group])
+            for i in range(args.selfplay_actors)
+        ]
     play_many_games_fn = build_play_many_games_fn(
         model=model,
         board_size=args.board_size,
@@ -951,27 +1026,13 @@ def main() -> None:
                 collect_rng_key,
                 jnp.float32(args.temperature),
             )
-
-        obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
-        obs_np = np.asarray(obs_np)
-        policy_np = np.asarray(policy_np)
-        value_np = np.asarray(value_np)
-        mask_np = np.asarray(mask_np)
-        winners_np = np.asarray(winners_np)
-
-        flat_obs = obs_np.reshape((-1, args.board_size, args.board_size, 4))
-        flat_policy = policy_np.reshape((-1, args.board_size * args.board_size))
-        flat_value = value_np.reshape((-1,))
-        valid = mask_np.reshape((-1,)).astype(bool)
-
-        return (
-            flat_obs[valid],
-            flat_policy[valid],
-            flat_value[valid],
-            int((winners_np == 1).sum()),
-            int((winners_np == -1).sum()),
-            int((winners_np == 0).sum()),
-            int(valid.sum()),
+        return _pack_collect_payload(
+            obs=obs,
+            policy=policy,
+            value=value,
+            mask=mask,
+            winners=winners,
+            board_size=args.board_size,
         )
 
     if args.async_selfplay:
@@ -997,23 +1058,49 @@ def main() -> None:
                 "root_dirichlet_alpha": args.root_dirichlet_alpha,
                 "temperature": args.temperature,
                 "seed": args.seed,
+                "actor_jax_platforms": actor_jax_platforms,
             }
-            for actor_idx in range(args.selfplay_actors):
-                param_q = ctx.Queue(maxsize=1)
-                param_q.put(params_seed)
-                actor_params_queues.append(param_q)
-                actor_proc = ctx.Process(
-                    target=_run_cross_process_actor,
-                    args=(actor_idx, proc_cfg, param_q, actor_output_queue, actor_stop),
-                    name=f"selfplay-proc-{actor_idx}",
-                    daemon=True,
-                )
-                actor_proc.start()
-                actor_processes.append(actor_proc)
+            # Spawned actors inherit parent env. Set actor JAX platform in parent
+            # before Process.start() so child bootstrap sees the intended backend.
+            prev_jax_platforms = os.environ.get("JAX_PLATFORMS")
+            prev_jax_platform_name = os.environ.get("JAX_PLATFORM_NAME")
+            if actor_jax_platforms:
+                os.environ["JAX_PLATFORMS"] = actor_jax_platforms
+                os.environ.pop("JAX_PLATFORM_NAME", None)
+            try:
+                for actor_idx in range(args.selfplay_actors):
+                    param_q = ctx.Queue(maxsize=1)
+                    param_q.put(params_seed)
+                    actor_params_queues.append(param_q)
+                    actor_proc = ctx.Process(
+                        target=_run_cross_process_actor,
+                        args=(actor_idx, proc_cfg, param_q, actor_output_queue, actor_stop),
+                        name=f"selfplay-proc-{actor_idx}",
+                        daemon=True,
+                    )
+                    actor_proc.start()
+                    actor_processes.append(actor_proc)
+            finally:
+                if actor_jax_platforms:
+                    if prev_jax_platforms is None:
+                        os.environ.pop("JAX_PLATFORMS", None)
+                    else:
+                        os.environ["JAX_PLATFORMS"] = prev_jax_platforms
+                    if prev_jax_platform_name is None:
+                        os.environ.pop("JAX_PLATFORM_NAME", None)
+                    else:
+                        os.environ["JAX_PLATFORM_NAME"] = prev_jax_platform_name
         else:
             actor_stop = threading.Event()
             params_ref_lock = threading.Lock()
             params_ref = [params]
+            actor_collect_steps = None
+            if use_pmap:
+                assert actor_device_groups is not None
+                actor_collect_steps = [
+                    make_pmap_collect_step(play_many_games_fn, devices=devices)
+                    for devices in actor_device_groups
+                ]
 
             def actor_loop(actor_idx: int) -> None:
                 nonlocal actor_batches_total, actor_examples_total
@@ -1025,7 +1112,32 @@ def main() -> None:
                         with params_ref_lock:
                             collect_params = params_ref[0]
                         actor_rng, collect_key = jax.random.split(actor_rng)
-                        payload = collect_new_examples(collect_params, collect_key)
+                        if use_pmap and actor_collect_steps is not None:
+                            assert actor_devices_per_group > 0
+                            start = actor_idx * actor_devices_per_group
+                            end = start + actor_devices_per_group
+                            collect_params_actor = jax.tree_util.tree_map(lambda x: x[start:end], collect_params)
+                            collect_keys = jax.random.split(collect_key, actor_devices_per_group)
+                            collect_temperature = jnp.full(
+                                (actor_devices_per_group,),
+                                jnp.float32(args.temperature),
+                                dtype=jnp.float32,
+                            )
+                            obs, policy, value, mask, _, winners = actor_collect_steps[actor_idx](
+                                collect_params_actor,
+                                collect_keys,
+                                collect_temperature,
+                            )
+                            payload = _pack_collect_payload(
+                                obs=obs,
+                                policy=policy,
+                                value=value,
+                                mask=mask,
+                                winners=winners,
+                                board_size=args.board_size,
+                            )
+                        else:
+                            payload = collect_new_examples(collect_params, collect_key)
                         assert replay_queue is not None
                         while actor_stop is not None and (not actor_stop.is_set()):
                             try:
@@ -1258,7 +1370,7 @@ def main() -> None:
                     f"draw={arena_draws} win_rate={arena_win_rate:.3f} threshold={args.arena_replace_threshold:.3f}"
                 )
                 if arena_win_rate >= args.arena_replace_threshold:
-                    best_params = current_params
+                    best_params = _clone_tree(current_params)
                     if use_pmap:
                         best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
                     best_step = step

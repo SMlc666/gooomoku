@@ -5,6 +5,8 @@ __pycache__/
 .mypy_cache/
 .DS_Store
 .ipynb_checkpoints/
+.venv/
+.jax_cache/
 
 checkpoints/
 artifacts/

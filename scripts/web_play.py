@@ -28,6 +28,7 @@ sys.path.append(str(REPO_ROOT / "src"))
 from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
+from gooomoku.runtime import configure_jax_runtime
 
 
 def _dtype_from_name(name: str):
@@ -291,6 +292,7 @@ def parse_args() -> argparse.Namespace:
 def create_app(args: argparse.Namespace) -> FastAPI:
     if args.jax_platforms:
         jax.config.update("jax_platforms", args.jax_platforms)
+    configure_jax_runtime(app_name="web_play", repo_root=REPO_ROOT)
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     payload, _resolved_path = _resolve_artifact_checkpoint(args.model_artifact, args.artifact_sha256)

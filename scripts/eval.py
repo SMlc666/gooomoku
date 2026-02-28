@@ -14,6 +14,7 @@ sys.path.append(str(REPO_ROOT / "src"))
 from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
+from gooomoku.runtime import configure_jax_runtime
 
 
 def _dtype_from_name(name: str):
@@ -137,6 +138,7 @@ def build_eval_vs_random_fn(
 
 
 def main() -> None:
+    configure_jax_runtime(app_name="eval", repo_root=REPO_ROOT)
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint against random agent.")
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/latest.pkl"))
     parser.add_argument("--games", type=int, default=20)

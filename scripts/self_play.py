@@ -16,6 +16,7 @@ sys.path.append(str(REPO_ROOT / "src"))
 from gooomoku import env
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
+from gooomoku.runtime import configure_jax_runtime
 
 
 def _dtype_from_name(name: str):
@@ -345,6 +346,7 @@ def stack_examples(examples: Sequence[TrainingExample]) -> Tuple[jnp.ndarray, jn
 
 
 def main() -> None:
+    configure_jax_runtime(app_name="self_play", repo_root=REPO_ROOT)
     parser = argparse.ArgumentParser(description="Run minimal JAX+mctx gomoku self-play.")
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--num-simulations", type=int, default=64)
