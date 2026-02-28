@@ -1364,12 +1364,11 @@ def _run_actor_role(
                             f"optimizer_updates={last_optimizer_updates}"
                         )
 
-            if sent_batches % 10 == 0:
-                elapsed = max(time.perf_counter() - start_time, 1e-6)
-                print(
-                    f"actor[{process_index}] sent_batches={sent_batches} sent_examples={sent_examples} "
-                    f"examples_per_sec={sent_examples / elapsed:.1f}"
-                )
+            elapsed = max(time.perf_counter() - start_time, 1e-6)
+            print(
+                f"actor[{process_index}] sent_batches={sent_batches} sent_examples={sent_examples} "
+                f"examples_per_sec={sent_examples / elapsed:.1f}"
+            )
     finally:
         sock.close()
 
