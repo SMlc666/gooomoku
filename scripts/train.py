@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import multiprocessing as mp
 import os
 import pickle
 import queue as queue_lib
@@ -30,6 +31,83 @@ from scripts.self_play import build_play_many_games_fn
 
 SelfPlayBatch = tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
 ActorError = tuple[int, BaseException]
+ActorMessage = tuple[str, Any]
+
+
+def _run_cross_process_actor(
+    actor_idx: int,
+    cfg: dict[str, Any],
+    params_queue: mp.Queue,
+    output_queue: mp.Queue,
+    stop_event: Any,
+) -> None:
+    jax.config.update("jax_platform_name", "cpu")
+
+    model = PolicyValueNet(
+        board_size=int(cfg["board_size"]),
+        channels=int(cfg["channels"]),
+        blocks=int(cfg["blocks"]),
+        compute_dtype=_dtype_from_name(str(cfg["compute_dtype"])),
+        param_dtype=_dtype_from_name(str(cfg["param_dtype"])),
+    )
+    play_many_games_fn = build_play_many_games_fn(
+        model=model,
+        board_size=int(cfg["board_size"]),
+        num_simulations=int(cfg["num_simulations"]),
+        max_num_considered_actions=int(cfg["max_num_considered_actions"]),
+        num_games=int(cfg["num_games"]),
+        temperature_drop_move=int(cfg["temperature_drop_move"]),
+        final_temperature=float(cfg["final_temperature"]),
+        root_dirichlet_fraction=float(cfg["root_dirichlet_fraction"]),
+        root_dirichlet_alpha=float(cfg["root_dirichlet_alpha"]),
+    )
+
+    rng = jax.random.PRNGKey(int(cfg["seed"]) + 100003 * (actor_idx + 1))
+    params = params_queue.get()
+    board_size = int(cfg["board_size"])
+    temperature = jnp.float32(float(cfg["temperature"]))
+
+    while not stop_event.is_set():
+        try:
+            while True:
+                try:
+                    params = params_queue.get_nowait()
+                except queue_lib.Empty:
+                    break
+
+            rng, collect_key = jax.random.split(rng)
+            obs, policy, value, mask, _, winners = play_many_games_fn(params, collect_key, temperature)
+            obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+            obs_np = np.asarray(obs_np)
+            policy_np = np.asarray(policy_np)
+            value_np = np.asarray(value_np)
+            mask_np = np.asarray(mask_np)
+            winners_np = np.asarray(winners_np)
+
+            flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
+            flat_policy = policy_np.reshape((-1, board_size * board_size))
+            flat_value = value_np.reshape((-1,))
+            valid = mask_np.reshape((-1,)).astype(bool)
+
+            payload = (
+                flat_obs[valid].astype(np.uint8),
+                flat_policy[valid].astype(np.float32),
+                flat_value[valid].astype(np.float32),
+                int((winners_np == 1).sum()),
+                int((winners_np == -1).sum()),
+                int((winners_np == 0).sum()),
+                int(valid.sum()),
+            )
+
+            while not stop_event.is_set():
+                try:
+                    output_queue.put(("data", payload), timeout=0.2)
+                    break
+                except queue_lib.Full:
+                    continue
+        except BaseException as exc:
+            output_queue.put(("error", (actor_idx, repr(exc))))
+            break
 
 
 def _dtype_from_name(name: str):
@@ -267,6 +345,7 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "arena_temperature": args.arena_temperature,
         "checkpoint_every_steps": args.checkpoint_every_steps,
         "async_selfplay": args.async_selfplay,
+        "cross_process_selfplay": args.cross_process_selfplay,
         "selfplay_actors": args.selfplay_actors,
         "actor_param_sync_updates": args.actor_param_sync_updates,
         "optimizer_updates": optimizer_updates,
@@ -602,6 +681,7 @@ def main() -> None:
     parser.add_argument("--disable-pmap", action="store_true")
     parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--async-selfplay", action="store_true")
+    parser.add_argument("--cross-process-selfplay", action="store_true")
     parser.add_argument("--async-selfplay-queue-size", type=int, default=4)
     parser.add_argument("--selfplay-actors", type=int, default=1)
     parser.add_argument("--actor-param-sync-updates", type=int, default=1)
@@ -722,6 +802,12 @@ def main() -> None:
     process_count = jax.process_count()
     process_index = jax.process_index()
     is_chief = process_index == 0
+
+    if process_count > 1 and args.async_selfplay and (not args.cross_process_selfplay):
+        if is_chief:
+            print("multi-host detected: enabling cross-process self-play for TPU runtime stability")
+        args.cross_process_selfplay = True
+
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
@@ -772,6 +858,7 @@ def main() -> None:
             f"global_device_count={global_devices}, distributed_initialized={distributed_initialized}, "
             f"per_device_batch={per_device_batch}, "
             f"selfplay_games_per_device={games_per_device}, async_selfplay={args.async_selfplay}, "
+            f"cross_process_selfplay={args.cross_process_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"updates_per_step={args.updates_per_step}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
@@ -785,7 +872,8 @@ def main() -> None:
             f"single-device mode: process={process_index}/{process_count}, local_device_count={local_devices}, "
             f"global_device_count={global_devices}, distributed_initialized={distributed_initialized}, "
             f"updates_per_step={args.updates_per_step}, "
-            f"async_selfplay={args.async_selfplay}, selfplay_actors={args.selfplay_actors}, "
+            f"async_selfplay={args.async_selfplay}, cross_process_selfplay={args.cross_process_selfplay}, "
+            f"selfplay_actors={args.selfplay_actors}, "
             f"actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
@@ -833,11 +921,14 @@ def main() -> None:
 
     completed_step = start_step - 1
     replay_queue: queue_lib.Queue[SelfPlayBatch] | None = None
-    actor_stop: threading.Event | None = None
+    actor_stop: Any = None
     actor_errors: list[ActorError] = []
     params_ref_lock: threading.Lock | None = None
     params_ref: list[Any] | None = None
     actor_threads: list[threading.Thread] = []
+    actor_processes: list[Any] = []
+    actor_params_queues: list[Any] = []
+    actor_output_queue: Any = None
     actor_stats_lock = threading.Lock()
     actor_batches_total = 0
     actor_examples_total = 0
@@ -885,46 +976,81 @@ def main() -> None:
 
     if args.async_selfplay:
         replay_queue = queue_lib.Queue(maxsize=args.async_selfplay_queue_size)
-        actor_stop = threading.Event()
-        params_ref_lock = threading.Lock()
-        params_ref = [params]
+        if args.cross_process_selfplay:
+            ctx = mp.get_context("spawn")
+            actor_stop = ctx.Event()
+            actor_output_queue = ctx.Queue(maxsize=args.async_selfplay_queue_size)
+            params_seed = _extract_host_tree(params, use_pmap=use_pmap)
+            params_seed = jax.device_get(params_seed)
+            proc_cfg = {
+                "board_size": args.board_size,
+                "channels": args.channels,
+                "blocks": args.blocks,
+                "compute_dtype": args.compute_dtype,
+                "param_dtype": args.param_dtype,
+                "num_simulations": args.num_simulations,
+                "max_num_considered_actions": args.max_num_considered_actions,
+                "num_games": selfplay_batch_games,
+                "temperature_drop_move": args.temperature_drop_move,
+                "final_temperature": args.final_temperature,
+                "root_dirichlet_fraction": args.root_dirichlet_fraction,
+                "root_dirichlet_alpha": args.root_dirichlet_alpha,
+                "temperature": args.temperature,
+                "seed": args.seed,
+            }
+            for actor_idx in range(args.selfplay_actors):
+                param_q = ctx.Queue(maxsize=1)
+                param_q.put(params_seed)
+                actor_params_queues.append(param_q)
+                actor_proc = ctx.Process(
+                    target=_run_cross_process_actor,
+                    args=(actor_idx, proc_cfg, param_q, actor_output_queue, actor_stop),
+                    name=f"selfplay-proc-{actor_idx}",
+                    daemon=True,
+                )
+                actor_proc.start()
+                actor_processes.append(actor_proc)
+        else:
+            actor_stop = threading.Event()
+            params_ref_lock = threading.Lock()
+            params_ref = [params]
 
-        def actor_loop(actor_idx: int) -> None:
-            nonlocal actor_batches_total, actor_examples_total
-            actor_rng = jax.random.PRNGKey(args.seed + 9973 + actor_idx * 100003)
-            while actor_stop is not None and (not actor_stop.is_set()):
-                try:
-                    if params_ref_lock is None or params_ref is None:
-                        break
-                    with params_ref_lock:
-                        collect_params = params_ref[0]
-                    actor_rng, collect_key = jax.random.split(actor_rng)
-                    payload = collect_new_examples(collect_params, collect_key)
-                    assert replay_queue is not None
-                    while actor_stop is not None and (not actor_stop.is_set()):
-                        try:
-                            replay_queue.put(payload, timeout=0.2)
-                            with actor_stats_lock:
-                                actor_batches_total += 1
-                                actor_examples_total += payload[6]
+            def actor_loop(actor_idx: int) -> None:
+                nonlocal actor_batches_total, actor_examples_total
+                actor_rng = jax.random.PRNGKey(args.seed + 9973 + actor_idx * 100003)
+                while actor_stop is not None and (not actor_stop.is_set()):
+                    try:
+                        if params_ref_lock is None or params_ref is None:
                             break
-                        except queue_lib.Full:
-                            continue
-                except BaseException as exc:
-                    actor_errors.append((actor_idx, exc))
-                    if actor_stop is not None:
-                        actor_stop.set()
-                    break
+                        with params_ref_lock:
+                            collect_params = params_ref[0]
+                        actor_rng, collect_key = jax.random.split(actor_rng)
+                        payload = collect_new_examples(collect_params, collect_key)
+                        assert replay_queue is not None
+                        while actor_stop is not None and (not actor_stop.is_set()):
+                            try:
+                                replay_queue.put(payload, timeout=0.2)
+                                with actor_stats_lock:
+                                    actor_batches_total += 1
+                                    actor_examples_total += payload[6]
+                                break
+                            except queue_lib.Full:
+                                continue
+                    except BaseException as exc:
+                        actor_errors.append((actor_idx, exc))
+                        if actor_stop is not None:
+                            actor_stop.set()
+                        break
 
-        for actor_idx in range(args.selfplay_actors):
-            actor_thread = threading.Thread(
-                target=actor_loop,
-                args=(actor_idx,),
-                name=f"selfplay-actor-{actor_idx}",
-                daemon=True,
-            )
-            actor_thread.start()
-            actor_threads.append(actor_thread)
+            for actor_idx in range(args.selfplay_actors):
+                actor_thread = threading.Thread(
+                    target=actor_loop,
+                    args=(actor_idx,),
+                    name=f"selfplay-actor-{actor_idx}",
+                    daemon=True,
+                )
+                actor_thread.start()
+                actor_threads.append(actor_thread)
 
     if start_step > args.train_steps:
         print(
@@ -941,7 +1067,6 @@ def main() -> None:
                 raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
 
             if args.async_selfplay:
-                assert replay_queue is not None
                 assert actor_stop is not None
                 wait_start = time.perf_counter()
                 while True:
@@ -949,15 +1074,36 @@ def main() -> None:
                         actor_idx, exc = actor_errors[0]
                         raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
                     try:
-                        (
-                            new_obs,
-                            new_policy,
-                            new_value,
-                            black_win,
-                            white_win,
-                            draw,
-                            new_examples,
-                        ) = replay_queue.get(timeout=0.5)
+                        if args.cross_process_selfplay:
+                            assert actor_output_queue is not None
+                            msg_type, msg_payload = actor_output_queue.get(timeout=0.5)
+                            if msg_type == "error":
+                                actor_idx, err_text = msg_payload
+                                actor_errors.append((int(actor_idx), RuntimeError(err_text)))
+                                continue
+                            (
+                                new_obs,
+                                new_policy,
+                                new_value,
+                                black_win,
+                                white_win,
+                                draw,
+                                new_examples,
+                            ) = msg_payload
+                            with actor_stats_lock:
+                                actor_batches_total += 1
+                                actor_examples_total += new_examples
+                        else:
+                            assert replay_queue is not None
+                            (
+                                new_obs,
+                                new_policy,
+                                new_value,
+                                black_win,
+                                white_win,
+                                draw,
+                                new_examples,
+                            ) = replay_queue.get(timeout=0.5)
                         break
                     except queue_lib.Empty:
                         if actor_stop.is_set() and actor_errors:
@@ -1046,12 +1192,24 @@ def main() -> None:
 
                 if (
                     args.async_selfplay
-                    and params_ref_lock is not None
-                    and params_ref is not None
                     and (optimizer_updates % args.actor_param_sync_updates == 0)
                 ):
-                    with params_ref_lock:
-                        params_ref[0] = params
+                    if args.cross_process_selfplay:
+                        params_host = _extract_host_tree(params, use_pmap=use_pmap)
+                        params_host = jax.device_get(params_host)
+                        for param_q in actor_params_queues:
+                            try:
+                                while True:
+                                    param_q.get_nowait()
+                            except queue_lib.Empty:
+                                pass
+                            try:
+                                param_q.put_nowait(params_host)
+                            except queue_lib.Full:
+                                pass
+                    elif params_ref_lock is not None and params_ref is not None:
+                        with params_ref_lock:
+                            params_ref[0] = params
 
             loss_val = loss_sum / args.updates_per_step
             pol_val = policy_sum / args.updates_per_step
@@ -1113,6 +1271,10 @@ def main() -> None:
     finally:
         if actor_stop is not None:
             actor_stop.set()
+        for actor_proc in actor_processes:
+            actor_proc.join(timeout=5.0)
+            if actor_proc.is_alive():
+                actor_proc.terminate()
         for actor_thread in actor_threads:
             actor_thread.join(timeout=5.0)
 
