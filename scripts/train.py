@@ -111,6 +111,7 @@ def _run_cross_process_actor(
     rng = jax.random.PRNGKey(int(cfg["seed"]) + 100003 * (actor_idx + 1))
     params = params_queue.get()
     board_size = int(cfg["board_size"])
+    fixed_examples = int(cfg.get("replay_fixed_update_size", 0))
     temperature = jnp.float32(float(cfg["temperature"]))
 
     while not stop_event.is_set():
@@ -135,14 +136,21 @@ def _run_cross_process_actor(
             flat_value = value_np.reshape((-1,))
             valid = mask_np.reshape((-1,)).astype(bool)
 
+            packed_obs, packed_policy, packed_value, stored_examples = _stabilize_replay_payload_examples(
+                flat_obs,
+                flat_policy,
+                flat_value,
+                valid,
+                fixed_examples=fixed_examples,
+            )
             payload = (
-                flat_obs[valid].astype(np.uint8),
-                flat_policy[valid].astype(np.float32),
-                flat_value[valid].astype(np.float32),
+                packed_obs,
+                packed_policy,
+                packed_value,
                 int((winners_np == 1).sum()),
                 int((winners_np == -1).sum()),
                 int((winners_np == 0).sum()),
-                int(valid.sum()),
+                stored_examples,
             )
 
             while not stop_event.is_set():
@@ -1028,6 +1036,44 @@ def _materialize_replay_from_device(
     return obs_np, policy_np, value_np
 
 
+def _stabilize_replay_payload_examples(
+    flat_obs: np.ndarray,
+    flat_policy: np.ndarray,
+    flat_value: np.ndarray,
+    valid: np.ndarray,
+    *,
+    fixed_examples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    compact_obs = flat_obs[valid]
+    compact_policy = flat_policy[valid]
+    compact_value = flat_value[valid]
+    compact_count = int(compact_obs.shape[0])
+
+    if fixed_examples <= 0 or compact_count <= 0:
+        return (
+            np.asarray(compact_obs, dtype=np.uint8),
+            np.asarray(compact_policy, dtype=np.float32),
+            np.asarray(compact_value, dtype=np.float32),
+            compact_count,
+        )
+
+    if compact_count >= fixed_examples:
+        return (
+            np.asarray(compact_obs[:fixed_examples], dtype=np.uint8),
+            np.asarray(compact_policy[:fixed_examples], dtype=np.float32),
+            np.asarray(compact_value[:fixed_examples], dtype=np.float32),
+            fixed_examples,
+        )
+
+    pad_index = np.arange(fixed_examples, dtype=np.int32) % compact_count
+    return (
+        np.asarray(compact_obs[pad_index], dtype=np.uint8),
+        np.asarray(compact_policy[pad_index], dtype=np.float32),
+        np.asarray(compact_value[pad_index], dtype=np.float32),
+        fixed_examples,
+    )
+
+
 def _pack_collect_payload(
     *,
     obs,
@@ -1036,6 +1082,7 @@ def _pack_collect_payload(
     mask,
     winners,
     board_size: int,
+    fixed_examples: int,
 ) -> SelfPlayBatch:
     obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
     obs_np = np.asarray(obs_np)
@@ -1049,14 +1096,22 @@ def _pack_collect_payload(
     flat_value = value_np.reshape((-1,))
     valid = mask_np.reshape((-1,)).astype(bool)
 
+    packed_obs, packed_policy, packed_value, stored_examples = _stabilize_replay_payload_examples(
+        flat_obs,
+        flat_policy,
+        flat_value,
+        valid,
+        fixed_examples=fixed_examples,
+    )
+
     return (
-        flat_obs[valid],
-        flat_policy[valid],
-        flat_value[valid],
+        packed_obs,
+        packed_policy,
+        packed_value,
         int((winners_np == 1).sum()),
         int((winners_np == -1).sum()),
         int((winners_np == 0).sum()),
-        int(valid.sum()),
+        stored_examples,
     )
 
 
@@ -1184,6 +1239,7 @@ def _run_actor_role(
                 mask=mask,
                 winners=winners,
                 board_size=args.board_size,
+                fixed_examples=args.replay_fixed_update_size,
             )
             send_selfplay_batch(sock, payload)
             sent_batches += 1
@@ -1369,6 +1425,15 @@ def main() -> None:
     parser.add_argument("--async-selfplay-queue-size", type=int, default=4)
     parser.add_argument("--selfplay-actors", type=int, default=1)
     parser.add_argument("--actor-param-sync-updates", type=int, default=1)
+    parser.add_argument(
+        "--replay-fixed-update-size",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, force each self-play payload to a fixed example count "
+            "(truncate/repeat valid rows) to stabilize replay append shapes and reduce recompiles."
+        ),
+    )
     parser.add_argument("--selfplay-batch-games", type=int, default=None)
     parser.add_argument("--replay-host", type=str, default="auto")
     parser.add_argument("--replay-port", type=int, default=19091)
@@ -1407,6 +1472,8 @@ def main() -> None:
         raise ValueError("selfplay-actors must be >= 1")
     if args.actor_param_sync_updates < 1:
         raise ValueError("actor-param-sync-updates must be >= 1")
+    if args.replay_fixed_update_size < 0:
+        raise ValueError("replay-fixed-update-size must be >= 0")
     if args.remote_replay_queue_size < 1:
         raise ValueError("remote-replay-queue-size must be >= 1")
     if args.replay_port <= 0:
@@ -1635,6 +1702,7 @@ def main() -> None:
             f"cross_process_selfplay={args.cross_process_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"updates_per_step={args.updates_per_step}, "
+            f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
@@ -1649,6 +1717,7 @@ def main() -> None:
             f"async_selfplay={args.async_selfplay}, cross_process_selfplay={args.cross_process_selfplay}, "
             f"selfplay_actors={args.selfplay_actors}, "
             f"actor_param_sync_updates={args.actor_param_sync_updates}, "
+            f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
@@ -1754,6 +1823,7 @@ def main() -> None:
             mask=mask,
             winners=winners,
             board_size=args.board_size,
+            fixed_examples=args.replay_fixed_update_size,
         )
 
     if args.role == "learner":
@@ -1841,6 +1911,7 @@ def main() -> None:
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "actor_jax_platforms": actor_jax_platforms,
+                "replay_fixed_update_size": args.replay_fixed_update_size,
             }
             # Spawned actors inherit parent env. Set actor JAX platform in parent
             # before Process.start() so child bootstrap sees the intended backend.
@@ -1917,6 +1988,7 @@ def main() -> None:
                                 mask=mask,
                                 winners=winners,
                                 board_size=args.board_size,
+                                fixed_examples=args.replay_fixed_update_size,
                             )
                         else:
                             payload = collect_new_examples(collect_params, collect_key)
