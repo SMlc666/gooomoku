@@ -79,12 +79,16 @@ def build_play_one_game_fn(
 ):
     max_steps = board_size * board_size
     num_actions = max_steps
+    # Keep root-defense heuristics off for self-play throughput: they add
+    # many gather/scatter/bincount ops to the MCTS jaxpr and can make TPU
+    # compile + runtime dramatically slower for large batches.
     search_fn = build_search_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
+        force_defense_at_root=False,
     )
 
     @jax.jit
@@ -158,12 +162,16 @@ def build_play_many_games_fn(
         lambda x: jnp.broadcast_to(x, (num_games,) + x.shape),
         init_state,
     )
+    # Keep root-defense heuristics off for self-play throughput: they add
+    # many gather/scatter/bincount ops to the MCTS jaxpr and can make TPU
+    # compile + runtime dramatically slower for large batches.
     search_fn = build_search_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
+        force_defense_at_root=False,
     )
 
     @jax.jit
