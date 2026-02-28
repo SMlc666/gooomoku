@@ -1382,6 +1382,9 @@ def main() -> None:
     parser.add_argument("--replay-endpoint-wait-seconds", type=float, default=180.0)
     parser.add_argument("--actor-steps", type=int, default=0)
     parser.add_argument("--actor-sync-every-batches", type=int, default=8)
+    parser.add_argument("--wait-log-interval-seconds", type=float, default=30.0)
+    parser.add_argument("--phase-log-threshold-ms", type=float, default=5000.0)
+    parser.add_argument("--detailed-step-log", action="store_true")
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
@@ -1420,6 +1423,10 @@ def main() -> None:
         raise ValueError("actor-steps must be >= 0")
     if args.actor_sync_every_batches < 0:
         raise ValueError("actor-sync-every-batches must be >= 0")
+    if args.wait_log_interval_seconds <= 0:
+        raise ValueError("wait-log-interval-seconds must be > 0")
+    if args.phase_log_threshold_ms < 0:
+        raise ValueError("phase-log-threshold-ms must be >= 0")
     if args.role == "actor" and args.actor_param_source == "checkpoint" and args.resume_from is None:
         raise ValueError("--actor-param-source=checkpoint requires --resume-from")
 
@@ -1655,11 +1662,12 @@ def main() -> None:
     )
     best_path = _best_checkpoint_path(args.output)
 
-    def maybe_save_training_checkpoint(step: int, reason: str) -> None:
+    def maybe_save_training_checkpoint(step: int, reason: str) -> float:
         if not is_chief:
-            return
+            return 0.0
         if args.checkpoint_every_steps <= 0 or (step % args.checkpoint_every_steps != 0):
-            return
+            return 0.0
+        save_start = time.perf_counter()
         current_params = _extract_host_tree(params, use_pmap=use_pmap)
         current_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
         replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_device(
@@ -1684,7 +1692,9 @@ def main() -> None:
             best_params=best_params,
             best_step=best_step,
         )
-        print(f"saved training checkpoint ({reason}) to {args.output}")
+        checkpoint_ms = (time.perf_counter() - save_start) * 1000.0
+        print(f"saved training checkpoint ({reason}) to {args.output} checkpoint_ms={checkpoint_ms:.1f}")
+        return checkpoint_ms
 
     completed_step = start_step - 1
     replay_queue: queue_lib.Queue[SelfPlayBatch] | None = None
@@ -1718,8 +1728,9 @@ def main() -> None:
     param_sync_accept_thread: threading.Thread | None = None
     param_sync_client_threads: list[threading.Thread] = []
     param_sync_client_threads_lock: threading.Lock | None = None
-    learner_wait_log_interval_sec = 30.0
+    wait_log_interval_sec = args.wait_log_interval_seconds
     learner_last_wait_log_at = time.perf_counter()
+    async_last_wait_log_at = learner_last_wait_log_at
 
     def collect_new_examples(params_for_collect, collect_rng_key):
         if use_pmap:
@@ -1945,6 +1956,11 @@ def main() -> None:
             completed_step = step
             step_start = time.perf_counter()
             collect_wait_ms = 0.0
+            replay_append_ms = 0.0
+            train_updates_ms = 0.0
+            param_snapshot_ms = 0.0
+            arena_ms = 0.0
+            checkpoint_ms = 0.0
             if actor_errors:
                 actor_idx, exc = actor_errors[0]
                 raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
@@ -1979,7 +1995,7 @@ def main() -> None:
                         break
                     except queue_lib.Empty:
                         now = time.perf_counter()
-                        if now - learner_last_wait_log_at >= learner_wait_log_interval_sec:
+                        if now - learner_last_wait_log_at >= wait_log_interval_sec:
                             learner_last_wait_log_at = now
                             print(
                                 "learner waiting for replay batch "
@@ -2035,6 +2051,14 @@ def main() -> None:
                         if actor_stop.is_set() and actor_errors:
                             actor_idx, exc = actor_errors[0]
                             raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
+                        now = time.perf_counter()
+                        if now - async_last_wait_log_at >= wait_log_interval_sec:
+                            async_last_wait_log_at = now
+                            assert replay_queue is not None
+                            print(
+                                "async selfplay waiting for batch "
+                                f"qsize={replay_queue.qsize()} actor_errors={len(actor_errors)}"
+                            )
                         continue
                 wait_sec = time.perf_counter() - wait_start
                 collect_wait_ms = wait_sec * 1000.0
@@ -2054,6 +2078,7 @@ def main() -> None:
                 ) = collect_new_examples(params, collect_key)
                 collect_wait_ms = (time.perf_counter() - collect_start) * 1000.0
 
+            replay_append_start = time.perf_counter()
             replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
                 replay_obs_dev,
                 replay_policy_dev,
@@ -2064,15 +2089,17 @@ def main() -> None:
                 new_policy=new_policy,
                 new_value=new_value,
             )
+            replay_append_ms = (time.perf_counter() - replay_append_start) * 1000.0
 
             if replay_count < args.batch_size:
                 print(f"step={step} replay={replay_count} waiting for enough samples")
-                maybe_save_training_checkpoint(step, "replay-wait")
+                checkpoint_ms = maybe_save_training_checkpoint(step, "replay-wait")
                 continue
 
             loss_sum = 0.0
             policy_sum = 0.0
             value_sum = 0.0
+            train_updates_start = time.perf_counter()
             for _ in range(args.updates_per_step):
                 rng_key, sample_key = jax.random.split(rng_key)
                 sample_ids = jax.random.randint(
@@ -2136,6 +2163,7 @@ def main() -> None:
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
                             params_ref[0] = _clone_tree(params)
+            train_updates_ms = (time.perf_counter() - train_updates_start) * 1000.0
 
             if (
                 args.role == "learner"
@@ -2143,6 +2171,7 @@ def main() -> None:
                 and param_sync_snapshot_state is not None
                 and (step % args.param_sync_every_steps == 0)
             ):
+                snapshot_start = time.perf_counter()
                 with param_sync_snapshot_lock:
                     param_sync_snapshot_state["optimizer_updates"] = int(optimizer_updates)
                     param_sync_snapshot_state["blob"] = _build_param_sync_blob(
@@ -2150,6 +2179,7 @@ def main() -> None:
                         use_pmap=use_pmap,
                         optimizer_updates=optimizer_updates,
                     )
+                param_snapshot_ms = (time.perf_counter() - snapshot_start) * 1000.0
 
             loss_val = loss_sum / args.updates_per_step
             pol_val = policy_sum / args.updates_per_step
@@ -2168,16 +2198,39 @@ def main() -> None:
             queue_size = replay_queue.qsize() if replay_queue is not None else 0
 
             if is_chief:
+                details = ""
+                if args.detailed_step_log:
+                    details = (
+                        f" replay_append_ms={replay_append_ms:.1f} train_updates_ms={train_updates_ms:.1f} "
+                        f"param_snapshot_ms={param_snapshot_ms:.1f}"
+                    )
                 print(
                 f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
                 f"replay={replay_count} new_examples={new_examples} "
                 f"bw={black_win} ww={white_win} d={draw} "
                 f"step_ms={step_ms:.1f} collect_ms={collect_wait_ms:.1f} wait_avg_ms={avg_wait_ms:.1f} "
                 f"qsize={queue_size} actor_batches={actor_batches_snapshot} actor_examples={actor_examples_snapshot} "
-                f"actor_bps={actor_batches_per_sec:.2f} actor_eps={actor_examples_per_sec:.1f}"
+                f"actor_bps={actor_batches_per_sec:.2f} actor_eps={actor_examples_per_sec:.1f}{details}"
             )
 
+            if is_chief and args.phase_log_threshold_ms > 0:
+                if collect_wait_ms >= args.phase_log_threshold_ms:
+                    print(f"phase-slow step={step} phase=collect collect_ms={collect_wait_ms:.1f}")
+                if replay_append_ms >= args.phase_log_threshold_ms:
+                    print(f"phase-slow step={step} phase=replay_append replay_append_ms={replay_append_ms:.1f}")
+                if train_updates_ms >= args.phase_log_threshold_ms:
+                    print(
+                        f"phase-slow step={step} phase=train_updates train_updates_ms={train_updates_ms:.1f} "
+                        f"updates_per_step={args.updates_per_step}"
+                    )
+                if param_snapshot_ms >= args.phase_log_threshold_ms:
+                    print(
+                        f"phase-slow step={step} phase=param_snapshot param_snapshot_ms={param_snapshot_ms:.1f} "
+                        f"param_sync_every_steps={args.param_sync_every_steps}"
+                    )
+
             if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
+                arena_start = time.perf_counter()
                 rng_key, arena_key = jax.random.split(rng_key)
                 if use_pmap:
                     arena_keys = jax.random.split(arena_key, local_devices)
@@ -2207,8 +2260,13 @@ def main() -> None:
                         best_cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
                         _save_model_checkpoint(best_path, best_params, best_cfg)
                         print(f"arena promoted candidate at step={step} -> {best_path}")
+                arena_ms = (time.perf_counter() - arena_start) * 1000.0
+                if is_chief and args.phase_log_threshold_ms > 0 and arena_ms >= args.phase_log_threshold_ms:
+                    print(f"phase-slow step={step} phase=arena arena_ms={arena_ms:.1f}")
 
-            maybe_save_training_checkpoint(step, "periodic")
+            checkpoint_ms = maybe_save_training_checkpoint(step, "periodic")
+            if is_chief and args.phase_log_threshold_ms > 0 and checkpoint_ms >= args.phase_log_threshold_ms:
+                print(f"phase-slow step={step} phase=checkpoint checkpoint_ms={checkpoint_ms:.1f}")
     finally:
         if actor_stop is not None:
             actor_stop.set()

@@ -90,6 +90,25 @@ When using `gs://` paths, `gcloud` CLI must be available on the runtime host.
 - Training checkpoint writes are chief-only (`process_index == 0`) in distributed mode to avoid multi-host file write races.
 - This is a minimal baseline focused on structure and correctness, not peak throughput.
 
+### Training observability knobs
+
+When diagnosing intermittent stalls (for example long gaps between `step=...` lines), `scripts/train.py` now exposes logging controls:
+
+- `--wait-log-interval-seconds` (default `30.0`): heartbeat interval while waiting for replay batches.
+- `--phase-log-threshold-ms` (default `5000.0`): emits `phase-slow` logs when collect/replay-append/train-updates/param-snapshot/arena/checkpoint exceeds this latency.
+- `--detailed-step-log`: adds per-step phase timings (`replay_append_ms`, `train_updates_ms`, `param_snapshot_ms`) to the regular `step=...` line.
+
+Example (more verbose diagnostics):
+
+```bash
+PYTHONPATH=src python scripts/train.py \
+  --board-size 15 --channels 96 --blocks 6 \
+  --async-selfplay \
+  --detailed-step-log \
+  --wait-log-interval-seconds 10 \
+  --phase-log-threshold-ms 2000
+```
+
 ### Role-separated learner/actor mode (TPU actors)
 
 `scripts/train.py` now supports `--role all|learner|actor` (default `all`).
