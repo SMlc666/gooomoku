@@ -2167,7 +2167,8 @@ def main() -> None:
             )
             queue_size = replay_queue.qsize() if replay_queue is not None else 0
 
-            print(
+            if is_chief:
+                print(
                 f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
                 f"replay={replay_count} new_examples={new_examples} "
                 f"bw={black_win} ww={white_win} d={draw} "
