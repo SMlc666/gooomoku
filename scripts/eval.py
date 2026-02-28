@@ -46,6 +46,7 @@ def build_play_vs_random_fn(
     board_size: int,
     num_simulations: int,
     max_num_considered_actions: int,
+    c_lcb: float = 0.0,
 ) -> callable:
     max_steps = board_size * board_size
     search_fn = build_search_fn(
@@ -54,6 +55,7 @@ def build_play_vs_random_fn(
         max_num_considered_actions=max_num_considered_actions,
         root_dirichlet_fraction=0.0,
         root_dirichlet_alpha=0.03,
+        c_lcb=c_lcb,
     )
 
     @jax.jit
@@ -103,12 +105,14 @@ def build_eval_vs_random_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     num_games: int,
+    c_lcb: float = 0.0,
 ) -> callable:
     play_vs_random_fn = build_play_vs_random_fn(
         model=model,
         board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        c_lcb=c_lcb,
     )
 
     @jax.jit
@@ -149,6 +153,7 @@ def main() -> None:
     parser.add_argument("--compute-dtype", type=str, default=None)
     parser.add_argument("--param-dtype", type=str, default=None)
     parser.add_argument("--num-simulations", type=int, default=None)
+    parser.add_argument("--c-lcb", type=float, default=None)
     parser.add_argument("--max-num-considered-actions", type=int, default=None)
     args = parser.parse_args()
 
@@ -162,7 +167,7 @@ def main() -> None:
     param_dtype = _dtype_from_name(param_dtype_name)
     num_simulations = args.num_simulations or int(config.get("num_simulations", 64))
     max_num_considered_actions = args.max_num_considered_actions or int(config.get("max_num_considered_actions", 24))
-
+    c_lcb = args.c_lcb if args.c_lcb is not None else float(config.get("c_lcb", 0.0))
     model = PolicyValueNet(
         board_size=board_size,
         channels=channels,
@@ -177,6 +182,7 @@ def main() -> None:
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         num_games=args.games,
+        c_lcb=c_lcb,
     )
     win, loss, draw, _ = eval_fn(params, jax.random.PRNGKey(args.seed))
     win = int(win)

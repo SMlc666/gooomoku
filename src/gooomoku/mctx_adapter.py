@@ -400,6 +400,7 @@ def run_gumbel_search(
     gumbel_scale: float = 1.0,
     force_defense_at_root: bool = False,
     force_defense_in_recurrent: bool = False,
+    c_lcb: float = 0.0,
 ):
     root = root_output(
         params=params,
@@ -408,6 +409,16 @@ def run_gumbel_search(
         force_defense_at_root=force_defense_at_root,
     )
     invalid_actions = ~env.batch_legal_action_mask(states)
+    if c_lcb > 0.0:
+        def qtransform(tree, node_index):
+            base_qvalues = mctx.qtransform_completed_by_mix_value(tree, node_index)
+            visit_counts = tree.children_visits[node_index]
+            node_visit = tree.node_visits[node_index]
+            lcb_penalty = c_lcb * jnp.sqrt(jnp.maximum(1.0, node_visit)) / (1 + visit_counts)
+            return base_qvalues - lcb_penalty
+    else:
+        qtransform = mctx.qtransform_completed_by_mix_value
+
     return mctx.gumbel_muzero_policy(
         params=params,
         rng_key=rng_key,
@@ -421,6 +432,7 @@ def run_gumbel_search(
         invalid_actions=invalid_actions,
         max_num_considered_actions=max_num_considered_actions,
         gumbel_scale=gumbel_scale,
+        qtransform=qtransform,
     )
 
 
@@ -434,6 +446,7 @@ def build_search_fn(
     root_dirichlet_alpha: float = 0.03,
     force_defense_at_root: bool = True,
     force_defense_in_recurrent: bool = False,
+    c_lcb: float = 0.0,
 ):
     recurrent = functools.partial(
         recurrent_fn,
@@ -467,6 +480,16 @@ def build_search_fn(
                 value=root.value,
                 embedding=root.embedding,
             )
+        if c_lcb > 0.0:
+            def qtransform(tree, node_index):
+                base_qvalues = mctx.qtransform_completed_by_mix_value(tree, node_index)
+                visit_counts = tree.children_visits[node_index]
+                node_visit = tree.node_visits[node_index]
+                lcb_penalty = c_lcb * jnp.sqrt(jnp.maximum(1.0, node_visit)) / (1 + visit_counts)
+                return base_qvalues - lcb_penalty
+        else:
+            qtransform = mctx.qtransform_completed_by_mix_value
+
         return mctx.gumbel_muzero_policy(
             params=params,
             rng_key=search_key,
@@ -476,6 +499,7 @@ def build_search_fn(
             invalid_actions=invalid_actions,
             max_num_considered_actions=max_num_considered_actions,
             gumbel_scale=gumbel_scale,
+            qtransform=qtransform,
         )
 
     return search_fn

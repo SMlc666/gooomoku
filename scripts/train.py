@@ -799,6 +799,7 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "max_num_considered_actions": args.max_num_considered_actions,
         "updates_per_step": args.updates_per_step,
         "temperature": args.temperature,
+        "c_lcb": args.c_lcb,
         "temperature_drop_move": args.temperature_drop_move,
         "final_temperature": args.final_temperature,
         "root_dirichlet_fraction": args.root_dirichlet_fraction,
@@ -1244,6 +1245,7 @@ def _run_actor_role(
         final_temperature=args.final_temperature,
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
+        c_lcb=args.c_lcb,
     )
     collect_step = make_pmap_collect_step(play_many_games_fn) if use_pmap else play_many_games_fn
 
@@ -1472,6 +1474,7 @@ def main() -> None:
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--temperature-drop-move", type=int, default=12)
     parser.add_argument("--final-temperature", type=float, default=0.0)
     parser.add_argument("--root-dirichlet-fraction", type=float, default=0.25)
@@ -1759,6 +1762,7 @@ def main() -> None:
         final_temperature=args.final_temperature,
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
+        c_lcb=args.c_lcb,
     )
     arena_num_simulations = args.arena_num_simulations or args.num_simulations
     arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
@@ -1998,6 +2002,7 @@ def main() -> None:
                 "final_temperature": args.final_temperature,
                 "root_dirichlet_fraction": args.root_dirichlet_fraction,
                 "root_dirichlet_alpha": args.root_dirichlet_alpha,
+                "c_lcb": args.c_lcb,
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "actor_jax_platforms": actor_jax_platforms,

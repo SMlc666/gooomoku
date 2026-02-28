@@ -263,6 +263,7 @@ def play_one_game(
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
+    c_lcb: float = 0.0,
 ) -> Tuple[List[TrainingExample], int]:
     compiled = build_play_one_game_fn(
         model=model,
@@ -308,6 +309,7 @@ def play_many_games(
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
+    c_lcb: float = 0.0,
 ) -> Tuple[List[TrainingExample], dict]:
     play_many_fn = build_play_many_games_fn(
         model=model,
@@ -360,6 +362,7 @@ def main() -> None:
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--compute-dtype", type=str, default="float32")
     parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--seed", type=int, default=0)
@@ -382,6 +385,7 @@ def main() -> None:
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
         temperature=args.temperature,
+        c_lcb=args.c_lcb,
     )
     print(f"samples={len(samples)} winner={winner}")
 

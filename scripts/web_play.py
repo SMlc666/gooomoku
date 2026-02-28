@@ -158,6 +158,7 @@ class GameEngine:
         num_simulations: int,
         max_num_considered_actions: int,
         ai_temperature: float,
+        c_lcb: float,
         seed: int,
     ):
         self.params = params
@@ -170,8 +171,8 @@ class GameEngine:
             max_num_considered_actions=max_num_considered_actions,
             root_dirichlet_fraction=0.0,
             root_dirichlet_alpha=0.03,
+            c_lcb=c_lcb,
         )
-        self.ai_temperature = float(ai_temperature)
         self.rng_key = jax.random.PRNGKey(seed)
         self._lock = threading.Lock()
         self._warmup()
@@ -281,6 +282,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--ai-temperature", type=float, default=0.0)
+    parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -325,6 +327,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         ai_temperature=args.ai_temperature,
+        c_lcb=args.c_lcb,
         seed=args.seed,
     )
 
@@ -348,8 +351,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "num_simulations": num_simulations,
             "max_num_considered_actions": max_num_considered_actions,
             "model_artifact": str(args.model_artifact),
+            "c_lcb": args.c_lcb,
         }
-
     @app.post("/api/new", response_model=NewGameResponse)
     def new_game(human_color: int = 1) -> NewGameResponse:
         if human_color not in (-1, 1):
