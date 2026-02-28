@@ -35,6 +35,39 @@ ActorError = tuple[int, BaseException]
 ActorMessage = tuple[str, Any]
 
 
+def _looks_like_tpu_runtime_error(exc: BaseException) -> bool:
+    text = str(exc)
+    patterns = (
+        "TPU is already in use by process",
+        "Unable to initialize backend 'tpu'",
+        "initialize_pjrt_plugin('tpu')",
+        "open(/dev/accel0)",
+        "Couldn't open device: /dev/accel0",
+    )
+    return any(p in text for p in patterns)
+
+
+def _print_tpu_startup_diagnostics(*, stage: str, exc: BaseException) -> None:
+    detail = str(exc)
+    diag_lines = [
+        "[gooomoku][tpu-startup] hard-fail (no fallback)",
+        f"TPU runtime initialization failed during {stage}.",
+        f"Original error: {detail}",
+        f"pid={os.getpid()} JAX_PLATFORMS={os.environ.get('JAX_PLATFORMS', '')!r}",
+        f"TPU_WORKER_ID={os.environ.get('TPU_WORKER_ID', '')!r} CLOUD_TPU_TASK_ID={os.environ.get('CLOUD_TPU_TASK_ID', '')!r}",
+        "Likely causes:",
+        "  1) another process on this host already owns TPU (/tmp/libtpu_lockfile)",
+        "  2) this worker cannot access /dev/accel0 (runtime/permission issue)",
+        "Recommended checks:",
+        "  - ensure exactly one trainer process per host",
+        "  - inspect current TPU owner: sudo lsof -w /dev/accel0",
+        "  - stop stale TPU owners shown in the error PID",
+        "  - remove stale /tmp/libtpu_lockfile and /tmp/tpu_logs if previous run crashed",
+        "  - verify TPU VM/runtime health: python -c \"import jax; print(jax.devices())\"",
+    ]
+    print("\n".join(diag_lines), file=sys.stderr)
+
+
 def _run_cross_process_actor(
     actor_idx: int,
     cfg: dict[str, Any],
@@ -724,6 +757,12 @@ def main() -> None:
     parser.add_argument("--output", type=str, default="checkpoints/latest.pkl")
     parser.add_argument("--disable-pmap", action="store_true")
     parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument(
+        "--jax-platforms",
+        type=str,
+        default="",
+        help="Optional JAX_PLATFORMS for learner process (e.g. 'tpu', 'cpu', 'gpu', '').",
+    )
     parser.add_argument("--async-selfplay", action="store_true")
     parser.add_argument("--cross-process-selfplay", action="store_true")
     parser.add_argument(
@@ -759,6 +798,11 @@ def main() -> None:
     if args.actor_param_sync_updates < 1:
         raise ValueError("actor-param-sync-updates must be >= 1")
     actor_jax_platforms = args.actor_jax_platforms.strip()
+    learner_jax_platforms = args.jax_platforms.strip()
+    if learner_jax_platforms:
+        os.environ["JAX_PLATFORMS"] = learner_jax_platforms
+        os.environ.pop("JAX_PLATFORM_NAME", None)
+        jax.config.update("jax_platforms", learner_jax_platforms)
     if args.cross_process_selfplay and "tpu" in {p.strip() for p in actor_jax_platforms.split(",") if p.strip()}:
         raise ValueError(
             "cross-process selfplay actors cannot use TPU in this process model (libtpu is process-exclusive). "
@@ -776,9 +820,20 @@ def main() -> None:
                 jax.distributed.initialize()
                 distributed_initialized = True
             except RuntimeError as exc:
+                if _looks_like_tpu_runtime_error(exc):
+                    _print_tpu_startup_diagnostics(stage="jax.distributed.initialize()", exc=exc)
+                    raise
                 if args.distributed_init == "on":
                     raise
                 print(f"distributed-init skipped: {exc}")
+
+    try:
+        _ = jax.devices()
+    except RuntimeError as exc:
+        if _looks_like_tpu_runtime_error(exc):
+            _print_tpu_startup_diagnostics(stage="backend preflight", exc=exc)
+            raise
+        raise
 
     model = PolicyValueNet(
         board_size=args.board_size,
