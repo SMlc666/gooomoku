@@ -1739,6 +1739,12 @@ def main() -> None:
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
+    if args.role == "actor" and use_pmap and args.distributed_init == "off":
+        print(
+            "actor role detected with distributed-init=off on multi-device TPU; "
+            "forcing disable-pmap to avoid cross-host pmap hangs"
+        )
+        use_pmap = False
     if args.role != "actor" and use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
     selfplay_batch_games = args.selfplay_batch_games or args.games_per_step
