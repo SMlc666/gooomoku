@@ -1316,6 +1316,7 @@ def _run_actor_role(
                     collect_key,
                     jnp.float32(args.temperature),
                 )
+            print(f"actor[{process_index}] collect_done batch={next_batch_idx}")
 
             payload = _pack_collect_payload(
                 obs=obs,
@@ -1326,6 +1327,7 @@ def _run_actor_role(
                 board_size=args.board_size,
                 fixed_examples=args.replay_fixed_update_size,
             )
+            print(f"actor[{process_index}] payload_done batch={next_batch_idx} examples={payload[6]}")
             collect_ms = (time.perf_counter() - collect_start) * 1000.0
             send_selfplay_batch(sock, payload)
             sent_batches += 1
