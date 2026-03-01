@@ -1230,13 +1230,16 @@ def _sample_ordered_position_from_collect(
 
     leading_shape = mask_arr.shape[:-1]
     flat_mask = mask_arr.reshape((-1, mask_arr.shape[-1]))
-    valid_positions = np.argwhere(flat_mask)
-    if valid_positions.size == 0:
+    games_with_moves = np.flatnonzero(flat_mask.any(axis=1))
+    if games_with_moves.size == 0:
         return None
 
-    picked = int(np_rng.integers(0, len(valid_positions)))
-    flat_game_idx = int(valid_positions[picked][0])
-    step_idx = int(valid_positions[picked][1])
+    picked = int(np_rng.integers(0, len(games_with_moves)))
+    flat_game_idx = int(games_with_moves[picked])
+    played_steps = np.flatnonzero(flat_mask[flat_game_idx])
+    if played_steps.size == 0:
+        return None
+    terminal_step_idx = int(played_steps[-1])
 
     obs_arr = np.asarray(obs_np, dtype=np.uint8)
     if obs_arr.ndim < 5:
@@ -1246,20 +1249,47 @@ def _sample_ordered_position_from_collect(
     if flat_game_idx >= obs_flat.shape[0] or flat_game_idx >= actions_flat.shape[0]:
         return None
 
-    sample_obs = np.asarray(obs_flat[flat_game_idx, step_idx], dtype=np.uint8)
-    position_code, black_code, white_code, to_play, last_code, stones = _obs_to_position_codes(sample_obs)
-    ordered_code = _actions_to_coord_code(actions_flat[flat_game_idx, : step_idx + 1], board_size)
+    pre_obs = np.asarray(obs_flat[flat_game_idx, terminal_step_idx], dtype=np.uint8)
+    mine_mask = pre_obs[:, :, 0] > 0
+    opp_mask = pre_obs[:, :, 1] > 0
+    side_to_move_is_black = bool(pre_obs[0, 0, 3] > 0)
+    if side_to_move_is_black:
+        black_mask = np.array(mine_mask, copy=True)
+        white_mask = np.array(opp_mask, copy=True)
+        terminal_to_play = "w"
+    else:
+        black_mask = np.array(opp_mask, copy=True)
+        white_mask = np.array(mine_mask, copy=True)
+        terminal_to_play = "b"
+
+    terminal_action = int(actions_flat[flat_game_idx, terminal_step_idx]) if terminal_step_idx < actions_flat.shape[1] else -1
+    last_code = "-"
+    if terminal_action >= 0:
+        r = int(terminal_action // board_size)
+        c = int(terminal_action % board_size)
+        if side_to_move_is_black:
+            black_mask[r, c] = True
+        else:
+            white_mask[r, c] = True
+        last_code = _coord_token(r, c)
+
+    occupied_mask = black_mask | white_mask
+    position_code = _mask_to_coord_code(occupied_mask)
+    black_code = _mask_to_coord_code(black_mask)
+    white_code = _mask_to_coord_code(white_mask)
+    stones = int(occupied_mask.sum())
+    ordered_code = _actions_to_coord_code(actions_flat[flat_game_idx, : terminal_step_idx + 1], board_size)
     index_path = np.unravel_index(flat_game_idx, leading_shape)
 
     return {
         "game_idx": flat_game_idx,
-        "step_idx": step_idx,
+        "terminal_step_idx": terminal_step_idx,
         "index_path": "-".join(str(int(v)) for v in index_path),
         "ordered_code": ordered_code,
         "position_code": position_code,
         "black_code": black_code,
         "white_code": white_code,
-        "to_play": to_play,
+        "to_play": terminal_to_play,
         "last_code": last_code,
         "stones": stones,
     }
@@ -1502,8 +1532,8 @@ def _run_actor_role(
             if sample_log is not None:
                 if should_sample:
                     print(
-                        f"actor[{process_index}] sample_position batch={next_batch_idx} "
-                        f"game_idx={sample_log['game_idx']} index_path={sample_log['index_path']} step_idx={sample_log['step_idx']} "
+                        f"actor[{process_index}] sample_terminal_position batch={next_batch_idx} "
+                        f"game_idx={sample_log['game_idx']} index_path={sample_log['index_path']} terminal_step_idx={sample_log['terminal_step_idx']} "
                         f"stones={sample_log['stones']} to_play={sample_log['to_play']} last={sample_log['last_code']} "
                         f"ordered_code={sample_log['ordered_code']} "
                         f"position_code={sample_log['position_code']} "
@@ -1724,8 +1754,8 @@ def main() -> None:
         type=int,
         default=0,
         help=(
-            "If > 0, actor logs one random sample position from replay payload every N sent batches "
-            "as coordinate code (e.g. h8i8i7...)."
+            "If > 0, actor logs one random TERMINAL position (end-of-game snapshot) from each "
+            "sampled replay payload every N sent batches as coordinate code (e.g. h8i8i7...)."
         ),
     )
     parser.add_argument("--wait-log-interval-seconds", type=float, default=30.0)
