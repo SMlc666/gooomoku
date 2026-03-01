@@ -1747,9 +1747,9 @@ def main() -> None:
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
-    if args.role == "actor" and use_pmap and args.distributed_init == "off":
+    if args.role in {"actor", "learner"} and use_pmap and args.distributed_init == "off":
         print(
-            "actor role detected with distributed-init=off on multi-device TPU; "
+            f"{args.role} role detected with distributed-init=off on multi-device TPU; "
             "forcing disable-pmap to avoid cross-host pmap hangs"
         )
         use_pmap = False
@@ -2171,6 +2171,7 @@ def main() -> None:
             param_snapshot_ms = 0.0
             arena_ms = 0.0
             checkpoint_ms = 0.0
+            payloads_to_append: list[SelfPlayBatch] = []
             if actor_errors:
                 actor_idx, exc = actor_errors[0]
                 raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
@@ -2218,7 +2219,7 @@ def main() -> None:
                 collect_wait_ms = wait_sec * 1000.0
                 learner_wait_total_sec += wait_sec
                 learner_wait_count += 1
-                payloads_to_append: list[SelfPlayBatch] = [
+                payloads_to_append = [
                     (new_obs, new_policy, new_value, black_win, white_win, draw, new_examples)
                 ]
                 if args.learner_drain_max_batches > 0:
@@ -2309,17 +2310,24 @@ def main() -> None:
 
             replay_append_start = time.perf_counter()
             if args.role == "learner":
-                for payload in payloads_to_append:
-                    replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
-                        replay_obs_dev,
-                        replay_policy_dev,
-                        replay_value_dev,
-                        replay_head=replay_head,
-                        replay_count=replay_count,
-                        new_obs=payload[0],
-                        new_policy=payload[1],
-                        new_value=payload[2],
-                    )
+                if len(payloads_to_append) == 1:
+                    append_obs = payloads_to_append[0][0]
+                    append_policy = payloads_to_append[0][1]
+                    append_value = payloads_to_append[0][2]
+                else:
+                    append_obs = np.concatenate([payload[0] for payload in payloads_to_append], axis=0)
+                    append_policy = np.concatenate([payload[1] for payload in payloads_to_append], axis=0)
+                    append_value = np.concatenate([payload[2] for payload in payloads_to_append], axis=0)
+                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
+                    replay_obs_dev,
+                    replay_policy_dev,
+                    replay_value_dev,
+                    replay_head=replay_head,
+                    replay_count=replay_count,
+                    new_obs=append_obs,
+                    new_policy=append_policy,
+                    new_value=append_value,
+                )
             else:
                 replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
                     replay_obs_dev,
