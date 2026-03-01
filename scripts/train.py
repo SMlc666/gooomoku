@@ -1155,6 +1155,56 @@ def _stabilize_replay_payload_examples(
     )
 
 
+def _column_label(col: int) -> str:
+    if col < 0:
+        raise ValueError(f"col must be >= 0, got {col}")
+    chars: list[str] = []
+    value = col
+    while True:
+        chars.append(chr(ord("a") + (value % 26)))
+        value = (value // 26) - 1
+        if value < 0:
+            break
+    return "".join(reversed(chars))
+
+
+def _coord_token(row: int, col: int) -> str:
+    return f"{_column_label(col)}{row + 1}"
+
+
+def _mask_to_coord_code(mask: np.ndarray) -> str:
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return "-"
+    return "".join(_coord_token(int(r), int(c)) for r, c in coords)
+
+
+def _obs_to_position_codes(obs_sample: np.ndarray) -> tuple[str, str, str, str, str, int]:
+    if obs_sample.ndim != 3 or obs_sample.shape[-1] < 4:
+        raise ValueError(f"unexpected obs sample shape: {obs_sample.shape}")
+
+    mine_mask = obs_sample[:, :, 0] > 0
+    opp_mask = obs_sample[:, :, 1] > 0
+    side_to_move_is_black = bool(obs_sample[0, 0, 3] > 0)
+    if side_to_move_is_black:
+        black_mask = mine_mask
+        white_mask = opp_mask
+        to_play = "b"
+    else:
+        black_mask = opp_mask
+        white_mask = mine_mask
+        to_play = "w"
+
+    occupied_mask = black_mask | white_mask
+    occupied_code = _mask_to_coord_code(occupied_mask)
+    black_code = _mask_to_coord_code(black_mask)
+    white_code = _mask_to_coord_code(white_mask)
+
+    last_coords = np.argwhere(obs_sample[:, :, 2] > 0)
+    last_code = _coord_token(int(last_coords[0][0]), int(last_coords[0][1])) if len(last_coords) > 0 else "-"
+    return occupied_code, black_code, white_code, to_play, last_code, int(occupied_mask.sum())
+
+
 def _pack_collect_payload(
     *,
     obs,
@@ -1305,6 +1355,8 @@ def _run_actor_role(
     sent_examples = 0
     steps_limit = int(args.actor_steps)
     sync_every = int(args.actor_sync_every_batches)
+    sample_every_batches = int(args.log_random_position_every_batches)
+    actor_np_rng = np.random.default_rng(args.seed + 700001 * (process_index + 1))
     start_time = time.perf_counter()
     try:
         while steps_limit <= 0 or sent_batches < steps_limit:
@@ -1347,7 +1399,14 @@ def _run_actor_role(
             collect_ms = (time.perf_counter() - collect_start) * 1000.0
             print(f"actor[{process_index}] upload_start batch={next_batch_idx}")
             upload_start = time.perf_counter()
-            send_selfplay_batch(sock, payload)
+            try:
+                send_selfplay_batch(sock, payload)
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                print(
+                    f"actor[{process_index}] upload failed at batch={next_batch_idx}: {exc}; "
+                    "learner likely stopped, exiting actor loop"
+                )
+                break
             upload_ms = (time.perf_counter() - upload_start) * 1000.0
             print(
                 f"actor[{process_index}] upload_done batch={next_batch_idx} "
@@ -1355,6 +1414,25 @@ def _run_actor_role(
             )
             sent_batches += 1
             sent_examples += payload[6]
+
+            if sample_every_batches > 0 and (sent_batches % sample_every_batches == 0):
+                obs_batch = payload[0]
+                if len(obs_batch) > 0:
+                    sample_idx = int(actor_np_rng.integers(0, len(obs_batch)))
+                    sample_obs = np.asarray(obs_batch[sample_idx], dtype=np.uint8)
+                    (
+                        position_code,
+                        black_code,
+                        white_code,
+                        to_play,
+                        last_code,
+                        stones,
+                    ) = _obs_to_position_codes(sample_obs)
+                    print(
+                        f"actor[{process_index}] sample_position batch={next_batch_idx} sample_idx={sample_idx} "
+                        f"stones={stones} to_play={to_play} last={last_code} "
+                        f"position_code={position_code} black={black_code} white={white_code}"
+                    )
 
             if sync_every > 0 and (sent_batches % sync_every == 0):
                 synced = False
@@ -1565,6 +1643,15 @@ def main() -> None:
     parser.add_argument("--replay-endpoint-wait-seconds", type=float, default=180.0)
     parser.add_argument("--actor-steps", type=int, default=0)
     parser.add_argument("--actor-sync-every-batches", type=int, default=8)
+    parser.add_argument(
+        "--log-random-position-every-batches",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, actor logs one random sample position from replay payload every N sent batches "
+            "as coordinate code (e.g. h8i8i7...)."
+        ),
+    )
     parser.add_argument("--wait-log-interval-seconds", type=float, default=30.0)
     parser.add_argument("--phase-log-threshold-ms", type=float, default=5000.0)
     parser.add_argument("--detailed-step-log", action="store_true")
@@ -1615,6 +1702,8 @@ def main() -> None:
         raise ValueError("actor-steps must be >= 0")
     if args.actor_sync_every_batches < 0:
         raise ValueError("actor-sync-every-batches must be >= 0")
+    if args.log_random_position_every_batches < 0:
+        raise ValueError("log-random-position-every-batches must be >= 0")
     if args.wait_log_interval_seconds <= 0:
         raise ValueError("wait-log-interval-seconds must be > 0")
     if args.phase_log_threshold_ms < 0:
@@ -2599,6 +2688,8 @@ def main() -> None:
             checkpoint_ms = maybe_save_training_checkpoint(step, "periodic")
             if is_chief and args.phase_log_threshold_ms > 0 and checkpoint_ms >= args.phase_log_threshold_ms:
                 print(f"phase-slow step={step} phase=checkpoint checkpoint_ms={checkpoint_ms:.1f}")
+    except KeyboardInterrupt:
+        print("\n[INFO] KeyboardInterrupt received. Saving current checkpoint before exiting...")
     finally:
         if actor_stop is not None:
             actor_stop.set()
