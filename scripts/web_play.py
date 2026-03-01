@@ -309,28 +309,43 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     num_simulations = int(config.get("num_simulations", args.num_simulations))
     max_num_considered_actions = int(config.get("max_num_considered_actions", args.max_num_considered_actions))
 
-    compute_dtype = _dtype_from_name(compute_dtype_name)
     param_dtype = _dtype_from_name(param_dtype_name)
-
-    model = PolicyValueNet(
-        board_size=board_size,
-        channels=channels,
-        blocks=blocks,
-        compute_dtype=compute_dtype,
-        param_dtype=param_dtype,
-    )
-
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
-    engine = GameEngine(
-        params=params,
-        model=model,
-        board_size=board_size,
-        num_simulations=num_simulations,
-        max_num_considered_actions=max_num_considered_actions,
-        ai_temperature=args.ai_temperature,
-        c_lcb=args.c_lcb,
-        seed=args.seed,
-    )
+
+    def _build_engine_with_compute_dtype(compute_name: str) -> GameEngine:
+        compute_dtype = _dtype_from_name(compute_name)
+        model = PolicyValueNet(
+            board_size=board_size,
+            channels=channels,
+            blocks=blocks,
+            compute_dtype=compute_dtype,
+            param_dtype=param_dtype,
+        )
+        return GameEngine(
+            params=params,
+            model=model,
+            board_size=board_size,
+            num_simulations=num_simulations,
+            max_num_considered_actions=max_num_considered_actions,
+            ai_temperature=args.ai_temperature,
+            c_lcb=args.c_lcb,
+            seed=args.seed,
+        )
+
+    effective_compute_dtype_name = compute_dtype_name
+    try:
+        engine = _build_engine_with_compute_dtype(effective_compute_dtype_name)
+    except jax.errors.JaxRuntimeError as exc:
+        if effective_compute_dtype_name != "float32":
+            print(
+                "web_play warmup failed with "
+                f"compute_dtype={effective_compute_dtype_name}: {exc}\n"
+                "Falling back to compute_dtype=float32 for GPU compatibility."
+            )
+            effective_compute_dtype_name = "float32"
+            engine = _build_engine_with_compute_dtype(effective_compute_dtype_name)
+        else:
+            raise
 
     app = FastAPI(title="gooomoku web PvAI")
     static_dir = REPO_ROOT / "web"
@@ -349,6 +364,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "board_size": board_size,
             "channels": channels,
             "blocks": blocks,
+            "compute_dtype": effective_compute_dtype_name,
+            "param_dtype": param_dtype_name,
             "num_simulations": num_simulations,
             "max_num_considered_actions": max_num_considered_actions,
             "model_artifact": str(args.model_artifact),

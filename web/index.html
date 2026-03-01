@@ -5,87 +5,420 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>gooomoku 网页对弈</title>
     <style>
+      @import url("https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Noto+Serif+SC:wght@400;600;700&display=swap");
+
       :root {
         color-scheme: dark;
+        --bg-night: #0b121d;
+        --bg-night-2: #121b2d;
+        --ink-soft: #d6dde8;
+        --ink-muted: #9aacbe;
+        --accent: #f6c35b;
+        --panel: rgba(19, 26, 39, 0.82);
+
+        --board-size: min(90vw, 760px);
+        --edge-size: clamp(24px, 5vw, 38px);
+        --grid-pad: clamp(18px, 4.2vw, 34px);
+        --stone-size: clamp(18px, 3.8vw, 31px);
+        --hit-size: clamp(24px, 5.2vw, 40px);
       }
+
+      * {
+        box-sizing: border-box;
+      }
+
       body {
         margin: 0;
-        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-        background: #111827;
-        color: #f9fafb;
+        min-height: 100vh;
+        font-family: "Noto Serif SC", "STSong", "Palatino Linotype", "Times New Roman", serif;
+        color: var(--ink-soft);
+        background:
+          radial-gradient(1200px 900px at 85% -10%, #21334f55 0%, #0000 55%),
+          radial-gradient(900px 700px at -10% 100%, #233b3d66 0%, #0000 58%),
+          linear-gradient(160deg, var(--bg-night) 0%, var(--bg-night-2) 100%);
       }
+
       .wrap {
-        max-width: 980px;
-        margin: 24px auto;
-        padding: 0 16px;
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 20px 14px 34px;
       }
+
+      h1 {
+        margin: 4px 0 14px;
+        font-family: "Cinzel", "Times New Roman", serif;
+        font-size: clamp(1.4rem, 3.8vw, 2.05rem);
+        letter-spacing: 0.08em;
+        font-weight: 700;
+        color: #f3e6c7;
+        text-shadow: 0 2px 16px #0008;
+      }
+
       .panel {
         display: flex;
-        gap: 12px;
+        gap: 10px;
         align-items: center;
         flex-wrap: wrap;
-        margin-bottom: 14px;
+        margin-bottom: 12px;
       }
+
       button {
-        border: none;
-        padding: 8px 14px;
-        border-radius: 8px;
-        background: #2563eb;
-        color: #fff;
+        border: 1px solid #ffffff24;
+        padding: 9px 16px;
+        border-radius: 999px;
+        color: #fef6e7;
+        background:
+          linear-gradient(175deg, #6f4f24 0%, #4b3319 52%, #2f1d0f 100%);
+        box-shadow:
+          inset 0 1px 0 #ffffff2f,
+          0 4px 14px #0008;
         cursor: pointer;
-        font-weight: 600;
+        font-weight: 700;
+        font-family: "Noto Serif SC", serif;
+        letter-spacing: 0.03em;
+        transition: transform 0.18s ease, filter 0.18s ease;
       }
+
       button.secondary {
-        background: #334155;
+        background:
+          linear-gradient(175deg, #3f4f60 0%, #2c3b4a 52%, #192532 100%);
       }
+
+      button:hover {
+        transform: translateY(-1px);
+        filter: brightness(1.08);
+      }
+
+      button:active {
+        transform: translateY(1px);
+      }
+
       #status {
-        margin: 10px 0;
-        color: #cbd5e1;
+        margin: 12px 0 14px;
+        padding: 12px 14px;
+        border: 1px solid #ffffff1f;
+        border-radius: 12px;
+        background: var(--panel);
+        color: #e6edf8;
+        line-height: 1.45;
+        box-shadow: inset 0 1px 0 #ffffff10;
       }
-      .board {
-        display: grid;
-        gap: 1px;
-        background: #334155;
+
+      .board-frame {
+        margin: 0 auto;
         width: fit-content;
-        border: 1px solid #475569;
+        max-width: 100%;
+        padding: clamp(9px, 2.8vw, 16px);
+        border-radius: 16px;
+        background: linear-gradient(145deg, #141d2a 0%, #0d151f 100%);
+        border: 1px solid #ffffff18;
+        box-shadow:
+          0 14px 38px #0009,
+          inset 0 1px 0 #ffffff12;
       }
-      .cell {
-        width: 34px;
-        height: 34px;
-        background: #f1f5f9;
+
+      .coord-grid {
+        display: grid;
+        grid-template-columns: var(--edge-size) var(--board-size) var(--edge-size);
+        grid-template-rows: var(--edge-size) var(--board-size) var(--edge-size);
+        align-items: center;
+        justify-items: center;
+      }
+
+      .corner {
+        width: var(--edge-size);
+        height: var(--edge-size);
+      }
+
+      .coord-row,
+      .coord-col {
+        color: #e6c988;
+        font-family: "Cinzel", "Times New Roman", serif;
+        font-size: clamp(0.63rem, 1.95vw, 0.84rem);
+        font-weight: 600;
+        letter-spacing: 0.07em;
+        text-shadow: 0 1px 1px #0007;
+        user-select: none;
+      }
+
+      .coord-row {
+        width: var(--board-size);
+        height: var(--edge-size);
+        display: grid;
+        align-items: center;
+        justify-items: center;
+        padding: 0 var(--grid-pad);
+      }
+
+      .coord-col {
+        width: var(--edge-size);
+        height: var(--board-size);
+        display: grid;
+        align-items: center;
+        justify-items: center;
+        padding: var(--grid-pad) 0;
+      }
+
+      .board {
+        position: relative;
+        width: var(--board-size);
+        height: var(--board-size);
+        border-radius: 10px;
+        border: 1px solid #6f4e28;
+        overflow: hidden;
+        box-shadow:
+          inset 0 0 0 1px #ffffff1f,
+          inset 0 2px 22px #7d5a2d33,
+          0 10px 28px #0008;
+        background:
+          radial-gradient(220px 280px at 18% 17%, #f0cf8f66 0%, #0000 68%),
+          radial-gradient(280px 360px at 90% 82%, #83521740 0%, #0000 70%),
+          linear-gradient(125deg, #d9ae6f 0%, #c89d63 35%, #be9158 68%, #a97946 100%);
+      }
+
+      .board::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          repeating-linear-gradient(
+            100deg,
+            #825c2f14 0px,
+            #825c2f14 1px,
+            #eacb8e10 1px,
+            #eacb8e10 3px
+          ),
+          repeating-linear-gradient(
+            15deg,
+            #00000006 0px,
+            #00000006 5px,
+            #ffffff06 5px,
+            #ffffff06 9px
+          );
+        mix-blend-mode: multiply;
+        pointer-events: none;
+      }
+
+      .board::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(circle at center, #0000 62%, #0003 100%);
+        pointer-events: none;
+      }
+
+      .line-layer,
+      .star-layer,
+      .intersection-layer {
+        position: absolute;
+        inset: 0;
+      }
+
+      .line-layer,
+      .star-layer {
+        pointer-events: none;
+      }
+
+      .line {
+        position: absolute;
+        background: #4e3518cc;
+        box-shadow: 0 0 0 1px #ffffff08;
+      }
+
+      .line.vertical {
+        top: var(--grid-pad);
+        bottom: var(--grid-pad);
+        width: 1.4px;
+        transform: translateX(-50%);
+      }
+
+      .line.horizontal {
+        left: var(--grid-pad);
+        right: var(--grid-pad);
+        height: 1.4px;
+        transform: translateY(-50%);
+      }
+
+      .star-point {
+        position: absolute;
+        width: clamp(6px, 1.5vw, 9px);
+        height: clamp(6px, 1.5vw, 9px);
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+        background: #4b2d11eb;
+        box-shadow: 0 0 0 1px #ffffff26;
+      }
+
+      .intersection {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: var(--hit-size);
+        height: var(--hit-size);
+        border: none;
+        transform: translate(-50%, -50%);
+        background: transparent;
+        border-radius: 50%;
+        padding: 0;
         display: flex;
         align-items: center;
         justify-content: center;
         cursor: pointer;
       }
-      .stone {
-        width: 26px;
-        height: 26px;
+
+      .intersection.empty:hover::before {
+        content: "";
+        position: absolute;
+        inset: calc(50% - 3px);
+        width: 6px;
+        height: 6px;
         border-radius: 50%;
+        background: #f3ddaccc;
+        box-shadow: 0 0 0 5px #f3ddac2f;
       }
-      .black {
-        background: #111827;
+
+      .board.locked .intersection {
+        pointer-events: none;
       }
-      .white {
-        background: #f8fafc;
-        border: 1px solid #cbd5e1;
+
+      .stone {
+        width: var(--stone-size);
+        height: var(--stone-size);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        font-size: clamp(9px, 2vw, 12.5px);
+        font-weight: 700;
+        line-height: 1;
+        text-align: center;
+        letter-spacing: -0.02em;
+        user-select: none;
       }
+
+      .stone.black {
+        color: #f2ecdd;
+        background:
+          radial-gradient(circle at 32% 25%, #808894 0%, #2f3540 28%, #131820 64%, #05070a 100%);
+        box-shadow:
+          inset -2px -3px 5px #000c,
+          inset 1px 2px 5px #ffffff26,
+          0 3px 8px #0008;
+      }
+
+      .stone.white {
+        color: #1f2a39;
+        background:
+          radial-gradient(circle at 31% 28%, #ffffff 0%, #f5f7fb 35%, #d6dbe6 72%, #bac2cf 100%);
+        box-shadow:
+          inset -2px -3px 4px #8a95aa50,
+          inset 2px 2px 5px #ffffffd0,
+          0 3px 8px #0006;
+      }
+
+      .stone-number {
+        text-shadow: 0 1px 2px #0008;
+      }
+
+      .stone.white .stone-number {
+        text-shadow: 0 1px 1px #ffffffb0;
+      }
+
+      .stone.last-move::after {
+        content: "";
+        position: absolute;
+        inset: -5px;
+        border-radius: 50%;
+        border: 2px solid var(--accent);
+        box-shadow:
+          0 0 0 1px #ffefca66,
+          0 0 12px #f6c35ba8;
+        animation: pulse 1.1s ease-out infinite;
+      }
+
+      .stone.placed {
+        animation: popStone 0.24s cubic-bezier(0.2, 1.35, 0.28, 1);
+      }
+
       .hint {
-        color: #94a3b8;
-        margin-top: 8px;
+        margin-top: 12px;
+        color: var(--ink-muted);
+        text-align: center;
+      }
+
+      @keyframes popStone {
+        0% {
+          transform: scale(0.56);
+        }
+        66% {
+          transform: scale(1.14);
+        }
+        100% {
+          transform: scale(1);
+        }
+      }
+
+      @keyframes pulse {
+        0% {
+          transform: scale(0.86);
+          opacity: 0.95;
+        }
+        72% {
+          transform: scale(1.08);
+          opacity: 0.14;
+        }
+        100% {
+          transform: scale(1.1);
+          opacity: 0;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .wrap {
+          padding: 14px 8px 26px;
+        }
+
+        h1 {
+          margin-bottom: 10px;
+          letter-spacing: 0.05em;
+        }
+
+        #status {
+          padding: 10px 11px;
+          margin-bottom: 10px;
+        }
       }
     </style>
   </head>
   <body>
     <div class="wrap">
       <h1>gooomoku 网页端人机对弈</h1>
+
       <div class="panel">
-        <button id="newBlack">新局（我执黑先手）</button>
-        <button id="newWhite" class="secondary">新局（我执白后手）</button>
+        <button id="newBlack" type="button">新局（我执黑先手）</button>
+        <button id="newWhite" type="button" class="secondary">新局（我执白后手）</button>
       </div>
+
       <div id="status">初始化中...</div>
-      <div id="board" class="board"></div>
-      <div class="hint">点击空位落子，AI 会自动应手。</div>
+
+      <div class="board-frame">
+        <div class="coord-grid">
+          <div class="corner"></div>
+          <div id="coordTop" class="coord-row"></div>
+          <div class="corner"></div>
+
+          <div id="coordLeft" class="coord-col"></div>
+          <div id="board" class="board" aria-label="Gomoku 棋盘"></div>
+          <div id="coordRight" class="coord-col"></div>
+
+          <div class="corner"></div>
+          <div id="coordBottom" class="coord-row"></div>
+          <div class="corner"></div>
+        </div>
+      </div>
+
+      <div class="hint">落子落在线交叉点上，显示手数、星位与最新手高亮。</div>
     </div>
 
     <script>
@@ -95,6 +428,13 @@
       let boardSize = 15;
       let busy = false;
       let terminated = false;
+      let animateAction = null;
+
+      const boardEl = document.getElementById("board");
+      const topCoordsEl = document.getElementById("coordTop");
+      const bottomCoordsEl = document.getElementById("coordBottom");
+      const leftCoordsEl = document.getElementById("coordLeft");
+      const rightCoordsEl = document.getElementById("coordRight");
 
       function actionToRC(action) {
         return { r: Math.floor(action / boardSize), c: action % boardSize };
@@ -104,29 +444,13 @@
         return r * boardSize + c;
       }
 
-      function setStatus(text) {
-        document.getElementById("status").textContent = text;
+      function axisPosition(index) {
+        if (boardSize <= 1) return "50%";
+        return `calc(var(--grid-pad) + ${index} * ((100% - (var(--grid-pad) * 2)) / ${boardSize - 1}))`;
       }
 
-      function renderBoard() {
-        const boardEl = document.getElementById("board");
-        boardEl.style.gridTemplateColumns = `repeat(${boardSize}, 34px)`;
-        boardEl.innerHTML = "";
-
-        for (let r = 0; r < boardSize; r += 1) {
-          for (let c = 0; c < boardSize; c += 1) {
-            const cell = document.createElement("div");
-            cell.className = "cell";
-            const v = board[r][c];
-            if (v !== 0) {
-              const stone = document.createElement("div");
-              stone.className = `stone ${v === 1 ? "black" : "white"}`;
-              cell.appendChild(stone);
-            }
-            cell.addEventListener("click", () => onClickCell(r, c));
-            boardEl.appendChild(cell);
-          }
-        }
+      function setStatus(text) {
+        document.getElementById("status").textContent = text;
       }
 
       function winnerText(winner) {
@@ -135,33 +459,193 @@
         return "和棋";
       }
 
-      async function startNewGame(color) {
-        busy = true;
-        humanColor = color;
-        setStatus("正在创建新对局...");
-        const resp = await fetch(`/api/new?human_color=${color}`, { method: "POST" });
-        if (!resp.ok) {
-          setStatus(`新局失败: ${await resp.text()}`);
-          busy = false;
-          return;
+      function colLabel(index) {
+        let n = index;
+        let result = "";
+        do {
+          result = String.fromCharCode(65 + (n % 26)) + result;
+          n = Math.floor(n / 26) - 1;
+        } while (n >= 0);
+        return result;
+      }
+
+      function actionToLabel(action) {
+        const { r, c } = actionToRC(action);
+        return `${colLabel(c)}${r + 1}`;
+      }
+
+      function buildMoveIndexMap() {
+        const moveMap = new Map();
+        for (let i = 0; i < history.length; i += 1) {
+          moveMap.set(history[i], i + 1);
+        }
+        return moveMap;
+      }
+
+      function getStarPoints(size) {
+        if (size === 15) {
+          return [
+            [3, 3],
+            [3, 11],
+            [11, 3],
+            [11, 11],
+            [7, 7],
+          ];
+        }
+        if (size === 19) {
+          return [
+            [3, 3],
+            [3, 9],
+            [3, 15],
+            [9, 3],
+            [9, 9],
+            [9, 15],
+            [15, 3],
+            [15, 9],
+            [15, 15],
+          ];
+        }
+        return [];
+      }
+
+      function renderCoordinates() {
+        const letters = Array.from({ length: boardSize }, (_, idx) => colLabel(idx));
+        const numbers = Array.from({ length: boardSize }, (_, idx) => String(idx + 1));
+
+        topCoordsEl.style.gridTemplateColumns = `repeat(${boardSize}, 1fr)`;
+        bottomCoordsEl.style.gridTemplateColumns = `repeat(${boardSize}, 1fr)`;
+        leftCoordsEl.style.gridTemplateRows = `repeat(${boardSize}, 1fr)`;
+        rightCoordsEl.style.gridTemplateRows = `repeat(${boardSize}, 1fr)`;
+
+        topCoordsEl.innerHTML = letters.map((v) => `<span>${v}</span>`).join("");
+        bottomCoordsEl.innerHTML = letters.map((v) => `<span>${v}</span>`).join("");
+        leftCoordsEl.innerHTML = numbers.map((v) => `<span>${v}</span>`).join("");
+        rightCoordsEl.innerHTML = numbers.map((v) => `<span>${v}</span>`).join("");
+      }
+
+      function renderBoard() {
+        if (!board.length) return;
+
+        renderCoordinates();
+        boardEl.innerHTML = "";
+        boardEl.classList.toggle("locked", busy || terminated);
+
+        const lineLayer = document.createElement("div");
+        lineLayer.className = "line-layer";
+        const starLayer = document.createElement("div");
+        starLayer.className = "star-layer";
+        const intersectionLayer = document.createElement("div");
+        intersectionLayer.className = "intersection-layer";
+
+        for (let i = 0; i < boardSize; i += 1) {
+          const vLine = document.createElement("div");
+          vLine.className = "line vertical";
+          vLine.style.left = axisPosition(i);
+          lineLayer.appendChild(vLine);
+
+          const hLine = document.createElement("div");
+          hLine.className = "line horizontal";
+          hLine.style.top = axisPosition(i);
+          lineLayer.appendChild(hLine);
         }
 
-        const data = await resp.json();
-        board = data.board;
-        history = data.history;
-        boardSize = board.length;
-        terminated = data.status !== "ongoing";
-        renderBoard();
-        if (terminated) {
-          setStatus(`对局结束：${winnerText(data.winner)}`);
-        } else {
-          setStatus(`新局开始：你执${humanColor === 1 ? "黑" : "白"}`);
+        const starPoints = getStarPoints(boardSize);
+        for (const [r, c] of starPoints) {
+          if (r < 0 || c < 0 || r >= boardSize || c >= boardSize) continue;
+          const dot = document.createElement("div");
+          dot.className = "star-point";
+          dot.style.top = axisPosition(r);
+          dot.style.left = axisPosition(c);
+          starLayer.appendChild(dot);
         }
-        busy = false;
+
+        const moveMap = buildMoveIndexMap();
+        const lastAction = history.length > 0 ? history[history.length - 1] : null;
+
+        for (let r = 0; r < boardSize; r += 1) {
+          for (let c = 0; c < boardSize; c += 1) {
+            const action = rcToAction(r, c);
+            const point = document.createElement("button");
+            point.className = "intersection";
+            point.style.top = axisPosition(r);
+            point.style.left = axisPosition(c);
+            point.addEventListener("click", () => onClickCell(r, c));
+
+            const v = board[r][c];
+            if (v === 0) {
+              point.classList.add("empty");
+              point.setAttribute("aria-label", `在 ${actionToLabel(action)} 落子`);
+            } else {
+              point.classList.add("occupied");
+              point.setAttribute("aria-label", `${v === 1 ? "黑" : "白"}子 ${actionToLabel(action)}`);
+              const stone = document.createElement("div");
+              stone.className = `stone ${v === 1 ? "black" : "white"}`;
+              if (action === lastAction) {
+                stone.classList.add("last-move");
+              }
+              if (animateAction != null && action === animateAction) {
+                stone.classList.add("placed");
+              }
+
+              const moveNo = moveMap.get(action);
+              if (moveNo != null) {
+                const num = document.createElement("span");
+                num.className = "stone-number";
+                num.textContent = String(moveNo);
+                stone.appendChild(num);
+              }
+
+              point.appendChild(stone);
+            }
+
+            intersectionLayer.appendChild(point);
+          }
+        }
+
+        boardEl.appendChild(lineLayer);
+        boardEl.appendChild(starLayer);
+        boardEl.appendChild(intersectionLayer);
+
+        animateAction = null;
+      }
+
+      async function startNewGame(color) {
+        busy = true;
+        terminated = false;
+        humanColor = color;
+        setStatus("正在创建新对局...");
+
+        try {
+          const resp = await fetch(`/api/new?human_color=${color}`, { method: "POST" });
+          if (!resp.ok) {
+            setStatus(`新局失败: ${await resp.text()}`);
+            return;
+          }
+
+          const data = await resp.json();
+          board = data.board;
+          history = data.history;
+          boardSize = board.length;
+          terminated = data.status !== "ongoing";
+          animateAction = history.length > 0 ? history[history.length - 1] : null;
+
+          if (terminated) {
+            setStatus(`对局结束：${winnerText(data.winner)}`);
+          } else {
+            const opener = data.ai_action == null ? "" : `，AI 先手 ${actionToLabel(data.ai_action)}`;
+            setStatus(`新局开始：你执${humanColor === 1 ? "黑" : "白"}${opener}`);
+          }
+        } catch (err) {
+          setStatus(`新局失败: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          busy = false;
+          renderBoard();
+        }
       }
 
       async function onClickCell(r, c) {
-        if (busy || terminated) return;
+        if (busy || terminated || !board.length) return;
+
         const action = rcToAction(r, c);
         if (board[r][c] !== 0) {
           setStatus("该位置已有棋子");
@@ -169,35 +653,49 @@
         }
 
         busy = true;
-        setStatus("AI 思考中...");
-        const resp = await fetch("/api/move", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            history,
-            human_action: action,
-            human_color: humanColor,
-          }),
-        });
-
-        if (!resp.ok) {
-          setStatus(`落子失败: ${await resp.text()}`);
-          busy = false;
-          return;
-        }
-
-        const data = await resp.json();
-        board = data.board;
-        history = data.history;
-        terminated = data.terminated;
         renderBoard();
-        if (terminated) {
-          setStatus(`对局结束：${winnerText(data.winner)}`);
-        } else {
-          const aiText = data.ai_action == null ? "无" : `${actionToRC(data.ai_action).r + 1},${actionToRC(data.ai_action).c + 1}`;
-          setStatus(`你已落子，AI 应手坐标: ${aiText}`);
+        setStatus("AI 思考中...");
+
+        const oldHistoryLen = history.length;
+
+        try {
+          const resp = await fetch("/api/move", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              history,
+              human_action: action,
+              human_color: humanColor,
+            }),
+          });
+
+          if (!resp.ok) {
+            setStatus(`落子失败: ${await resp.text()}`);
+            return;
+          }
+
+          const data = await resp.json();
+          board = data.board;
+          history = data.history;
+          boardSize = board.length;
+          terminated = Boolean(data.terminated);
+
+          if (history.length > oldHistoryLen) {
+            animateAction = history[history.length - 1];
+          }
+
+          if (terminated) {
+            setStatus(`对局结束：${winnerText(data.winner)}`);
+          } else {
+            const aiText = data.ai_action == null ? "无" : actionToLabel(data.ai_action);
+            setStatus(`你落子 ${actionToLabel(action)}，AI 应手 ${aiText}`);
+          }
+        } catch (err) {
+          setStatus(`落子失败: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          busy = false;
+          renderBoard();
         }
-        busy = false;
       }
 
       document.getElementById("newBlack").addEventListener("click", () => startNewGame(1));
