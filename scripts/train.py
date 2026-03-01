@@ -123,7 +123,7 @@ def _run_cross_process_actor(
                     break
 
             rng, collect_key = jax.random.split(rng)
-            obs, policy, value, mask, _, winners = play_many_games_fn(params, collect_key, temperature)
+            obs, policy, value, mask, _, _, winners = play_many_games_fn(params, collect_key, temperature)
             obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
             obs_np = np.asarray(obs_np)
             policy_np = np.asarray(policy_np)
@@ -1205,6 +1205,66 @@ def _obs_to_position_codes(obs_sample: np.ndarray) -> tuple[str, str, str, str, 
     return occupied_code, black_code, white_code, to_play, last_code, int(occupied_mask.sum())
 
 
+def _actions_to_coord_code(action_seq: np.ndarray, board_size: int) -> str:
+    valid_actions = np.asarray(action_seq, dtype=np.int32)
+    valid_actions = valid_actions[valid_actions >= 0]
+    if valid_actions.size == 0:
+        return "-"
+    return "".join(
+        _coord_token(int(action // board_size), int(action % board_size))
+        for action in valid_actions
+    )
+
+
+def _sample_ordered_position_from_collect(
+    *,
+    obs_np: np.ndarray,
+    mask_np: np.ndarray,
+    actions_np: np.ndarray,
+    board_size: int,
+    np_rng: np.random.Generator,
+) -> dict[str, Any] | None:
+    mask_arr = np.asarray(mask_np, dtype=np.bool_)
+    if mask_arr.ndim < 2:
+        return None
+
+    leading_shape = mask_arr.shape[:-1]
+    flat_mask = mask_arr.reshape((-1, mask_arr.shape[-1]))
+    valid_positions = np.argwhere(flat_mask)
+    if valid_positions.size == 0:
+        return None
+
+    picked = int(np_rng.integers(0, len(valid_positions)))
+    flat_game_idx = int(valid_positions[picked][0])
+    step_idx = int(valid_positions[picked][1])
+
+    obs_arr = np.asarray(obs_np, dtype=np.uint8)
+    if obs_arr.ndim < 5:
+        return None
+    obs_flat = obs_arr.reshape((-1, obs_arr.shape[-4], board_size, board_size, 4))
+    actions_flat = np.asarray(actions_np, dtype=np.int32).reshape((-1, actions_np.shape[-1]))
+    if flat_game_idx >= obs_flat.shape[0] or flat_game_idx >= actions_flat.shape[0]:
+        return None
+
+    sample_obs = np.asarray(obs_flat[flat_game_idx, step_idx], dtype=np.uint8)
+    position_code, black_code, white_code, to_play, last_code, stones = _obs_to_position_codes(sample_obs)
+    ordered_code = _actions_to_coord_code(actions_flat[flat_game_idx, : step_idx + 1], board_size)
+    index_path = np.unravel_index(flat_game_idx, leading_shape)
+
+    return {
+        "game_idx": flat_game_idx,
+        "step_idx": step_idx,
+        "index_path": "-".join(str(int(v)) for v in index_path),
+        "ordered_code": ordered_code,
+        "position_code": position_code,
+        "black_code": black_code,
+        "white_code": white_code,
+        "to_play": to_play,
+        "last_code": last_code,
+        "stones": stones,
+    }
+
+
 def _pack_collect_payload(
     *,
     obs,
@@ -1214,16 +1274,25 @@ def _pack_collect_payload(
     winners,
     board_size: int,
     fixed_examples: int,
-) -> SelfPlayBatch:
+    actions=None,
+    sample_np_rng: np.random.Generator | None = None,
+) -> tuple[SelfPlayBatch, dict[str, Any] | None]:
     print("pack_collect ready_start")
     ready_start = time.perf_counter()
-    jax.block_until_ready((obs, policy, value, mask, winners))
+    if actions is None:
+        jax.block_until_ready((obs, policy, value, mask, winners))
+    else:
+        jax.block_until_ready((obs, policy, value, mask, winners, actions))
     ready_ms = (time.perf_counter() - ready_start) * 1000.0
     print(f"pack_collect ready_done ready_ms={ready_ms:.1f}")
 
     print("pack_collect device_get_start")
     device_get_start = time.perf_counter()
-    obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+    if actions is None:
+        obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+        actions_np = None
+    else:
+        obs_np, policy_np, value_np, mask_np, winners_np, actions_np = jax.device_get((obs, policy, value, mask, winners, actions))
     device_get_ms = (time.perf_counter() - device_get_start) * 1000.0
     print(f"pack_collect device_get_done device_get_ms={device_get_ms:.1f}")
     obs_np = np.asarray(obs_np)
@@ -1245,7 +1314,7 @@ def _pack_collect_payload(
         fixed_examples=fixed_examples,
     )
 
-    return (
+    payload: SelfPlayBatch = (
         packed_obs,
         packed_policy,
         packed_value,
@@ -1254,6 +1323,18 @@ def _pack_collect_payload(
         int((winners_np == 0).sum()),
         stored_examples,
     )
+
+    sample_log = None
+    if sample_np_rng is not None and actions_np is not None:
+        sample_log = _sample_ordered_position_from_collect(
+            obs_np=obs_np,
+            mask_np=mask_np,
+            actions_np=np.asarray(actions_np, dtype=np.int32),
+            board_size=board_size,
+            np_rng=sample_np_rng,
+        )
+
+    return payload, sample_log
 
 
 def _maybe_reload_actor_params(
@@ -1367,13 +1448,13 @@ def _run_actor_role(
             if use_pmap:
                 collect_keys = jax.random.split(collect_key, local_devices)
                 collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
-                obs, policy, value, mask, _, winners = collect_step(
+                obs, policy, value, mask, actions, _, winners = collect_step(
                     params,
                     collect_keys,
                     collect_temperature,
                 )
             else:
-                obs, policy, value, mask, _, winners = collect_step(
+                obs, policy, value, mask, actions, _, winners = collect_step(
                     params,
                     collect_key,
                     jnp.float32(args.temperature),
@@ -1382,7 +1463,8 @@ def _run_actor_role(
 
             print(f"actor[{process_index}] payload_start batch={next_batch_idx}")
             payload_start = time.perf_counter()
-            payload = _pack_collect_payload(
+            should_sample = sample_every_batches > 0 and (next_batch_idx % sample_every_batches == 0)
+            payload, sample_log = _pack_collect_payload(
                 obs=obs,
                 policy=policy,
                 value=value,
@@ -1390,6 +1472,8 @@ def _run_actor_role(
                 winners=winners,
                 board_size=args.board_size,
                 fixed_examples=args.replay_fixed_update_size,
+                actions=actions if should_sample else None,
+                sample_np_rng=actor_np_rng if should_sample else None,
             )
             payload_ms = (time.perf_counter() - payload_start) * 1000.0
             print(
@@ -1415,23 +1499,15 @@ def _run_actor_role(
             sent_batches += 1
             sent_examples += payload[6]
 
-            if sample_every_batches > 0 and (sent_batches % sample_every_batches == 0):
-                obs_batch = payload[0]
-                if len(obs_batch) > 0:
-                    sample_idx = int(actor_np_rng.integers(0, len(obs_batch)))
-                    sample_obs = np.asarray(obs_batch[sample_idx], dtype=np.uint8)
-                    (
-                        position_code,
-                        black_code,
-                        white_code,
-                        to_play,
-                        last_code,
-                        stones,
-                    ) = _obs_to_position_codes(sample_obs)
+            if sample_log is not None:
+                if should_sample:
                     print(
-                        f"actor[{process_index}] sample_position batch={next_batch_idx} sample_idx={sample_idx} "
-                        f"stones={stones} to_play={to_play} last={last_code} "
-                        f"position_code={position_code} black={black_code} white={white_code}"
+                        f"actor[{process_index}] sample_position batch={next_batch_idx} "
+                        f"game_idx={sample_log['game_idx']} index_path={sample_log['index_path']} step_idx={sample_log['step_idx']} "
+                        f"stones={sample_log['stones']} to_play={sample_log['to_play']} last={sample_log['last_code']} "
+                        f"ordered_code={sample_log['ordered_code']} "
+                        f"position_code={sample_log['position_code']} "
+                        f"black={sample_log['black_code']} white={sample_log['white_code']}"
                     )
 
             if sync_every > 0 and (sent_batches % sync_every == 0):
@@ -2031,18 +2107,18 @@ def main() -> None:
         if use_pmap:
             collect_keys = jax.random.split(collect_rng_key, local_devices)
             collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
-            obs, policy, value, mask, _, winners = collect_step(
+            obs, policy, value, mask, _, _, winners = collect_step(
                 params_for_collect,
                 collect_keys,
                 collect_temperature,
             )
         else:
-            obs, policy, value, mask, _, winners = collect_step(
+            obs, policy, value, mask, _, _, winners = collect_step(
                 params_for_collect,
                 collect_rng_key,
                 jnp.float32(args.temperature),
             )
-        return _pack_collect_payload(
+        payload, _ = _pack_collect_payload(
             obs=obs,
             policy=policy,
             value=value,
@@ -2051,6 +2127,7 @@ def main() -> None:
             board_size=args.board_size,
             fixed_examples=args.replay_fixed_update_size,
         )
+        return payload
 
     if args.role == "learner":
         bind_host = args.replay_host.strip()
@@ -2203,12 +2280,12 @@ def main() -> None:
                                 jnp.float32(args.temperature),
                                 dtype=jnp.float32,
                             )
-                            obs, policy, value, mask, _, winners = actor_collect_steps[actor_idx](
+                            obs, policy, value, mask, _, _, winners = actor_collect_steps[actor_idx](
                                 collect_params_actor,
                                 collect_keys,
                                 collect_temperature,
                             )
-                            payload = _pack_collect_payload(
+                            payload, _ = _pack_collect_payload(
                                 obs=obs,
                                 policy=policy,
                                 value=value,

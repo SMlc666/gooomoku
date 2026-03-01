@@ -184,14 +184,15 @@ def build_play_many_games_fn(
         pi_buf = jnp.zeros((num_games, max_steps, num_actions), dtype=jnp.float32)
         to_play_buf = jnp.zeros((num_games, max_steps), dtype=jnp.int8)
         mask_buf = jnp.zeros((num_games, max_steps), dtype=jnp.bool_)
+        action_buf = jnp.full((num_games, max_steps), jnp.int32(-1), dtype=jnp.int32)
         steps = jnp.zeros((num_games,), dtype=jnp.int32)
 
         def cond_fn(carry):
-            cur_state, _, step_idx, _, _, _, _, _ = carry
+            cur_state, _, step_idx, _, _, _, _, _, _ = carry
             return (step_idx < max_steps) & jnp.any(~cur_state.terminated)
 
         def body_fn(carry):
-            cur_state, cur_key, step_idx, cur_obs, cur_pi, cur_to_play, cur_mask, cur_steps = carry
+            cur_state, cur_key, step_idx, cur_obs, cur_pi, cur_to_play, cur_mask, cur_action, cur_steps = carry
             cur_key, search_key, sample_key = jax.random.split(cur_key, 3)
 
             active = ~cur_state.terminated
@@ -216,17 +217,29 @@ def build_play_many_games_fn(
             obs_to_store = jnp.where(active[:, None, None, None], obs, jnp.float32(0.0))
             pi_to_store = jnp.where(active[:, None], visit_probs, jnp.float32(0.0))
             to_play_to_store = jnp.where(active, cur_state.to_play, jnp.int8(0))
+            action_to_store = jnp.where(active, action, jnp.int32(-1))
 
             next_obs = cur_obs.at[:, step_idx].set(obs_to_store)
             next_pi = cur_pi.at[:, step_idx].set(pi_to_store)
             next_to_play = cur_to_play.at[:, step_idx].set(to_play_to_store)
             next_mask = cur_mask.at[:, step_idx].set(active)
+            next_action = cur_action.at[:, step_idx].set(action_to_store)
             next_steps = cur_steps + active.astype(jnp.int32)
 
             next_state, _, _ = env.batch_step(cur_state, action)
-            return (next_state, cur_key, step_idx + 1, next_obs, next_pi, next_to_play, next_mask, next_steps)
+            return (
+                next_state,
+                cur_key,
+                step_idx + 1,
+                next_obs,
+                next_pi,
+                next_to_play,
+                next_mask,
+                next_action,
+                next_steps,
+            )
 
-        state, _, _, obs_buf, pi_buf, to_play_buf, mask_buf, steps = jax.lax.while_loop(
+        state, _, _, obs_buf, pi_buf, to_play_buf, mask_buf, action_buf, steps = jax.lax.while_loop(
             cond_fn,
             body_fn,
             (
@@ -237,6 +250,7 @@ def build_play_many_games_fn(
                 pi_buf,
                 to_play_buf,
                 mask_buf,
+                action_buf,
                 steps,
             ),
         )
@@ -249,7 +263,7 @@ def build_play_many_games_fn(
         )
         value_buf = jnp.where(mask_buf, signed_values, jnp.float32(0.0))
         pi_buf = jnp.where(mask_buf[:, :, None], pi_buf, jnp.float32(0.0))
-        return obs_buf, pi_buf, value_buf, mask_buf, steps, winners
+        return obs_buf, pi_buf, value_buf, mask_buf, action_buf, steps, winners
 
     return play_many_fn
 
@@ -328,7 +342,7 @@ def play_many_games(
         root_dirichlet_alpha=root_dirichlet_alpha,
         c_lcb=c_lcb,
     )
-    obs, pi, value, mask, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
+    obs, pi, value, mask, _, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
     obs = jax.device_get(obs)
     pi = jax.device_get(pi)
     value = jax.device_get(value)
