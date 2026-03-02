@@ -1930,6 +1930,8 @@ def main() -> None:
     process_count = jax.process_count()
     process_index = jax.process_index()
     is_chief = process_index == 0
+    if args.role == "learner":
+        is_chief = True
 
 
     local_devices = jax.local_device_count()
