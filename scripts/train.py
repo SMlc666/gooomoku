@@ -1032,7 +1032,7 @@ def _append_replay(
     return merged_obs, merged_policy, merged_value
 
 
-def _init_device_replay(
+def _init_host_replay(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
     replay_value: np.ndarray,
@@ -1041,22 +1041,22 @@ def _init_device_replay(
     board_size: int,
 ):
     num_actions = board_size * board_size
-    obs_dev = jnp.zeros((replay_size, board_size, board_size, 4), dtype=jnp.uint8)
-    policy_dev = jnp.zeros((replay_size, num_actions), dtype=jnp.float32)
-    value_dev = jnp.zeros((replay_size,), dtype=jnp.float32)
+    obs_host = np.zeros((replay_size, board_size, board_size, 4), dtype=np.uint8)
+    policy_host = np.zeros((replay_size, num_actions), dtype=np.float32)
+    value_host = np.zeros((replay_size,), dtype=np.float32)
     replay_count = int(min(replay_obs.shape[0], replay_size))
     replay_head = replay_count % replay_size if replay_size > 0 else 0
     if replay_count > 0:
-        obs_dev = obs_dev.at[:replay_count].set(jnp.asarray(replay_obs[-replay_count:], dtype=jnp.uint8))
-        policy_dev = policy_dev.at[:replay_count].set(jnp.asarray(replay_policy[-replay_count:], dtype=jnp.float32))
-        value_dev = value_dev.at[:replay_count].set(jnp.asarray(replay_value[-replay_count:], dtype=jnp.float32))
-    return obs_dev, policy_dev, value_dev, replay_head, replay_count
+        obs_host[:replay_count] = replay_obs[-replay_count:]
+        policy_host[:replay_count] = replay_policy[-replay_count:]
+        value_host[:replay_count] = replay_value[-replay_count:]
+    return obs_host, policy_host, value_host, replay_head, replay_count
 
 
-def _append_replay_device(
-    replay_obs_dev: jnp.ndarray,
-    replay_policy_dev: jnp.ndarray,
-    replay_value_dev: jnp.ndarray,
+def _append_replay_host(
+    replay_obs_host: np.ndarray,
+    replay_policy_host: np.ndarray,
+    replay_value_host: np.ndarray,
     *,
     replay_head: int,
     replay_count: int,
@@ -1064,57 +1064,50 @@ def _append_replay_device(
     new_policy: np.ndarray,
     new_value: np.ndarray,
 ):
-    capacity = int(replay_obs_dev.shape[0])
+    capacity = int(replay_obs_host.shape[0])
     new_count = int(new_obs.shape[0])
     if new_count <= 0 or capacity <= 0:
-        return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count
+        return replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count
 
     if new_count >= capacity:
-        tail_obs = jnp.asarray(new_obs[-capacity:], dtype=jnp.uint8)
-        tail_policy = jnp.asarray(new_policy[-capacity:], dtype=jnp.float32)
-        tail_value = jnp.asarray(new_value[-capacity:], dtype=jnp.float32)
-        return tail_obs, tail_policy, tail_value, 0, capacity
+        replay_obs_host[:] = new_obs[-capacity:]
+        replay_policy_host[:] = new_policy[-capacity:]
+        replay_value_host[:] = new_value[-capacity:]
+        return replay_obs_host, replay_policy_host, replay_value_host, 0, capacity
 
     first = min(new_count, capacity - replay_head)
     if first > 0:
-        replay_obs_dev = replay_obs_dev.at[replay_head : replay_head + first].set(jnp.asarray(new_obs[:first], dtype=jnp.uint8))
-        replay_policy_dev = replay_policy_dev.at[replay_head : replay_head + first].set(
-            jnp.asarray(new_policy[:first], dtype=jnp.float32)
-        )
-        replay_value_dev = replay_value_dev.at[replay_head : replay_head + first].set(
-            jnp.asarray(new_value[:first], dtype=jnp.float32)
-        )
+        replay_obs_host[replay_head : replay_head + first] = new_obs[:first]
+        replay_policy_host[replay_head : replay_head + first] = new_policy[:first]
+        replay_value_host[replay_head : replay_head + first] = new_value[:first]
 
     remaining = new_count - first
     if remaining > 0:
-        replay_obs_dev = replay_obs_dev.at[:remaining].set(jnp.asarray(new_obs[first:], dtype=jnp.uint8))
-        replay_policy_dev = replay_policy_dev.at[:remaining].set(jnp.asarray(new_policy[first:], dtype=jnp.float32))
-        replay_value_dev = replay_value_dev.at[:remaining].set(jnp.asarray(new_value[first:], dtype=jnp.float32))
+        replay_obs_host[:remaining] = new_obs[first:]
+        replay_policy_host[:remaining] = new_policy[first:]
+        replay_value_host[:remaining] = new_value[first:]
 
     replay_head = (replay_head + new_count) % capacity
     replay_count = min(capacity, replay_count + new_count)
-    return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count
+    return replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count
 
 
-def _materialize_replay_from_device(
-    replay_obs_dev: jnp.ndarray,
-    replay_policy_dev: jnp.ndarray,
-    replay_value_dev: jnp.ndarray,
+def _materialize_replay_from_host(
+    replay_obs_host: np.ndarray,
+    replay_policy_host: np.ndarray,
+    replay_value_host: np.ndarray,
     *,
     replay_count: int,
 ):
     if replay_count <= 0:
-        obs_shape = replay_obs_dev.shape[1:]
-        policy_dim = replay_policy_dev.shape[1]
+        obs_shape = replay_obs_host.shape[1:]
+        policy_dim = replay_policy_host.shape[1]
         return (
             np.zeros((0,) + obs_shape, dtype=np.uint8),
             np.zeros((0, policy_dim), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
         )
-    obs_np = np.asarray(jax.device_get(replay_obs_dev[:replay_count]), dtype=np.uint8)
-    policy_np = np.asarray(jax.device_get(replay_policy_dev[:replay_count]), dtype=np.float32)
-    value_np = np.asarray(jax.device_get(replay_value_dev[:replay_count]), dtype=np.float32)
-    return obs_np, policy_np, value_np
+    return replay_obs_host[:replay_count].copy(), replay_policy_host[:replay_count].copy(), replay_value_host[:replay_count].copy()
 
 
 def _stabilize_replay_payload_examples(
@@ -2054,7 +2047,7 @@ def main() -> None:
         )
 
     best_params = jax.tree_util.tree_map(jnp.asarray, best_params)
-    replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _init_device_replay(
+    replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _init_host_replay(
         replay_obs,
         replay_policy,
         replay_value,
@@ -2071,10 +2064,10 @@ def main() -> None:
         save_start = time.perf_counter()
         current_params = _extract_host_tree(params, use_pmap=use_pmap)
         current_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
-        replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_device(
-            replay_obs_dev,
-            replay_policy_dev,
-            replay_value_dev,
+        replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_host(
+            replay_obs_host,
+            replay_policy_host,
+            replay_value_host,
             replay_count=replay_count,
         )
         cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
@@ -2514,10 +2507,10 @@ def main() -> None:
                     append_obs = np.concatenate([payload[0] for payload in payloads_to_append], axis=0)
                     append_policy = np.concatenate([payload[1] for payload in payloads_to_append], axis=0)
                     append_value = np.concatenate([payload[2] for payload in payloads_to_append], axis=0)
-                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
-                    replay_obs_dev,
-                    replay_policy_dev,
-                    replay_value_dev,
+                replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _append_replay_host(
+                    replay_obs_host,
+                    replay_policy_host,
+                    replay_value_host,
                     replay_head=replay_head,
                     replay_count=replay_count,
                     new_obs=append_obs,
@@ -2525,10 +2518,10 @@ def main() -> None:
                     new_value=append_value,
                 )
             else:
-                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_head, replay_count = _append_replay_device(
-                    replay_obs_dev,
-                    replay_policy_dev,
-                    replay_value_dev,
+                replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _append_replay_host(
+                    replay_obs_host,
+                    replay_policy_host,
+                    replay_value_host,
                     replay_head=replay_head,
                     replay_count=replay_count,
                     new_obs=new_obs,
@@ -2551,17 +2544,10 @@ def main() -> None:
                 policy_batches = []
                 value_batches = []
                 for _ in range(args.updates_per_step):
-                    rng_key, sample_key = jax.random.split(rng_key)
-                    sample_ids = jax.random.randint(
-                        sample_key,
-                        shape=(args.batch_size,),
-                        minval=0,
-                        maxval=replay_count,
-                        dtype=jnp.int32,
-                    )
-                    obs = replay_obs_dev[sample_ids]
-                    policy_target = replay_policy_dev[sample_ids]
-                    value_target = replay_value_dev[sample_ids]
+                    sample_ids = np_rng.integers(0, replay_count, size=args.batch_size, dtype=np.int32)
+                    obs = jnp.asarray(replay_obs_host[sample_ids])
+                    policy_target = jnp.asarray(replay_policy_host[sample_ids])
+                    value_target = jnp.asarray(replay_value_host[sample_ids])
                     if not args.disable_symmetry_augmentation:
                         rng_key, aug_key = jax.random.split(rng_key)
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
@@ -2629,17 +2615,10 @@ def main() -> None:
                             params_ref[0] = _clone_tree(params)
             else:
                 for _ in range(args.updates_per_step):
-                    rng_key, sample_key = jax.random.split(rng_key)
-                    sample_ids = jax.random.randint(
-                        sample_key,
-                        shape=(args.batch_size,),
-                        minval=0,
-                        maxval=replay_count,
-                        dtype=jnp.int32,
-                    )
-                    obs = replay_obs_dev[sample_ids]
-                    policy_target = replay_policy_dev[sample_ids]
-                    value_target = replay_value_dev[sample_ids]
+                    sample_ids = np_rng.integers(0, replay_count, size=args.batch_size, dtype=np.int32)
+                    obs = jnp.asarray(replay_obs_host[sample_ids])
+                    policy_target = jnp.asarray(replay_policy_host[sample_ids])
+                    value_target = jnp.asarray(replay_value_host[sample_ids])
                     if not args.disable_symmetry_augmentation:
                         rng_key, aug_key = jax.random.split(rng_key)
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
@@ -2825,10 +2804,10 @@ def main() -> None:
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
     final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
-    replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_device(
-        replay_obs_dev,
-        replay_policy_dev,
-        replay_value_dev,
+    replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_host(
+        replay_obs_host,
+        replay_policy_host,
+        replay_value_host,
         replay_count=replay_count,
     )
     cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
