@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.experimental import multihost_utils
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT))
@@ -183,7 +184,12 @@ def _l2_regularization(params) -> jnp.ndarray:
     )
 
 
-def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+def make_single_train_step(
+    model: PolicyValueNet,
+    optimizer: optax.GradientTransformation,
+    weight_decay: float,
+    value_loss_weight: float,
+):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
@@ -193,7 +199,7 @@ def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTrans
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = policy_loss + value_loss + reg
+            total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
             return total_loss, (policy_loss, value_loss)
 
         (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -204,7 +210,12 @@ def make_single_train_step(model: PolicyValueNet, optimizer: optax.GradientTrans
     return train_step
 
 
-def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+def make_pmap_train_step(
+    model: PolicyValueNet,
+    optimizer: optax.GradientTransformation,
+    weight_decay: float,
+    value_loss_weight: float,
+):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target):
         def loss_fn(trainable):
@@ -214,7 +225,7 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = policy_loss + value_loss + reg
+            total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
             return total_loss, (policy_loss, value_loss)
 
         (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -229,7 +240,12 @@ def make_pmap_train_step(model: PolicyValueNet, optimizer: optax.GradientTransfo
     return train_step
 
 
-def make_single_multi_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+def make_single_multi_train_step(
+    model: PolicyValueNet,
+    optimizer: optax.GradientTransformation,
+    weight_decay: float,
+    value_loss_weight: float,
+):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
         def one_update(carry, inputs):
@@ -243,7 +259,7 @@ def make_single_multi_train_step(model: PolicyValueNet, optimizer: optax.Gradien
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = policy_loss + value_loss + reg
+                total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
                 return total_loss, (policy_loss, value_loss)
 
             (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
@@ -267,7 +283,12 @@ def make_single_multi_train_step(model: PolicyValueNet, optimizer: optax.Gradien
     return train_step
 
 
-def make_pmap_multi_train_step(model: PolicyValueNet, optimizer: optax.GradientTransformation, weight_decay: float):
+def make_pmap_multi_train_step(
+    model: PolicyValueNet,
+    optimizer: optax.GradientTransformation,
+    weight_decay: float,
+    value_loss_weight: float,
+):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
         def one_update(carry, inputs):
@@ -281,7 +302,7 @@ def make_pmap_multi_train_step(model: PolicyValueNet, optimizer: optax.GradientT
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = policy_loss + value_loss + reg
+                total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
                 return total_loss, (policy_loss, value_loss)
 
             (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
@@ -753,6 +774,7 @@ def _save_training_checkpoint(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
     replay_value: np.ndarray,
+    ema_params,
     best_params,
     best_step: int,
 ) -> None:
@@ -768,6 +790,7 @@ def _save_training_checkpoint(
         "replay_obs": replay_obs,
         "replay_policy": replay_policy,
         "replay_value": replay_value,
+        "ema_params": jax.device_get(ema_params),
         "best_params": jax.device_get(best_params),
         "best_step": int(best_step),
     }
@@ -784,6 +807,59 @@ def _extract_host_tree(params, use_pmap: bool):
 
 def _clone_tree(tree):
     return jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), tree)
+
+
+def _update_ema_params(ema_params, params, decay: float):
+    if decay <= 0.0:
+        return _clone_tree(params)
+    one_minus = jnp.float32(1.0 - decay)
+    decay_j = jnp.float32(decay)
+    return jax.tree_util.tree_map(
+        lambda ema, cur: (decay_j * ema.astype(jnp.float32) + one_minus * cur.astype(jnp.float32)).astype(cur.dtype),
+        ema_params,
+        params,
+    )
+
+
+def _sample_replay_indices(
+    *,
+    np_rng: np.random.Generator,
+    replay_count: int,
+    batch_size: int,
+    recent_fraction: float,
+    recent_window: int,
+) -> np.ndarray:
+    if replay_count <= 0:
+        raise ValueError("replay_count must be > 0 for replay sampling")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0 for replay sampling")
+
+    frac = float(np.clip(recent_fraction, 0.0, 1.0))
+    if recent_window <= 0 or frac <= 0.0:
+        return np_rng.integers(0, replay_count, size=batch_size, dtype=np.int32)
+
+    recent_cap = min(int(recent_window), int(replay_count))
+    if recent_cap <= 0:
+        return np_rng.integers(0, replay_count, size=batch_size, dtype=np.int32)
+
+    recent_samples = int(round(batch_size * frac))
+    recent_samples = max(0, min(batch_size, recent_samples))
+    global_samples = batch_size - recent_samples
+
+    parts = []
+    if recent_samples > 0:
+        recent_start = replay_count - recent_cap
+        parts.append(np_rng.integers(recent_start, replay_count, size=recent_samples, dtype=np.int32))
+    if global_samples > 0:
+        parts.append(np_rng.integers(0, replay_count, size=global_samples, dtype=np.int32))
+
+    if not parts:
+        return np_rng.integers(0, replay_count, size=batch_size, dtype=np.int32)
+    if len(parts) == 1:
+        return parts[0]
+    merged = np.concatenate(parts, axis=0)
+    np_rng.shuffle(merged)
+    return merged.astype(np.int32, copy=False)
 
 
 def _add_batch_dim_state(state: env.GomokuState) -> env.GomokuState:
@@ -807,6 +883,9 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "lr": args.lr,
         "lr_warmup_steps": args.lr_warmup_steps,
         "lr_end_value": args.lr_end_value,
+        "grad_clip_norm": args.grad_clip_norm,
+        "value_loss_weight": args.value_loss_weight,
+        "ema_decay": args.ema_decay,
         "compute_dtype": args.compute_dtype,
         "param_dtype": args.param_dtype,
         "symmetry_augmentation": not args.disable_symmetry_augmentation,
@@ -821,6 +900,8 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "cross_process_selfplay": args.cross_process_selfplay,
         "selfplay_actors": args.selfplay_actors,
         "actor_param_sync_updates": args.actor_param_sync_updates,
+        "replay_recent_fraction": args.replay_recent_fraction,
+        "replay_recent_window": args.replay_recent_window,
         "optimizer_updates": optimizer_updates,
         "best_step": best_step,
     }
@@ -1145,6 +1226,81 @@ def _stabilize_replay_payload_examples(
         np.asarray(compact_policy[pad_index], dtype=np.float32),
         np.asarray(compact_value[pad_index], dtype=np.float32),
         fixed_examples,
+    )
+
+
+def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBatch:
+    new_obs, new_policy, new_value, black_win, white_win, draw, new_examples = payload
+    local_examples = int(new_examples)
+
+    counts_out = multihost_utils.process_allgather(jnp.asarray(np.array([local_examples], dtype=np.int32)))
+    counts_np = np.asarray(jax.device_get(counts_out), dtype=np.int32).reshape(-1)
+    max_examples = int(counts_np.max()) if counts_np.size > 0 else 0
+    if max_examples <= 0:
+        return (
+            np.zeros((0,) + new_obs.shape[1:], dtype=np.uint8),
+            np.zeros((0, new_policy.shape[1]), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            0,
+            0,
+            0,
+            0,
+        )
+
+    obs_pad = np.zeros((max_examples,) + new_obs.shape[1:], dtype=np.uint8)
+    policy_pad = np.zeros((max_examples, new_policy.shape[1]), dtype=np.float32)
+    value_pad = np.zeros((max_examples,), dtype=np.float32)
+    if local_examples > 0:
+        obs_pad[:local_examples] = new_obs[:local_examples]
+        policy_pad[:local_examples] = new_policy[:local_examples]
+        value_pad[:local_examples] = new_value[:local_examples]
+
+    stats_local = np.asarray([black_win, white_win, draw], dtype=np.int32)
+    obs_all, policy_all, value_all, _counts_dup, stats_all = multihost_utils.process_allgather(
+        (
+            jnp.asarray(obs_pad),
+            jnp.asarray(policy_pad),
+            jnp.asarray(value_pad),
+            jnp.asarray(np.array([local_examples], dtype=np.int32)),
+            jnp.asarray(stats_local),
+        )
+    )
+
+    obs_all_np = np.asarray(jax.device_get(obs_all), dtype=np.uint8)
+    policy_all_np = np.asarray(jax.device_get(policy_all), dtype=np.float32)
+    value_all_np = np.asarray(jax.device_get(value_all), dtype=np.float32)
+    stats_all_np = np.asarray(jax.device_get(stats_all), dtype=np.int32)
+
+    merged_obs_parts = []
+    merged_policy_parts = []
+    merged_value_parts = []
+    for proc_i, proc_examples in enumerate(counts_np):
+        proc_n = int(proc_examples)
+        if proc_n <= 0:
+            continue
+        merged_obs_parts.append(obs_all_np[proc_i, :proc_n])
+        merged_policy_parts.append(policy_all_np[proc_i, :proc_n])
+        merged_value_parts.append(value_all_np[proc_i, :proc_n])
+
+    if merged_obs_parts:
+        merged_obs = np.concatenate(merged_obs_parts, axis=0)
+        merged_policy = np.concatenate(merged_policy_parts, axis=0)
+        merged_value = np.concatenate(merged_value_parts, axis=0)
+    else:
+        merged_obs = np.zeros((0,) + new_obs.shape[1:], dtype=np.uint8)
+        merged_policy = np.zeros((0, new_policy.shape[1]), dtype=np.float32)
+        merged_value = np.zeros((0,), dtype=np.float32)
+
+    stats_sum = stats_all_np if stats_all_np.ndim == 1 else stats_all_np.sum(axis=0)
+    merged_examples = int(counts_np.sum()) if counts_np.size > 0 else 0
+    return (
+        np.asarray(merged_obs, dtype=np.uint8),
+        np.asarray(merged_policy, dtype=np.float32),
+        np.asarray(merged_value, dtype=np.float32),
+        int(stats_sum[0]),
+        int(stats_sum[1]),
+        int(stats_sum[2]),
+        merged_examples,
     )
 
 
@@ -1674,6 +1830,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--lr-end-value", type=float, default=1e-4)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--value-loss-weight", type=float, default=1.25)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -1731,6 +1890,18 @@ def main() -> None:
             "(truncate/repeat valid rows) to stabilize replay append shapes and reduce recompiles."
         ),
     )
+    parser.add_argument(
+        "--replay-recent-fraction",
+        type=float,
+        default=0.7,
+        help="Fraction of each train batch sampled from recent replay tail (0..1).",
+    )
+    parser.add_argument(
+        "--replay-recent-window",
+        type=int,
+        default=16384,
+        help="Replay tail size used by recent-priority sampling. <=0 disables recent sampling.",
+    )
     parser.add_argument("--selfplay-batch-games", type=int, default=None)
     parser.add_argument("--replay-host", type=str, default="auto")
     parser.add_argument("--replay-port", type=int, default=19091)
@@ -1767,10 +1938,24 @@ def main() -> None:
         action="store_true",
         help="Disable fused multi-update train step and keep one-jit-call-per-update behavior.",
     )
+    parser.add_argument(
+        "--disable-cross-host-replay-merge",
+        action="store_true",
+        help=(
+            "Disable cross-host replay payload allgather in role=all distributed runs. "
+            "Enabled by default when process_count > 1 and distributed init is active."
+        ),
+    )
     args = parser.parse_args()
 
     if args.updates_per_step < 1:
         raise ValueError("updates-per-step must be >= 1")
+    if args.grad_clip_norm < 0:
+        raise ValueError("grad-clip-norm must be >= 0")
+    if args.value_loss_weight <= 0:
+        raise ValueError("value-loss-weight must be > 0")
+    if not (0.0 <= args.ema_decay < 1.0):
+        raise ValueError("ema-decay must be in [0, 1)")
     compute_dtype = _dtype_from_name(args.compute_dtype)
     param_dtype = _dtype_from_name(args.param_dtype)
     if args.arena_every_steps < 0:
@@ -1791,6 +1976,8 @@ def main() -> None:
         raise ValueError("actor-param-sync-updates must be >= 1")
     if args.replay_fixed_update_size < 0:
         raise ValueError("replay-fixed-update-size must be >= 0")
+    if not (0.0 <= args.replay_recent_fraction <= 1.0):
+        raise ValueError("replay-recent-fraction must be in [0, 1]")
     if args.remote_replay_queue_size < 1:
         raise ValueError("remote-replay-queue-size must be >= 1")
     if args.learner_drain_max_batches < 0:
@@ -1879,7 +2066,13 @@ def main() -> None:
         decay_steps=decay_steps,
         end_value=args.lr_end_value,
     )
-    optimizer = optax.adam(learning_rate=lr_schedule)
+    if args.grad_clip_norm > 0:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(args.grad_clip_norm),
+            optax.adam(learning_rate=lr_schedule),
+        )
+    else:
+        optimizer = optax.adam(learning_rate=lr_schedule)
     opt_state = optimizer.init(params)
     replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.uint8)
     replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
@@ -1887,6 +2080,7 @@ def main() -> None:
     np_rng = np.random.default_rng(args.seed + 13)
     optimizer_updates = 0
     best_params = _clone_tree(params)
+    ema_params = _clone_tree(params)
     best_step = 0
     start_step = 1
 
@@ -1928,6 +2122,10 @@ def main() -> None:
             best_params = jax.tree_util.tree_map(jnp.asarray, payload["best_params"])
         else:
             best_params = _clone_tree(params)
+        if "ema_params" in payload:
+            ema_params = jax.tree_util.tree_map(jnp.asarray, payload["ema_params"])
+        else:
+            ema_params = _clone_tree(params)
         best_step = int(payload.get("best_step", 0))
 
         print(
@@ -1940,10 +2138,30 @@ def main() -> None:
     is_chief = process_index == 0
     if args.role == "learner":
         is_chief = True
+    if args.role == "all" and process_count > 1:
+        # Avoid identical multi-host trajectories/sampling streams in role=all.
+        rng_key = jax.random.fold_in(rng_key, jnp.asarray(process_index, dtype=jnp.uint32))
+        np_rng = np.random.default_rng(args.seed + 13 + 1_000_003 * process_index)
 
 
     local_devices = jax.local_device_count()
     global_devices = jax.device_count()
+    cross_host_replay_merge = (
+        (not args.disable_cross_host_replay_merge)
+        and args.role == "all"
+        and distributed_initialized
+        and process_count > 1
+    )
+    if is_chief and args.role == "all":
+        print(
+            "cross-host replay merge "
+            + ("enabled" if cross_host_replay_merge else "disabled")
+            + (
+                f" (process_count={process_count}, distributed_initialized={distributed_initialized})"
+                if process_count > 1
+                else f" (process_count={process_count})"
+            )
+        )
     use_pmap = (not args.disable_pmap) and local_devices > 1
     if args.role in {"actor", "learner"} and use_pmap and args.distributed_init == "off":
         if args.allow_role_pmap_with_distributed_off:
@@ -1981,6 +2199,8 @@ def main() -> None:
 
     games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
     fused_train_updates = args.updates_per_step > 1 and (not args.disable_fused_train_updates)
+    ema_decay_step = float(args.ema_decay)
+    ema_decay_fused = float(args.ema_decay ** max(args.updates_per_step, 1))
     actor_device_groups = None
     actor_devices_per_group = 0
     if args.async_selfplay and (not args.cross_process_selfplay) and use_pmap:
@@ -2026,11 +2246,22 @@ def main() -> None:
 
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
-        train_step = make_pmap_train_step(model, optimizer, weight_decay=args.weight_decay)
-        train_step_multi = make_pmap_multi_train_step(model, optimizer, weight_decay=args.weight_decay)
+        train_step = make_pmap_train_step(
+            model,
+            optimizer,
+            weight_decay=args.weight_decay,
+            value_loss_weight=args.value_loss_weight,
+        )
+        train_step_multi = make_pmap_multi_train_step(
+            model,
+            optimizer,
+            weight_decay=args.weight_decay,
+            value_loss_weight=args.value_loss_weight,
+        )
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
+        ema_params = _replicate_tree_for_pmap(ema_params, local_devices=local_devices)
         best_params_repl = _replicate_tree_for_pmap(best_params, local_devices=local_devices)
         print(
             f"pmap enabled: process={process_index}/{process_count}, local_device_count={local_devices}, "
@@ -2042,11 +2273,24 @@ def main() -> None:
             f"updates_per_step={args.updates_per_step}, "
             f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
+            f"replay_recent_fraction={args.replay_recent_fraction:.2f}, replay_recent_window={args.replay_recent_window}, "
+            f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
-        train_step = make_single_train_step(model, optimizer, weight_decay=args.weight_decay)
-        train_step_multi = make_single_multi_train_step(model, optimizer, weight_decay=args.weight_decay)
+        train_step = make_single_train_step(
+            model,
+            optimizer,
+            weight_decay=args.weight_decay,
+            value_loss_weight=args.value_loss_weight,
+        )
+        train_step_multi = make_single_multi_train_step(
+            model,
+            optimizer,
+            weight_decay=args.weight_decay,
+            value_loss_weight=args.value_loss_weight,
+        )
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
         best_params_repl = None
@@ -2059,6 +2303,9 @@ def main() -> None:
             f"actor_param_sync_updates={args.actor_param_sync_updates}, "
             f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
+            f"replay_recent_fraction={args.replay_recent_fraction:.2f}, replay_recent_window={args.replay_recent_window}, "
+            f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
@@ -2099,6 +2346,7 @@ def main() -> None:
             replay_obs=replay_obs_np,
             replay_policy=replay_policy_np,
             replay_value=replay_value_np,
+            ema_params=_extract_host_tree(ema_params, use_pmap=use_pmap),
             best_params=best_params,
             best_step=best_step,
         )
@@ -2502,6 +2750,9 @@ def main() -> None:
             else:
                 rng_key, collect_key = jax.random.split(rng_key)
                 collect_start = time.perf_counter()
+                payload = collect_new_examples(params, collect_key)
+                if cross_host_replay_merge:
+                    payload = _merge_selfplay_payloads_across_hosts(payload)
                 (
                     new_obs,
                     new_policy,
@@ -2510,7 +2761,7 @@ def main() -> None:
                     white_win,
                     draw,
                     new_examples,
-                ) = collect_new_examples(params, collect_key)
+                ) = payload
                 collect_wait_ms = (time.perf_counter() - collect_start) * 1000.0
 
             replay_append_start = time.perf_counter()
@@ -2560,7 +2811,13 @@ def main() -> None:
                 policy_batches = []
                 value_batches = []
                 for _ in range(args.updates_per_step):
-                    sample_ids = np_rng.integers(0, replay_count, size=args.batch_size, dtype=np.int32)
+                    sample_ids = _sample_replay_indices(
+                        np_rng=np_rng,
+                        replay_count=replay_count,
+                        batch_size=args.batch_size,
+                        recent_fraction=args.replay_recent_fraction,
+                        recent_window=args.replay_recent_window,
+                    )
                     obs = jnp.asarray(replay_obs_host[sample_ids])
                     policy_target = jnp.asarray(replay_policy_host[sample_ids])
                     value_target = jnp.asarray(replay_value_host[sample_ids])
@@ -2608,6 +2865,10 @@ def main() -> None:
                 value_sum = value_scalar * args.updates_per_step
                 prev_optimizer_updates = optimizer_updates
                 optimizer_updates += args.updates_per_step
+                if ema_decay_step > 0.0:
+                    ema_params = _update_ema_params(ema_params, params, ema_decay_fused)
+                else:
+                    ema_params = params
                 should_sync_actor_params = (
                     args.async_selfplay
                     and ((prev_optimizer_updates // args.actor_param_sync_updates) != (optimizer_updates // args.actor_param_sync_updates))
@@ -2631,7 +2892,13 @@ def main() -> None:
                             params_ref[0] = _clone_tree(params)
             else:
                 for _ in range(args.updates_per_step):
-                    sample_ids = np_rng.integers(0, replay_count, size=args.batch_size, dtype=np.int32)
+                    sample_ids = _sample_replay_indices(
+                        np_rng=np_rng,
+                        replay_count=replay_count,
+                        batch_size=args.batch_size,
+                        recent_fraction=args.replay_recent_fraction,
+                        recent_window=args.replay_recent_window,
+                    )
                     obs = jnp.asarray(replay_obs_host[sample_ids])
                     policy_target = jnp.asarray(replay_policy_host[sample_ids])
                     value_target = jnp.asarray(replay_value_host[sample_ids])
@@ -2665,6 +2932,10 @@ def main() -> None:
                         policy_sum += float(policy_loss)
                         value_sum += float(value_loss)
                     optimizer_updates += 1
+                    if ema_decay_step > 0.0:
+                        ema_params = _update_ema_params(ema_params, params, ema_decay_step)
+                    else:
+                        ema_params = params
 
                     if (
                         args.async_selfplay
@@ -2758,13 +3029,13 @@ def main() -> None:
                 if use_pmap:
                     arena_keys = jax.random.split(arena_key, local_devices)
                     assert pmap_arena_step is not None
-                    arena_wins, arena_losses, arena_draws = pmap_arena_step(params, best_params_repl, arena_keys)
+                    arena_wins, arena_losses, arena_draws = pmap_arena_step(ema_params, best_params_repl, arena_keys)
                     arena_wins = int(np.asarray(jax.device_get(arena_wins)).sum())
                     arena_losses = int(np.asarray(jax.device_get(arena_losses)).sum())
                     arena_draws = int(np.asarray(jax.device_get(arena_draws)).sum())
-                    current_params = _extract_host_tree(params, use_pmap=use_pmap)
+                    current_params = _extract_host_tree(ema_params, use_pmap=use_pmap)
                 else:
-                    current_params = _extract_host_tree(params, use_pmap=use_pmap)
+                    current_params = _extract_host_tree(ema_params, use_pmap=use_pmap)
                     arena_wins, arena_losses, arena_draws = arena_fn(current_params, best_params, arena_key)
                     arena_wins = int(arena_wins)
                     arena_losses = int(arena_losses)
@@ -2840,6 +3111,7 @@ def main() -> None:
             replay_obs=replay_obs_np,
             replay_policy=replay_policy_np,
             replay_value=replay_value_np,
+            ema_params=_extract_host_tree(ema_params, use_pmap=use_pmap),
             best_params=best_params,
             best_step=best_step,
         )

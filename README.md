@@ -86,6 +86,7 @@ When using `gs://` paths, `gcloud` CLI must be available on the runtime host.
 - Keep `--batch-size` divisible by `jax.local_device_count()` in pmap mode.
 - To force single-device fallback: add `--disable-pmap`.
 - For multi-host TPU slices (for example v4-16 with 2 workers), launch `scripts/train.py` on **all workers** and keep `--distributed-init auto` (default) or set `--distributed-init on` to require `jax.distributed.initialize()`.
+- In `--role all` + distributed multi-host runs, self-play payloads are merged across hosts by default before replay append (disable via `--disable-cross-host-replay-merge`).
 - For asynchronous actor-learner on TPU slices, add `--async-selfplay --cross-process-selfplay` to run self-play actors in separate processes and avoid TPU runtime conflicts from threaded actor execution.
 - Training checkpoint writes are chief-only (`process_index == 0`) in distributed mode to avoid multi-host file write races.
 - This is a minimal baseline focused on structure and correctness, not peak throughput.
@@ -99,6 +100,8 @@ When diagnosing intermittent stalls (for example long gaps between `step=...` li
 - `--detailed-step-log`: adds per-step phase timings (`replay_append_ms`, `train_updates_ms`, `param_snapshot_ms`) to the regular `step=...` line.
 - Multi-update training now runs in a fused JAX step by default when `updates-per-step > 1` (higher training throughput without changing CLI commands). Use `--disable-fused-train-updates` only for A/B debugging.
 - `--replay-fixed-update-size` (default `0`): if set (for example `4096`), each self-play payload is normalized to a fixed example count (truncate/repeat valid rows) to stabilize replay append tensor shapes and reduce repeated JAX recompiles caused by variable `new_examples`.
+- Replay sampling uses recent+uniform mix by default: `--replay-recent-fraction 0.7 --replay-recent-window 16384` (set fraction to `0` or window `<=0` to disable).
+- Training stability knobs: `--grad-clip-norm` (default `1.0`), `--value-loss-weight` (default `1.25`), and EMA-eval `--ema-decay` (default `0.999` for arena candidate evaluation).
 
 Example (more verbose diagnostics):
 
