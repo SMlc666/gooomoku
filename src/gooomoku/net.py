@@ -41,7 +41,7 @@ class TransformerBlock(nn.Module):
             )
         head_dim = self.channels // self.num_heads
         y = nn.LayerNorm(
-            compute_dtype=self.compute_dtype,
+            dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(x)
 
@@ -94,7 +94,7 @@ class TransformerBlock(nn.Module):
         x = x + y
 
         y = nn.LayerNorm(
-            compute_dtype=self.compute_dtype,
+            dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(x)
         y = nn.Dense(
@@ -181,7 +181,7 @@ class PolicyValueNet(nn.Module):
             )
 
         x = nn.LayerNorm(
-            compute_dtype=self.compute_dtype,
+            dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="final_norm",
         )(x)
@@ -194,7 +194,7 @@ class PolicyValueNet(nn.Module):
         )(x).squeeze(-1)
 
         pooled = nn.LayerNorm(
-            compute_dtype=self.compute_dtype,
+            dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="global_pool_norm",
         )(x)
