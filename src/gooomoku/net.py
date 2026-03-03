@@ -68,7 +68,7 @@ class TransformerBlock(nn.Module):
         )(y)
 
         attn_logits = jnp.einsum("bthd,bshd->bhts", q, k)
-        attn_logits = attn_logits * jnp.float32(head_dim ** -0.5)
+        attn_logits = attn_logits * jnp.asarray(head_dim ** -0.5, dtype=self.compute_dtype)
         rel_table_size = (2 * self.board_size - 1) * (2 * self.board_size - 1)
         rel_pos_bias = self.param(
             "rel_pos_bias",
@@ -82,7 +82,7 @@ class TransformerBlock(nn.Module):
         rel_bias = rel_bias.reshape(self.num_heads, tokens, tokens)
         attn_logits = attn_logits + rel_bias[None, :, :, :]
 
-        attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=-1).astype(self.compute_dtype)
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1).astype(self.compute_dtype)
         context = jnp.einsum("bhts,bshd->bthd", attn_weights, v)
         context = context.reshape((context.shape[0], context.shape[1], self.channels))
         y = nn.Dense(
