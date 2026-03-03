@@ -342,6 +342,43 @@ def _apply_root_dirichlet_noise(
     return jnp.where(legal_mask, jnp.log(jnp.clip(mixed, 1e-20)), min_logit)
 
 
+def _apply_dynamic_considered_pruning(
+    *,
+    prior_logits: jnp.ndarray,
+    legal_mask: jnp.ndarray,
+    num_moves: jnp.ndarray,
+    max_num_considered_actions: int,
+    opening_considered_actions: int,
+    midgame_considered_actions: int,
+    endgame_considered_actions: int,
+    midgame_start_move: int,
+    endgame_start_move: int,
+) -> jnp.ndarray:
+    batch_size = prior_logits.shape[0]
+    num_actions = prior_logits.shape[-1]
+    top_k = int(max(1, min(max_num_considered_actions, num_actions)))
+    top_vals, top_idx = jax.lax.top_k(prior_logits, k=top_k)
+    del top_vals
+
+    opening_k = int(max(1, min(opening_considered_actions, top_k)))
+    mid_k = int(max(1, min(midgame_considered_actions, top_k)))
+    end_k = int(max(1, min(endgame_considered_actions, top_k)))
+    move_count = num_moves.astype(jnp.int32)
+    desired_k = jnp.where(
+        move_count < jnp.int32(midgame_start_move),
+        jnp.int32(opening_k),
+        jnp.where(move_count < jnp.int32(endgame_start_move), jnp.int32(mid_k), jnp.int32(end_k)),
+    )
+    keep_rank = jnp.arange(top_k, dtype=jnp.int32)[None, :] < desired_k[:, None]
+
+    selected = jnp.zeros((batch_size, num_actions), dtype=jnp.bool_)
+    selected = selected.at[jnp.arange(batch_size)[:, None], top_idx].set(keep_rank)
+    selected = selected & legal_mask
+
+    min_logit = jnp.finfo(prior_logits.dtype).min
+    return jnp.where(selected, prior_logits, min_logit)
+
+
 def root_output(
     params,
     model: PolicyValueNet,
@@ -447,6 +484,12 @@ def build_search_fn(
     force_defense_at_root: bool = True,
     force_defense_in_recurrent: bool = False,
     c_lcb: float = 0.0,
+    dynamic_considered_actions: bool = False,
+    opening_considered_actions: int = 64,
+    midgame_considered_actions: int = 96,
+    endgame_considered_actions: int = 160,
+    midgame_start_move: int = 12,
+    endgame_start_move: int = 40,
 ):
     recurrent = functools.partial(
         recurrent_fn,
@@ -465,9 +508,26 @@ def build_search_fn(
             force_defense_at_root=force_defense_at_root,
         )
         invalid_actions = ~env.batch_legal_action_mask(states)
+        legal_actions = ~invalid_actions
+        if dynamic_considered_actions:
+            pruned_logits = _apply_dynamic_considered_pruning(
+                prior_logits=root.prior_logits,
+                legal_mask=legal_actions,
+                num_moves=states.num_moves,
+                max_num_considered_actions=max_num_considered_actions,
+                opening_considered_actions=opening_considered_actions,
+                midgame_considered_actions=midgame_considered_actions,
+                endgame_considered_actions=endgame_considered_actions,
+                midgame_start_move=midgame_start_move,
+                endgame_start_move=endgame_start_move,
+            )
+            root = mctx.RootFnOutput(
+                prior_logits=pruned_logits,
+                value=root.value,
+                embedding=root.embedding,
+            )
         if use_root_noise:
             noise_key, search_key = jax.random.split(rng_key)
-            legal_actions = ~invalid_actions
             noisy_logits = _apply_root_dirichlet_noise(
                 prior_logits=root.prior_logits,
                 legal_mask=legal_actions,

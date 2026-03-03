@@ -102,6 +102,10 @@ When diagnosing intermittent stalls (for example long gaps between `step=...` li
 - `--replay-fixed-update-size` (default `0`): if set (for example `4096`), each self-play payload is normalized to a fixed example count (truncate/repeat valid rows) to stabilize replay append tensor shapes and reduce repeated JAX recompiles caused by variable `new_examples`.
 - Replay sampling uses recent+uniform mix by default: `--replay-recent-fraction 0.7 --replay-recent-window 16384` (set fraction to `0` or window `<=0` to disable).
 - Training stability knobs: `--grad-clip-norm` (default `1.0`), `--value-loss-weight` (default `1.25`), and EMA-eval `--ema-decay` (default `0.999` for arena candidate evaluation).
+- `--role all` now enables overlap mode by default (`--async-selfplay`) unless you pass `--disable-overlap-selfplay`.
+- Dynamic root considered-action pruning is available via `--disable-dynamic-considered-actions` and `--considered-actions-opening/midgame/endgame`.
+- You can decouple self-play search depth from training depth with `--search-blocks` (for example train 10 blocks, search 6 blocks).
+- Attention head cap is configurable with `--max-attention-heads` to reduce attention HBM pressure on large-board TPU runs.
 
 Example (more verbose diagnostics):
 

@@ -278,6 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--board-size", type=int, default=15)
     parser.add_argument("--channels", type=int, default=96)
     parser.add_argument("--blocks", type=int, default=8)
+    parser.add_argument("--max-attention-heads", type=int, default=4)
     parser.add_argument("--num-simulations", type=int, default=256)
     parser.add_argument("--max-num-considered-actions", type=int, default=64)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
@@ -304,6 +305,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     board_size = int(config.get("board_size", args.board_size))
     channels = int(config.get("channels", args.channels))
     blocks = int(config.get("blocks", args.blocks))
+    max_attention_heads = int(config.get("max_attention_heads", args.max_attention_heads))
     compute_dtype_name = str(config.get("compute_dtype", args.compute_dtype))
     param_dtype_name = str(config.get("param_dtype", args.param_dtype))
     num_simulations = int(config.get("num_simulations", args.num_simulations))
@@ -318,6 +320,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             board_size=board_size,
             channels=channels,
             blocks=blocks,
+            max_attention_heads=max_attention_heads,
             compute_dtype=compute_dtype,
             param_dtype=param_dtype,
         )
@@ -364,6 +367,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             "board_size": board_size,
             "channels": channels,
             "blocks": blocks,
+            "max_attention_heads": max_attention_heads,
             "compute_dtype": effective_compute_dtype_name,
             "param_dtype": param_dtype_name,
             "num_simulations": num_simulations,

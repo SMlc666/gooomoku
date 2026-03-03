@@ -150,6 +150,7 @@ def main() -> None:
     parser.add_argument("--board-size", type=int, default=None)
     parser.add_argument("--channels", type=int, default=None)
     parser.add_argument("--blocks", type=int, default=None)
+    parser.add_argument("--max-attention-heads", type=int, default=None)
     parser.add_argument("--compute-dtype", type=str, default=None)
     parser.add_argument("--param-dtype", type=str, default=None)
     parser.add_argument("--num-simulations", type=int, default=None)
@@ -161,6 +162,7 @@ def main() -> None:
     board_size = args.board_size or int(config.get("board_size", 9))
     channels = args.channels or int(config.get("channels", 64))
     blocks = args.blocks or int(config.get("blocks", 6))
+    max_attention_heads = args.max_attention_heads or int(config.get("max_attention_heads", 4))
     compute_dtype_name = args.compute_dtype or str(config.get("compute_dtype", "float32"))
     param_dtype_name = args.param_dtype or str(config.get("param_dtype", "float32"))
     compute_dtype = _dtype_from_name(compute_dtype_name)
@@ -172,6 +174,7 @@ def main() -> None:
         board_size=board_size,
         channels=channels,
         blocks=blocks,
+        max_attention_heads=max_attention_heads,
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
     )

@@ -72,6 +72,12 @@ def build_play_one_game_fn(
     board_size: int,
     num_simulations: int,
     max_num_considered_actions: int,
+    dynamic_considered_actions: bool = False,
+    opening_considered_actions: int = 64,
+    midgame_considered_actions: int = 96,
+    endgame_considered_actions: int = 160,
+    midgame_start_move: int = 12,
+    endgame_start_move: int = 40,
     temperature_drop_move: int = 12,
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
@@ -91,6 +97,12 @@ def build_play_one_game_fn(
         root_dirichlet_alpha=root_dirichlet_alpha,
         force_defense_at_root=False,
         c_lcb=c_lcb,
+        dynamic_considered_actions=dynamic_considered_actions,
+        opening_considered_actions=opening_considered_actions,
+        midgame_considered_actions=midgame_considered_actions,
+        endgame_considered_actions=endgame_considered_actions,
+        midgame_start_move=midgame_start_move,
+        endgame_start_move=endgame_start_move,
     )
 
     @jax.jit
@@ -152,6 +164,12 @@ def build_play_many_games_fn(
     num_simulations: int,
     max_num_considered_actions: int,
     num_games: int,
+    dynamic_considered_actions: bool = False,
+    opening_considered_actions: int = 64,
+    midgame_considered_actions: int = 96,
+    endgame_considered_actions: int = 160,
+    midgame_start_move: int = 12,
+    endgame_start_move: int = 40,
     temperature_drop_move: int = 12,
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
@@ -176,6 +194,12 @@ def build_play_many_games_fn(
         root_dirichlet_alpha=root_dirichlet_alpha,
         force_defense_at_root=False,
         c_lcb=c_lcb,
+        dynamic_considered_actions=dynamic_considered_actions,
+        opening_considered_actions=opening_considered_actions,
+        midgame_considered_actions=midgame_considered_actions,
+        endgame_considered_actions=endgame_considered_actions,
+        midgame_start_move=midgame_start_move,
+        endgame_start_move=endgame_start_move,
     )
 
     @jax.jit
@@ -277,6 +301,12 @@ def play_one_game(
     num_simulations: int,
     max_num_considered_actions: int,
     temperature: float,
+    dynamic_considered_actions: bool = False,
+    opening_considered_actions: int = 64,
+    midgame_considered_actions: int = 96,
+    endgame_considered_actions: int = 160,
+    midgame_start_move: int = 12,
+    endgame_start_move: int = 40,
     temperature_drop_move: int = 12,
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
@@ -288,6 +318,12 @@ def play_one_game(
         board_size=board_size,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        dynamic_considered_actions=dynamic_considered_actions,
+        opening_considered_actions=opening_considered_actions,
+        midgame_considered_actions=midgame_considered_actions,
+        endgame_considered_actions=endgame_considered_actions,
+        midgame_start_move=midgame_start_move,
+        endgame_start_move=endgame_start_move,
         temperature_drop_move=temperature_drop_move,
         final_temperature=final_temperature,
         root_dirichlet_fraction=root_dirichlet_fraction,
@@ -324,6 +360,12 @@ def play_many_games(
     num_simulations: int,
     max_num_considered_actions: int,
     temperature: float,
+    dynamic_considered_actions: bool = False,
+    opening_considered_actions: int = 64,
+    midgame_considered_actions: int = 96,
+    endgame_considered_actions: int = 160,
+    midgame_start_move: int = 12,
+    endgame_start_move: int = 40,
     temperature_drop_move: int = 12,
     final_temperature: float = 0.0,
     root_dirichlet_fraction: float = 0.25,
@@ -336,6 +378,12 @@ def play_many_games(
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
         num_games=num_games,
+        dynamic_considered_actions=dynamic_considered_actions,
+        opening_considered_actions=opening_considered_actions,
+        midgame_considered_actions=midgame_considered_actions,
+        endgame_considered_actions=endgame_considered_actions,
+        midgame_start_move=midgame_start_move,
+        endgame_start_move=endgame_start_move,
         temperature_drop_move=temperature_drop_move,
         final_temperature=final_temperature,
         root_dirichlet_fraction=root_dirichlet_fraction,
@@ -381,8 +429,15 @@ def main() -> None:
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
+    parser.add_argument("--disable-dynamic-considered-actions", action="store_true")
+    parser.add_argument("--considered-actions-opening", type=int, default=64)
+    parser.add_argument("--considered-actions-midgame", type=int, default=96)
+    parser.add_argument("--considered-actions-endgame", type=int, default=160)
+    parser.add_argument("--considered-actions-mid-move", type=int, default=12)
+    parser.add_argument("--considered-actions-endgame-move", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--c-lcb", type=float, default=0.0)
+    parser.add_argument("--max-attention-heads", type=int, default=4)
     parser.add_argument("--compute-dtype", type=str, default="float32")
     parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--seed", type=int, default=0)
@@ -392,6 +447,7 @@ def main() -> None:
     param_dtype = _dtype_from_name(args.param_dtype)
     model = PolicyValueNet(
         board_size=args.board_size,
+        max_attention_heads=args.max_attention_heads,
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
     )
@@ -405,6 +461,12 @@ def main() -> None:
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
         temperature=args.temperature,
+        dynamic_considered_actions=not args.disable_dynamic_considered_actions,
+        opening_considered_actions=args.considered_actions_opening,
+        midgame_considered_actions=args.considered_actions_midgame,
+        endgame_considered_actions=args.considered_actions_endgame,
+        midgame_start_move=args.considered_actions_mid_move,
+        endgame_start_move=args.considered_actions_endgame_move,
         c_lcb=args.c_lcb,
     )
     print(f"samples={len(samples)} winner={winner}")

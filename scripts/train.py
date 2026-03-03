@@ -22,6 +22,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax.core import freeze
+from flax.core import unfreeze
+from flax.core.frozen_dict import FrozenDict
 from jax.experimental import multihost_utils
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -90,10 +93,13 @@ def _run_cross_process_actor(
         jax.config.update("jax_platforms", actor_jax_platforms)
     configure_jax_runtime(app_name=f"train-actor-{actor_idx}", repo_root=REPO_ROOT)
 
+    train_blocks = int(cfg["blocks"])
+    search_blocks = int(cfg.get("search_blocks", train_blocks))
     model = PolicyValueNet(
         board_size=int(cfg["board_size"]),
         channels=int(cfg["channels"]),
-        blocks=int(cfg["blocks"]),
+        blocks=search_blocks,
+        max_attention_heads=int(cfg.get("max_attention_heads", 4)),
         compute_dtype=_dtype_from_name(str(cfg["compute_dtype"])),
         param_dtype=_dtype_from_name(str(cfg["param_dtype"])),
     )
@@ -107,10 +113,23 @@ def _run_cross_process_actor(
         final_temperature=float(cfg["final_temperature"]),
         root_dirichlet_fraction=float(cfg["root_dirichlet_fraction"]),
         root_dirichlet_alpha=float(cfg["root_dirichlet_alpha"]),
+        c_lcb=float(cfg.get("c_lcb", 0.0)),
+        dynamic_considered_actions=bool(cfg.get("dynamic_considered_actions", False)),
+        opening_considered_actions=int(cfg.get("considered_actions_opening", 64)),
+        midgame_considered_actions=int(cfg.get("considered_actions_midgame", 96)),
+        endgame_considered_actions=int(cfg.get("considered_actions_endgame", 160)),
+        midgame_start_move=int(cfg.get("considered_actions_mid_move", 12)),
+        endgame_start_move=int(cfg.get("considered_actions_endgame_move", 40)),
     )
 
     rng = jax.random.PRNGKey(int(cfg["seed"]) + 100003 * (actor_idx + 1))
     params = params_queue.get()
+    params = _extract_search_params(
+        params,
+        train_blocks=train_blocks,
+        search_blocks=search_blocks,
+        use_pmap=False,
+    )
     board_size = int(cfg["board_size"])
     fixed_examples = int(cfg.get("replay_fixed_update_size", 0))
     temperature = jnp.float32(float(cfg["temperature"]))
@@ -120,6 +139,12 @@ def _run_cross_process_actor(
             while True:
                 try:
                     params = params_queue.get_nowait()
+                    params = _extract_search_params(
+                        params,
+                        train_blocks=train_blocks,
+                        search_blocks=search_blocks,
+                        use_pmap=False,
+                    )
                 except queue_lib.Empty:
                     break
 
@@ -809,6 +834,39 @@ def _clone_tree(tree):
     return jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), tree)
 
 
+def _slice_axis_prefix(x, *, axis: int, size: int):
+    slices = [slice(None)] * x.ndim
+    slices[axis] = slice(0, size)
+    return x[tuple(slices)]
+
+
+def _extract_search_params(params, *, train_blocks: int, search_blocks: int, use_pmap: bool):
+    if search_blocks >= train_blocks:
+        return params
+    if search_blocks < 1:
+        raise ValueError("search_blocks must be >= 1")
+
+    mutable = unfreeze(params)
+    param_tree = mutable.get("params")
+    if not isinstance(param_tree, dict) or "transformer_stack" not in param_tree:
+        raise ValueError("cannot locate params/transformer_stack in parameter tree for search block slicing")
+
+    scan_axis = 1 if use_pmap else 0
+    stack_tree = param_tree["transformer_stack"]
+
+    def maybe_slice_block_axis(leaf):
+        ndim = getattr(leaf, "ndim", 0)
+        shape = getattr(leaf, "shape", ())
+        if ndim <= scan_axis:
+            return leaf
+        if int(shape[scan_axis]) != int(train_blocks):
+            return leaf
+        return _slice_axis_prefix(leaf, axis=scan_axis, size=search_blocks)
+
+    param_tree["transformer_stack"] = jax.tree_util.tree_map(maybe_slice_block_axis, stack_tree)
+    return freeze(mutable) if isinstance(params, FrozenDict) else mutable
+
+
 def _update_ema_params(ema_params, params, decay: float):
     if decay <= 0.0:
         return _clone_tree(params)
@@ -871,8 +929,16 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "board_size": args.board_size,
         "channels": args.channels,
         "blocks": args.blocks,
+        "search_blocks": args.search_blocks,
+        "max_attention_heads": args.max_attention_heads,
         "num_simulations": args.num_simulations,
         "max_num_considered_actions": args.max_num_considered_actions,
+        "dynamic_considered_actions": not args.disable_dynamic_considered_actions,
+        "considered_actions_opening": args.considered_actions_opening,
+        "considered_actions_midgame": args.considered_actions_midgame,
+        "considered_actions_endgame": args.considered_actions_endgame,
+        "considered_actions_mid_move": args.considered_actions_mid_move,
+        "considered_actions_endgame_move": args.considered_actions_endgame_move,
         "updates_per_step": args.updates_per_step,
         "temperature": args.temperature,
         "c_lcb": args.c_lcb,
@@ -1542,6 +1608,8 @@ def _run_actor_role(
     args,
     model: PolicyValueNet,
     params,
+    train_blocks: int,
+    search_blocks: int,
     use_pmap: bool,
     local_devices: int,
     process_index: int,
@@ -1561,6 +1629,12 @@ def _run_actor_role(
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
         num_games=games_per_device,
+        dynamic_considered_actions=not args.disable_dynamic_considered_actions,
+        opening_considered_actions=args.considered_actions_opening,
+        midgame_considered_actions=args.considered_actions_midgame,
+        endgame_considered_actions=args.considered_actions_endgame,
+        midgame_start_move=args.considered_actions_mid_move,
+        endgame_start_move=args.considered_actions_endgame_move,
         temperature_drop_move=args.temperature_drop_move,
         final_temperature=args.final_temperature,
         root_dirichlet_fraction=args.root_dirichlet_fraction,
@@ -1571,6 +1645,12 @@ def _run_actor_role(
 
     if use_pmap:
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
+    params = _extract_search_params(
+        params,
+        train_blocks=train_blocks,
+        search_blocks=search_blocks,
+        use_pmap=use_pmap,
+    )
 
     last_optimizer_updates = -1
     if use_network_sync:
@@ -1583,6 +1663,12 @@ def _run_actor_role(
             )
             if net_params is not None:
                 params = _replicate_tree_for_pmap(net_params, local_devices=local_devices) if use_pmap else net_params
+                params = _extract_search_params(
+                    params,
+                    train_blocks=train_blocks,
+                    search_blocks=search_blocks,
+                    use_pmap=use_pmap,
+                )
                 last_optimizer_updates = pulled_updates
                 print(
                     f"actor[{process_index}] loaded params from network {param_endpoint_host}:{param_endpoint_port} "
@@ -1602,6 +1688,12 @@ def _run_actor_role(
         )
         if loaded_params is not None:
             params = loaded_params
+            params = _extract_search_params(
+                params,
+                train_blocks=train_blocks,
+                search_blocks=search_blocks,
+                use_pmap=use_pmap,
+            )
             print(f"actor[{process_index}] loaded params from {args.resume_from} optimizer_updates={last_optimizer_updates}")
 
     sock = connect_with_retry(endpoint_host, endpoint_port, args.replay_connect_retry_seconds)
@@ -1701,6 +1793,12 @@ def _run_actor_role(
                         )
                         if net_params is not None:
                             params = _replicate_tree_for_pmap(net_params, local_devices=local_devices) if use_pmap else net_params
+                            params = _extract_search_params(
+                                params,
+                                train_blocks=train_blocks,
+                                search_blocks=search_blocks,
+                                use_pmap=use_pmap,
+                            )
                             last_optimizer_updates = pulled_updates
                             synced = True
                             print(
@@ -1721,6 +1819,12 @@ def _run_actor_role(
                     )
                     if loaded_params is not None:
                         params = loaded_params
+                        params = _extract_search_params(
+                            params,
+                            train_blocks=train_blocks,
+                            search_blocks=search_blocks,
+                            use_pmap=use_pmap,
+                        )
                         print(
                             f"actor[{process_index}] synced params from {args.resume_from} "
                             f"optimizer_updates={last_optimizer_updates}"
@@ -1820,6 +1924,8 @@ def main() -> None:
     parser.add_argument("--board-size", type=int, default=9)
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=6)
+    parser.add_argument("--search-blocks", type=int, default=0)
+    parser.add_argument("--max-attention-heads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--role", choices=("all", "learner", "actor"), default="all")
@@ -1838,6 +1944,12 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
+    parser.add_argument("--disable-dynamic-considered-actions", action="store_true")
+    parser.add_argument("--considered-actions-opening", type=int, default=64)
+    parser.add_argument("--considered-actions-midgame", type=int, default=96)
+    parser.add_argument("--considered-actions-endgame", type=int, default=160)
+    parser.add_argument("--considered-actions-mid-move", type=int, default=12)
+    parser.add_argument("--considered-actions-endgame-move", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--temperature-drop-move", type=int, default=12)
@@ -1871,6 +1983,11 @@ def main() -> None:
         help="Optional JAX_PLATFORMS for learner process (e.g. 'tpu', 'cpu', 'gpu', '').",
     )
     parser.add_argument("--async-selfplay", action="store_true")
+    parser.add_argument(
+        "--disable-overlap-selfplay",
+        action="store_true",
+        help="Disable default role=all overlap mode (async selfplay + training).",
+    )
     parser.add_argument("--cross-process-selfplay", action="store_true")
     parser.add_argument(
         "--actor-jax-platforms",
@@ -1947,9 +2064,28 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    selfplay_actors_explicit = "--selfplay-actors" in sys.argv
 
     if args.updates_per_step < 1:
         raise ValueError("updates-per-step must be >= 1")
+    if args.max_attention_heads < 1:
+        raise ValueError("max-attention-heads must be >= 1")
+    if args.max_num_considered_actions < 1:
+        raise ValueError("max-num-considered-actions must be >= 1")
+    if args.search_blocks < 0:
+        raise ValueError("search-blocks must be >= 0")
+    if args.search_blocks > args.blocks:
+        raise ValueError("search-blocks cannot exceed blocks")
+    if args.considered_actions_opening < 1:
+        raise ValueError("considered-actions-opening must be >= 1")
+    if args.considered_actions_midgame < 1:
+        raise ValueError("considered-actions-midgame must be >= 1")
+    if args.considered_actions_endgame < 1:
+        raise ValueError("considered-actions-endgame must be >= 1")
+    if args.considered_actions_mid_move < 0:
+        raise ValueError("considered-actions-mid-move must be >= 0")
+    if args.considered_actions_endgame_move < args.considered_actions_mid_move:
+        raise ValueError("considered-actions-endgame-move must be >= considered-actions-mid-move")
     if args.grad_clip_norm < 0:
         raise ValueError("grad-clip-norm must be >= 0")
     if args.value_loss_weight <= 0:
@@ -2008,6 +2144,15 @@ def main() -> None:
     if args.role in {"actor", "learner"}:
         args.async_selfplay = False
         args.cross_process_selfplay = False
+    auto_overlap_enabled = False
+    if (
+        args.role == "all"
+        and (not args.disable_overlap_selfplay)
+        and (not args.async_selfplay)
+        and (not args.cross_process_selfplay)
+    ):
+        args.async_selfplay = True
+        auto_overlap_enabled = True
     actor_jax_platforms = args.actor_jax_platforms.strip()
     learner_jax_platforms = args.jax_platforms.strip()
     if learner_jax_platforms:
@@ -2046,15 +2191,30 @@ def main() -> None:
             raise
         raise
 
-    model = PolicyValueNet(
+    effective_search_blocks = args.blocks if args.search_blocks <= 0 else args.search_blocks
+    args.search_blocks = effective_search_blocks
+    train_model = PolicyValueNet(
         board_size=args.board_size,
         channels=args.channels,
         blocks=args.blocks,
+        max_attention_heads=args.max_attention_heads,
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
     )
+    search_model = (
+        train_model
+        if effective_search_blocks == args.blocks
+        else PolicyValueNet(
+            board_size=args.board_size,
+            channels=args.channels,
+            blocks=effective_search_blocks,
+            max_attention_heads=args.max_attention_heads,
+            compute_dtype=compute_dtype,
+            param_dtype=param_dtype,
+        )
+    )
     rng_key, init_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
+    params = train_model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
 
     total_optimizer_updates = max(1, args.train_steps * args.updates_per_step)
     warmup_steps = max(0, min(args.lr_warmup_steps, total_optimizer_updates - 1))
@@ -2087,7 +2247,7 @@ def main() -> None:
     if args.resume_from is not None:
         payload = _load_checkpoint_payload(args.resume_from)
         resume_cfg = payload.get("config", {})
-        for key in ("board_size", "channels", "blocks", "compute_dtype", "param_dtype"):
+        for key in ("board_size", "channels", "blocks", "max_attention_heads", "compute_dtype", "param_dtype"):
             cfg_val = resume_cfg.get(key)
             arg_val = getattr(args, key)
             if cfg_val is not None and str(cfg_val) != str(arg_val):
@@ -2185,11 +2345,21 @@ def main() -> None:
     if args.role != "actor" and use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
         raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
 
+    if auto_overlap_enabled and (not selfplay_actors_explicit) and use_pmap and local_devices >= 4 and (local_devices % 2 == 0):
+        args.selfplay_actors = 2
+    if auto_overlap_enabled and is_chief:
+        print(
+            f"role=all overlap enabled by default: async_selfplay={args.async_selfplay} "
+            f"selfplay_actors={args.selfplay_actors} (disable with --disable-overlap-selfplay)"
+        )
+
     if args.role == "actor":
         _run_actor_role(
             args=args,
-            model=model,
+            model=search_model,
             params=params,
+            train_blocks=args.blocks,
+            search_blocks=effective_search_blocks,
             use_pmap=use_pmap,
             local_devices=local_devices,
             process_index=process_index,
@@ -2220,11 +2390,17 @@ def main() -> None:
             for i in range(args.selfplay_actors)
         ]
     play_many_games_fn = build_play_many_games_fn(
-        model=model,
+        model=search_model,
         board_size=args.board_size,
         num_simulations=args.num_simulations,
         max_num_considered_actions=args.max_num_considered_actions,
         num_games=games_per_device,
+        dynamic_considered_actions=not args.disable_dynamic_considered_actions,
+        opening_considered_actions=args.considered_actions_opening,
+        midgame_considered_actions=args.considered_actions_midgame,
+        endgame_considered_actions=args.considered_actions_endgame,
+        midgame_start_move=args.considered_actions_mid_move,
+        endgame_start_move=args.considered_actions_endgame_move,
         temperature_drop_move=args.temperature_drop_move,
         final_temperature=args.final_temperature,
         root_dirichlet_fraction=args.root_dirichlet_fraction,
@@ -2235,7 +2411,7 @@ def main() -> None:
     arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
     arena_games_per_device = args.arena_games // local_devices if use_pmap else args.arena_games
     arena_fn = build_arena_fn(
-        model=model,
+        model=train_model,
         board_size=args.board_size,
         num_simulations=arena_num_simulations,
         max_num_considered_actions=arena_max_num_considered_actions,
@@ -2247,13 +2423,13 @@ def main() -> None:
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
         train_step = make_pmap_train_step(
-            model,
+            train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
         )
         train_step_multi = make_pmap_multi_train_step(
-            model,
+            train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
@@ -2274,19 +2450,23 @@ def main() -> None:
             f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"replay_recent_fraction={args.replay_recent_fraction:.2f}, replay_recent_window={args.replay_recent_window}, "
+            f"search_blocks={effective_search_blocks}, max_attention_heads={args.max_attention_heads}, "
+            f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
+            f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
+            f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
             f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
     else:
         train_step = make_single_train_step(
-            model,
+            train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
         )
         train_step_multi = make_single_multi_train_step(
-            model,
+            train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
@@ -2304,6 +2484,10 @@ def main() -> None:
             f"fused_train_updates={fused_train_updates}, "
             f"replay_fixed_update_size={args.replay_fixed_update_size}, "
             f"replay_recent_fraction={args.replay_recent_fraction:.2f}, replay_recent_window={args.replay_recent_window}, "
+            f"search_blocks={effective_search_blocks}, max_attention_heads={args.max_attention_heads}, "
+            f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
+            f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
+            f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
             f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
@@ -2416,6 +2600,14 @@ def main() -> None:
         )
         return payload
 
+    def extract_collect_params(runtime_params, *, runtime_use_pmap: bool):
+        return _extract_search_params(
+            runtime_params,
+            train_blocks=args.blocks,
+            search_blocks=effective_search_blocks,
+            use_pmap=runtime_use_pmap,
+        )
+
     if args.role == "learner":
         bind_host = args.replay_host.strip()
         if (not bind_host) or bind_host.lower() == "auto":
@@ -2485,14 +2677,23 @@ def main() -> None:
             actor_output_queue = ctx.Queue(maxsize=args.async_selfplay_queue_size)
             params_seed = _extract_host_tree(params, use_pmap=use_pmap)
             params_seed = jax.device_get(params_seed)
+            params_seed = extract_collect_params(params_seed, runtime_use_pmap=False)
             proc_cfg = {
                 "board_size": args.board_size,
                 "channels": args.channels,
                 "blocks": args.blocks,
+                "search_blocks": effective_search_blocks,
+                "max_attention_heads": args.max_attention_heads,
                 "compute_dtype": args.compute_dtype,
                 "param_dtype": args.param_dtype,
                 "num_simulations": args.num_simulations,
                 "max_num_considered_actions": args.max_num_considered_actions,
+                "dynamic_considered_actions": not args.disable_dynamic_considered_actions,
+                "considered_actions_opening": args.considered_actions_opening,
+                "considered_actions_midgame": args.considered_actions_midgame,
+                "considered_actions_endgame": args.considered_actions_endgame,
+                "considered_actions_mid_move": args.considered_actions_mid_move,
+                "considered_actions_endgame_move": args.considered_actions_endgame_move,
                 "num_games": selfplay_batch_games,
                 "temperature_drop_move": args.temperature_drop_move,
                 "final_temperature": args.final_temperature,
@@ -2537,7 +2738,7 @@ def main() -> None:
         else:
             actor_stop = threading.Event()
             params_ref_lock = threading.Lock()
-            params_ref = [_clone_tree(params)]
+            params_ref = [_clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))]
             actor_collect_steps = None
             if use_pmap:
                 assert actor_device_groups is not None
@@ -2750,7 +2951,8 @@ def main() -> None:
             else:
                 rng_key, collect_key = jax.random.split(rng_key)
                 collect_start = time.perf_counter()
-                payload = collect_new_examples(params, collect_key)
+                collect_params = extract_collect_params(params, runtime_use_pmap=use_pmap)
+                payload = collect_new_examples(collect_params, collect_key)
                 if cross_host_replay_merge:
                     payload = _merge_selfplay_payloads_across_hosts(payload)
                 (
@@ -2877,6 +3079,7 @@ def main() -> None:
                     if args.cross_process_selfplay:
                         params_host = _extract_host_tree(params, use_pmap=use_pmap)
                         params_host = jax.device_get(params_host)
+                        params_host = extract_collect_params(params_host, runtime_use_pmap=False)
                         for param_q in actor_params_queues:
                             try:
                                 while True:
@@ -2889,7 +3092,7 @@ def main() -> None:
                                 pass
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
-                            params_ref[0] = _clone_tree(params)
+                            params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
             else:
                 for _ in range(args.updates_per_step):
                     sample_ids = _sample_replay_indices(
@@ -2944,6 +3147,7 @@ def main() -> None:
                         if args.cross_process_selfplay:
                             params_host = _extract_host_tree(params, use_pmap=use_pmap)
                             params_host = jax.device_get(params_host)
+                            params_host = extract_collect_params(params_host, runtime_use_pmap=False)
                             for param_q in actor_params_queues:
                                 try:
                                     while True:
@@ -2956,7 +3160,7 @@ def main() -> None:
                                     pass
                         elif params_ref_lock is not None and params_ref is not None:
                             with params_ref_lock:
-                                params_ref[0] = _clone_tree(params)
+                                params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
             train_updates_ms = (time.perf_counter() - train_updates_start) * 1000.0
 
             if (

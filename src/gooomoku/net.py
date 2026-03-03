@@ -7,8 +7,11 @@ import jax
 import jax.numpy as jnp
 
 
-def _pick_attention_heads(channels: int) -> int:
+def _pick_attention_heads(channels: int, max_heads: int) -> int:
+    capped = max(1, int(max_heads))
     for heads in (8, 6, 4, 3, 2, 1):
+        if heads > capped:
+            continue
         if channels % heads == 0:
             return heads
     return 1
@@ -136,6 +139,7 @@ class PolicyValueNet(nn.Module):
     board_size: int
     channels: int = 64
     blocks: int = 6
+    max_attention_heads: int = 4
     compute_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -159,7 +163,7 @@ class PolicyValueNet(nn.Module):
         x = x + pos_embedding[None, :, :].astype(self.compute_dtype)
 
         if self.blocks > 0:
-            heads = _pick_attention_heads(self.channels)
+            heads = _pick_attention_heads(self.channels, self.max_attention_heads)
             transformer_stack = nn.scan(
                 TransformerScanCell,
                 variable_axes={"params": 0},
