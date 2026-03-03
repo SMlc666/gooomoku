@@ -1698,6 +1698,14 @@ def main() -> None:
     parser.add_argument("--disable-pmap", action="store_true")
     parser.add_argument("--distributed-init", choices=("auto", "on", "off"), default="auto")
     parser.add_argument(
+        "--allow-role-pmap-with-distributed-off",
+        action="store_true",
+        help=(
+            "Allow local pmap for --role learner/actor when --distributed-init=off. "
+            "Use only when each process is intended to run independently on local TPU devices."
+        ),
+    )
+    parser.add_argument(
         "--jax-platforms",
         type=str,
         default="",
@@ -1938,11 +1946,17 @@ def main() -> None:
     global_devices = jax.device_count()
     use_pmap = (not args.disable_pmap) and local_devices > 1
     if args.role in {"actor", "learner"} and use_pmap and args.distributed_init == "off":
-        print(
-            f"{args.role} role detected with distributed-init=off on multi-device TPU; "
-            "forcing disable-pmap to avoid cross-host pmap hangs"
-        )
-        use_pmap = False
+        if args.allow_role_pmap_with_distributed_off:
+            print(
+                f"{args.role} role detected with distributed-init=off on multi-device TPU; "
+                "keeping pmap enabled due to --allow-role-pmap-with-distributed-off"
+            )
+        else:
+            print(
+                f"{args.role} role detected with distributed-init=off on multi-device TPU; "
+                "forcing disable-pmap to avoid cross-host pmap hangs"
+            )
+            use_pmap = False
     if args.role != "actor" and use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
     selfplay_batch_games = args.selfplay_batch_games or args.games_per_step

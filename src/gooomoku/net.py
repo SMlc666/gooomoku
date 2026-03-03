@@ -6,42 +6,67 @@ import flax.linen as nn
 import jax.numpy as jnp
 
 
-class ResidualBlock(nn.Module):
+def _pick_attention_heads(channels: int) -> int:
+    for heads in (8, 6, 4, 3, 2, 1):
+        if channels % heads == 0:
+            return heads
+    return 1
+
+
+class TransformerBlock(nn.Module):
     channels: int
+    num_heads: int
+    mlp_hidden: int
     compute_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        residual = x
-        x = nn.Conv(
-            self.channels,
-            kernel_size=(3, 3),
-            padding="SAME",
-            dtype=self.compute_dtype,
+        y = nn.LayerNorm(
+            compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            self.channels,
-            kernel_size=(3, 3),
-            padding="SAME",
+        y = nn.MultiHeadDotProductAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.channels,
+            out_features=self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
+            dropout_rate=0.0,
+        )(y, y, deterministic=True)
+        x = x + y
+
+        y = nn.LayerNorm(
+            compute_dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
         )(x)
-        x = nn.relu(x + residual)
-        return x
+        y = nn.Dense(
+            self.mlp_hidden,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(y)
+        y = nn.gelu(y, approximate=True)
+        y = nn.Dense(
+            self.channels,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+        )(y)
+        return x + y
 
 
-class ResidualScanCell(nn.Module):
+class TransformerScanCell(nn.Module):
     channels: int
+    num_heads: int
+    mlp_hidden: int
     compute_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, carry: jnp.ndarray, _: jnp.ndarray) -> tuple[jnp.ndarray, None]:
-        carry = ResidualBlock(
+        carry = TransformerBlock(
             channels=self.channels,
+            num_heads=self.num_heads,
+            mlp_hidden=self.mlp_hidden,
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(carry)
@@ -57,66 +82,70 @@ class PolicyValueNet(nn.Module):
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = nn.Conv(
+        tokens = self.board_size * self.board_size
+        x = obs.astype(self.compute_dtype).reshape((obs.shape[0], tokens, obs.shape[-1]))
+        x = nn.Dense(
             self.channels,
-            kernel_size=(3, 3),
-            padding="SAME",
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )(obs)
-        x = nn.relu(x)
+            name="token_embed",
+        )(x)
 
-        residual_stack = nn.scan(
-            ResidualScanCell,
-            variable_axes={"params": 0},
-            split_rngs={"params": True},
-            in_axes=0,
-            out_axes=0,
+        pos_embedding = self.param(
+            "pos_embedding",
+            nn.initializers.normal(stddev=0.02),
+            (tokens, self.channels),
+            self.param_dtype,
         )
-        x, _ = residual_stack(
-            channels=self.channels,
+        x = x + pos_embedding[None, :, :].astype(self.compute_dtype)
+
+        if self.blocks > 0:
+            heads = _pick_attention_heads(self.channels)
+            transformer_stack = nn.scan(
+                TransformerScanCell,
+                variable_axes={"params": 0},
+                split_rngs={"params": True},
+                in_axes=0,
+                out_axes=0,
+            )
+            x, _ = transformer_stack(
+                channels=self.channels,
+                num_heads=heads,
+                mlp_hidden=self.channels * 4,
+                compute_dtype=self.compute_dtype,
+                param_dtype=self.param_dtype,
+                name="transformer_stack",
+            )(
+                x,
+                jnp.arange(self.blocks, dtype=jnp.int32),
+            )
+
+        x = nn.LayerNorm(
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-            name="residual_stack",
-        )(
-            x,
-            jnp.arange(self.blocks, dtype=jnp.int32),
-        )
-
-        policy = nn.Conv(
-            2,
-            kernel_size=(1, 1),
-            padding="SAME",
-            dtype=self.compute_dtype,
-            param_dtype=self.param_dtype,
+            name="final_norm",
         )(x)
-        policy = nn.relu(policy)
-        policy = policy.reshape((policy.shape[0], -1))
+
         policy = nn.Dense(
-            self.board_size * self.board_size,
-            dtype=self.compute_dtype,
-            param_dtype=self.param_dtype,
-        )(policy)
-
-        value = nn.Conv(
             1,
-            kernel_size=(1, 1),
-            padding="SAME",
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
-        )(x)
-        value = nn.relu(value)
-        value = value.reshape((value.shape[0], -1))
+            name="policy_head",
+        )(x).squeeze(-1)
+
+        value = jnp.mean(x, axis=1)
         value = nn.Dense(
             self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
+            name="value_dense_0",
         )(value)
-        value = nn.relu(value)
+        value = nn.gelu(value, approximate=True)
         value = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
+            name="value_dense_1",
         )(value)
         value = jnp.tanh(value).squeeze(-1)
         return policy, value
