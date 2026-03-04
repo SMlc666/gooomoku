@@ -218,11 +218,16 @@ def _build_base_optimizer(*, optimizer_name: str, lr_schedule):
     if name == "adam":
         return optax.adam(learning_rate=lr_schedule)
     if name == "muon":
-        muon_fn = getattr(optax, "muon", None)
+        # Muon is exposed under optax.contrib in current Optax releases.
+        contrib = getattr(optax, "contrib", None)
+        muon_fn = getattr(contrib, "muon", None) if contrib is not None else None
+        if muon_fn is None:
+            muon_fn = getattr(optax, "muon", None)  # Compatibility fallback.
         if muon_fn is None:
             raise ValueError(
-                "optimizer=muon requested but optax.muon is unavailable. "
-                "Please upgrade Optax (requirements.txt has optax>=0.2.3)."
+                "optimizer=muon requested but optax.contrib.muon is unavailable. "
+                "Please upgrade Optax to a version that includes Muon "
+                "(requirements.txt has optax>=0.2.6)."
             )
         sig = inspect.signature(muon_fn)
         if "learning_rate" in sig.parameters:

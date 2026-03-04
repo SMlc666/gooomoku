@@ -1,7 +1,7 @@
 jax>=0.4.33
 jaxlib>=0.4.33
 flax>=0.8.5
-optax>=0.2.3
+optax>=0.2.6
 mctx>=0.0.5
 numpy>=1.26
 fastapi>=0.116.0
