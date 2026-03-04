@@ -15,6 +15,7 @@ FRAME_PREFIX_STRUCT: Final[struct.Struct] = struct.Struct("!4sI")
 _OBS_DTYPE = np.dtype(np.uint8)
 _POLICY_DTYPE = np.dtype(np.float32)
 _VALUE_DTYPE = np.dtype(np.float32)
+_HORIZON_DTYPE = np.dtype(np.float32)
 
 
 class ReplayWireError(RuntimeError):
@@ -44,6 +45,7 @@ def encode_selfplay_batch(
     obs: np.ndarray,
     policy: np.ndarray,
     value: np.ndarray,
+    horizon: np.ndarray,
     black_win: int,
     white_win: int,
     draw: int,
@@ -52,22 +54,29 @@ def encode_selfplay_batch(
     obs_arr = _ensure_contiguous(obs, _OBS_DTYPE)
     policy_arr = _ensure_contiguous(policy, _POLICY_DTYPE)
     value_arr = _ensure_contiguous(value, _VALUE_DTYPE)
+    horizon_arr = _ensure_contiguous(horizon, _HORIZON_DTYPE)
 
-    if obs_arr.shape[0] != policy_arr.shape[0] or obs_arr.shape[0] != value_arr.shape[0]:
-        raise ReplayWireError("obs/policy/value first dimension mismatch")
+    if (
+        obs_arr.shape[0] != policy_arr.shape[0]
+        or obs_arr.shape[0] != value_arr.shape[0]
+        or obs_arr.shape[0] != horizon_arr.shape[0]
+    ):
+        raise ReplayWireError("obs/policy/value/horizon first dimension mismatch")
 
     obs_bytes = obs_arr.tobytes(order="C")
     policy_bytes = policy_arr.tobytes(order="C")
     value_bytes = value_arr.tobytes(order="C")
-    body = obs_bytes + policy_bytes + value_bytes
+    horizon_bytes = horizon_arr.tobytes(order="C")
+    body = obs_bytes + policy_bytes + value_bytes + horizon_bytes
 
     obs_offset = 0
     policy_offset = len(obs_bytes)
     value_offset = len(obs_bytes) + len(policy_bytes)
+    horizon_offset = len(obs_bytes) + len(policy_bytes) + len(value_bytes)
     checksum = hashlib.sha256(body).hexdigest()
 
     header = {
-        "schema": "gooomoku-selfplay-v1",
+        "schema": "gooomoku-selfplay-v2",
         "obs": {
             "dtype": str(obs_arr.dtype),
             "shape": list(obs_arr.shape),
@@ -85,6 +94,12 @@ def encode_selfplay_batch(
             "shape": list(value_arr.shape),
             "offset": value_offset,
             "nbytes": len(value_bytes),
+        },
+        "horizon": {
+            "dtype": str(horizon_arr.dtype),
+            "shape": list(horizon_arr.shape),
+            "offset": horizon_offset,
+            "nbytes": len(horizon_bytes),
         },
         "black_win": int(black_win),
         "white_win": int(white_win),
@@ -110,7 +125,8 @@ def decode_selfplay_batch(frame: bytes):
         raise ReplayWireError("invalid header length")
 
     header = json.loads(frame[header_start:header_end].decode("utf-8"))
-    if header.get("schema") != "gooomoku-selfplay-v1":
+    schema = header.get("schema")
+    if schema not in {"gooomoku-selfplay-v1", "gooomoku-selfplay-v2"}:
         raise ReplayWireError(f"unsupported schema: {header.get('schema')}")
 
     body = frame[header_end:]
@@ -137,14 +153,19 @@ def decode_selfplay_batch(frame: bytes):
     obs = decode_array(header["obs"], _OBS_DTYPE)
     policy = decode_array(header["policy"], _POLICY_DTYPE)
     value = decode_array(header["value"], _VALUE_DTYPE)
+    if schema == "gooomoku-selfplay-v2" and "horizon" in header:
+        horizon = decode_array(header["horizon"], _HORIZON_DTYPE)
+    else:
+        horizon = np.zeros((value.shape[0],), dtype=_HORIZON_DTYPE)
 
-    if obs.shape[0] != policy.shape[0] or obs.shape[0] != value.shape[0]:
-        raise ReplayWireError("decoded obs/policy/value first dimension mismatch")
+    if obs.shape[0] != policy.shape[0] or obs.shape[0] != value.shape[0] or obs.shape[0] != horizon.shape[0]:
+        raise ReplayWireError("decoded obs/policy/value/horizon first dimension mismatch")
 
     return (
         obs,
         policy,
         value,
+        horizon,
         int(header["black_win"]),
         int(header["white_win"]),
         int(header["draw"]),

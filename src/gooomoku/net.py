@@ -144,7 +144,12 @@ class PolicyValueNet(nn.Module):
     param_dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self,
+        obs: jnp.ndarray,
+        *,
+        return_aux: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         tokens = self.board_size * self.board_size
         x = obs.astype(self.compute_dtype).reshape((obs.shape[0], tokens, obs.shape[-1]))
         x = nn.Dense(
@@ -196,6 +201,12 @@ class PolicyValueNet(nn.Module):
             param_dtype=self.param_dtype,
             name="policy_head",
         )(x).squeeze(-1)
+        threat_logits = nn.Dense(
+            1,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="threat_head",
+        )(x).squeeze(-1)
 
         pooled = nn.LayerNorm(
             dtype=self.compute_dtype,
@@ -213,25 +224,34 @@ class PolicyValueNet(nn.Module):
         mean_pool = jnp.mean(pooled, axis=1)
         max_pool = jnp.max(pooled, axis=1)
         value = jnp.concatenate([attn_pool, mean_pool, max_pool], axis=-1)
-        value = nn.Dense(
+        value_features = nn.Dense(
             self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="global_fuse",
         )(value)
-        value = nn.gelu(value, approximate=True)
-        value = nn.Dense(
+        value_features = nn.gelu(value_features, approximate=True)
+        value_features = nn.Dense(
             self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="value_dense_0",
-        )(value)
-        value = nn.gelu(value, approximate=True)
+        )(value_features)
+        value_features = nn.gelu(value_features, approximate=True)
         value = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="value_dense_1",
-        )(value)
+        )(value_features)
+        horizon_logit = nn.Dense(
+            1,
+            dtype=self.compute_dtype,
+            param_dtype=self.param_dtype,
+            name="horizon_head",
+        )(value_features)
         value = jnp.tanh(value).squeeze(-1)
+        horizon_logit = horizon_logit.squeeze(-1)
+        if return_aux:
+            return policy, value, threat_logits, horizon_logit
         return policy, value

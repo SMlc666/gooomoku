@@ -279,8 +279,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels", type=int, default=96)
     parser.add_argument("--blocks", type=int, default=8)
     parser.add_argument("--max-attention-heads", type=int, default=4)
-    parser.add_argument("--num-simulations", type=int, default=256)
-    parser.add_argument("--max-num-considered-actions", type=int, default=64)
+    parser.add_argument("--num-simulations", type=int, default=None)
+    parser.add_argument("--max-num-considered-actions", type=int, default=None)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="float32")
     parser.add_argument("--ai-temperature", type=float, default=0.0)
@@ -308,8 +308,16 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     max_attention_heads = int(config.get("max_attention_heads", args.max_attention_heads))
     compute_dtype_name = str(config.get("compute_dtype", args.compute_dtype))
     param_dtype_name = str(config.get("param_dtype", args.param_dtype))
-    num_simulations = int(config.get("num_simulations", args.num_simulations))
-    max_num_considered_actions = int(config.get("max_num_considered_actions", args.max_num_considered_actions))
+    num_simulations = int(
+        args.num_simulations
+        if args.num_simulations is not None
+        else config.get("num_simulations", 256)
+    )
+    max_num_considered_actions = int(
+        args.max_num_considered_actions
+        if args.max_num_considered_actions is not None
+        else config.get("max_num_considered_actions", 64)
+    )
 
     param_dtype = _dtype_from_name(param_dtype_name)
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])

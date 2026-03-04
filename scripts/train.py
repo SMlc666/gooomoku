@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -32,6 +33,8 @@ sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
+from gooomoku.mctx_adapter import _current_player_winning_mask
+from gooomoku.mctx_adapter import _opponent_threat_block_mask
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 from gooomoku.replay_wire import ReplayWireError
@@ -41,7 +44,7 @@ from gooomoku.replay_wire import send_selfplay_batch
 from gooomoku.runtime import configure_jax_runtime
 from scripts.self_play import build_play_many_games_fn
 
-SelfPlayBatch = tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
+SelfPlayBatch = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int, int]
 ActorError = tuple[int, BaseException]
 ActorMessage = tuple[str, Any]
 
@@ -149,23 +152,31 @@ def _run_cross_process_actor(
                     break
 
             rng, collect_key = jax.random.split(rng)
-            obs, policy, value, mask, _, _, winners = play_many_games_fn(params, collect_key, temperature)
-            obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+            obs, policy, value, mask, _, steps, winners = play_many_games_fn(params, collect_key, temperature)
+            obs_np, policy_np, value_np, mask_np, steps_np, winners_np = jax.device_get(
+                (obs, policy, value, mask, steps, winners)
+            )
             obs_np = np.asarray(obs_np)
             policy_np = np.asarray(policy_np)
             value_np = np.asarray(value_np)
             mask_np = np.asarray(mask_np)
+            steps_np = np.asarray(steps_np)
             winners_np = np.asarray(winners_np)
 
+            max_steps = int(mask_np.shape[-1])
+            step_idx = np.arange(max_steps, dtype=np.int32)
+            horizon_np = np.maximum(steps_np[..., None].astype(np.int32) - 1 - step_idx[None, ...], 0).astype(np.float32)
             flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
             flat_policy = policy_np.reshape((-1, board_size * board_size))
             flat_value = value_np.reshape((-1,))
+            flat_horizon = horizon_np.reshape((-1,))
             valid = mask_np.reshape((-1,)).astype(bool)
 
-            packed_obs, packed_policy, packed_value, stored_examples = _stabilize_replay_payload_examples(
+            packed_obs, packed_policy, packed_value, packed_horizon, stored_examples = _stabilize_replay_payload_examples(
                 flat_obs,
                 flat_policy,
                 flat_value,
+                flat_horizon,
                 valid,
                 fixed_examples=fixed_examples,
             )
@@ -173,6 +184,7 @@ def _run_cross_process_actor(
                 packed_obs,
                 packed_policy,
                 packed_value,
+                packed_horizon,
                 int((winners_np == 1).sum()),
                 int((winners_np == -1).sum()),
                 int((winners_np == 0).sum()),
@@ -201,6 +213,26 @@ def _dtype_from_name(name: str):
     return table[name]
 
 
+def _build_base_optimizer(*, optimizer_name: str, lr_schedule):
+    name = str(optimizer_name).strip().lower()
+    if name == "adam":
+        return optax.adam(learning_rate=lr_schedule)
+    if name == "muon":
+        muon_fn = getattr(optax, "muon", None)
+        if muon_fn is None:
+            raise ValueError(
+                "optimizer=muon requested but optax.muon is unavailable. "
+                "Please upgrade Optax (requirements.txt has optax>=0.2.3)."
+            )
+        sig = inspect.signature(muon_fn)
+        if "learning_rate" in sig.parameters:
+            return muon_fn(learning_rate=lr_schedule)
+        if "lr" in sig.parameters:
+            return muon_fn(lr=lr_schedule)
+        return muon_fn(lr_schedule)
+    raise ValueError(f"unsupported optimizer: {optimizer_name}")
+
+
 def _l2_regularization(params) -> jnp.ndarray:
     return jax.tree_util.tree_reduce(
         lambda acc, x: acc + jnp.sum(jnp.square(x)),
@@ -209,28 +241,92 @@ def _l2_regularization(params) -> jnp.ndarray:
     )
 
 
+def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
+    batch = obs.shape[0]
+    board_size = obs.shape[1]
+    num_actions = board_size * board_size
+    mine = obs[..., 0] > 0.5
+    opp = obs[..., 1] > 0.5
+    to_play_black = obs[:, 0, 0, 3] > 0.5
+    mine_flat = mine.reshape((batch, num_actions))
+    opp_flat = opp.reshape((batch, num_actions))
+    black_bits = jnp.where(to_play_black[:, None], mine_flat, opp_flat).astype(jnp.bool_)
+    white_bits = jnp.where(to_play_black[:, None], opp_flat, mine_flat).astype(jnp.bool_)
+    last_plane = obs[..., 2].reshape((batch, num_actions))
+    has_last = jnp.max(last_plane, axis=1) > 0.5
+    last_action = jnp.argmax(last_plane, axis=1).astype(jnp.int32)
+    last_action = jnp.where(has_last, last_action, jnp.int32(-1))
+    occupied = black_bits | white_bits
+    num_moves = jnp.sum(occupied.astype(jnp.int32), axis=1).astype(jnp.int32)
+    return env.GomokuState(
+        board=jnp.zeros((batch, board_size, board_size), dtype=jnp.int8),
+        black_bits=black_bits,
+        white_bits=white_bits,
+        to_play=jnp.where(to_play_black, jnp.int8(1), jnp.int8(-1)),
+        last_action=last_action,
+        num_moves=num_moves,
+        terminated=jnp.zeros((batch,), dtype=jnp.bool_),
+        winner=jnp.zeros((batch,), dtype=jnp.int8),
+    )
+
+
+def _threat_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
+    states = _states_from_obs_for_aux(obs)
+    win_mask = jax.vmap(_current_player_winning_mask)(states)
+    block_mask = jax.vmap(_opponent_threat_block_mask)(states)
+    legal = env.batch_legal_action_mask(states)
+    return (win_mask | block_mask) & legal
+
+
 def make_single_train_step(
     model: PolicyValueNet,
     optimizer: optax.GradientTransformation,
     weight_decay: float,
     value_loss_weight: float,
+    threat_loss_weight: float,
+    horizon_loss_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs, policy_target, value_target):
+    def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
         def loss_fn(trainable):
-            logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+            logits, value, threat_logits, horizon_logit = model.apply(
+                trainable,
+                obs.astype(model.compute_dtype),
+                return_aux=True,
+            )
             logits = logits.astype(jnp.float32)
             value = value.astype(jnp.float32)
+            threat_logits = threat_logits.astype(jnp.float32)
+            horizon_logit = horizon_logit.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
+            threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
+            threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
+            positives = jnp.sum(threat_target)
+            negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
+            pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
+            threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
+            threat_loss = jnp.mean(threat_bce * threat_weights)
+            horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
+            horizon_pred = jax.nn.sigmoid(horizon_logit)
+            horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
-            return total_loss, (policy_loss, value_loss)
+            total_loss = (
+                policy_loss
+                + jnp.float32(value_loss_weight) * value_loss
+                + jnp.float32(threat_loss_weight) * threat_loss
+                + jnp.float32(horizon_loss_weight) * horizon_loss
+                + reg
+            )
+            return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
+            loss_fn,
+            has_aux=True,
+        )(params)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, policy_loss, value_loss
+        return new_params, new_opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss
 
     return train_step
 
@@ -240,27 +336,56 @@ def make_pmap_train_step(
     optimizer: optax.GradientTransformation,
     weight_decay: float,
     value_loss_weight: float,
+    threat_loss_weight: float,
+    horizon_loss_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs, policy_target, value_target):
+    def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
         def loss_fn(trainable):
-            logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+            logits, value, threat_logits, horizon_logit = model.apply(
+                trainable,
+                obs.astype(model.compute_dtype),
+                return_aux=True,
+            )
             logits = logits.astype(jnp.float32)
             value = value.astype(jnp.float32)
+            threat_logits = threat_logits.astype(jnp.float32)
+            horizon_logit = horizon_logit.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
+            threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
+            threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
+            positives = jnp.sum(threat_target)
+            negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
+            pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
+            threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
+            threat_loss = jnp.mean(threat_bce * threat_weights)
+            horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
+            horizon_pred = jax.nn.sigmoid(horizon_logit)
+            horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
-            return total_loss, (policy_loss, value_loss)
+            total_loss = (
+                policy_loss
+                + jnp.float32(value_loss_weight) * value_loss
+                + jnp.float32(threat_loss_weight) * threat_loss
+                + jnp.float32(horizon_loss_weight) * horizon_loss
+                + reg
+            )
+            return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
+            loss_fn,
+            has_aux=True,
+        )(params)
         grads = jax.lax.pmean(grads, axis_name="device")
         loss = jax.lax.pmean(loss, axis_name="device")
         policy_loss = jax.lax.pmean(policy_loss, axis_name="device")
         value_loss = jax.lax.pmean(value_loss, axis_name="device")
+        threat_loss = jax.lax.pmean(threat_loss, axis_name="device")
+        horizon_loss = jax.lax.pmean(horizon_loss, axis_name="device")
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, policy_loss, value_loss
+        return new_params, new_opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss
 
     return train_step
 
@@ -270,32 +395,59 @@ def make_single_multi_train_step(
     optimizer: optax.GradientTransformation,
     weight_decay: float,
     value_loss_weight: float,
+    threat_loss_weight: float,
+    horizon_loss_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
+    def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
         def one_update(carry, inputs):
             current_params, current_opt_state = carry
-            obs, policy_target, value_target = inputs
+            obs, policy_target, value_target, horizon_target = inputs
 
             def loss_fn(trainable):
-                logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+                logits, value, threat_logits, horizon_logit = model.apply(
+                    trainable,
+                    obs.astype(model.compute_dtype),
+                    return_aux=True,
+                )
                 logits = logits.astype(jnp.float32)
                 value = value.astype(jnp.float32)
+                threat_logits = threat_logits.astype(jnp.float32)
+                horizon_logit = horizon_logit.astype(jnp.float32)
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
+                threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
+                threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
+                positives = jnp.sum(threat_target)
+                negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
+                pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
+                threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
+                threat_loss = jnp.mean(threat_bce * threat_weights)
+                horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
+                horizon_pred = jax.nn.sigmoid(horizon_logit)
+                horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
-                return total_loss, (policy_loss, value_loss)
+                total_loss = (
+                    policy_loss
+                    + jnp.float32(value_loss_weight) * value_loss
+                    + jnp.float32(threat_loss_weight) * threat_loss
+                    + jnp.float32(horizon_loss_weight) * horizon_loss
+                    + reg
+                )
+                return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
-            (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
+            (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
+                loss_fn,
+                has_aux=True,
+            )(current_params)
             updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
             next_params = optax.apply_updates(current_params, updates)
-            return (next_params, next_opt_state), (loss, policy_loss, value_loss)
+            return (next_params, next_opt_state), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (new_params, new_opt_state), (losses, policy_losses, value_losses) = jax.lax.scan(
+        (new_params, new_opt_state), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
             one_update,
             (params, opt_state),
-            (obs_batches, policy_batches, value_batches),
+            (obs_batches, policy_batches, value_batches, horizon_batches),
         )
         return (
             new_params,
@@ -303,6 +455,8 @@ def make_single_multi_train_step(
             jnp.mean(losses),
             jnp.mean(policy_losses),
             jnp.mean(value_losses),
+            jnp.mean(threat_losses),
+            jnp.mean(horizon_losses),
         )
 
     return train_step
@@ -313,36 +467,65 @@ def make_pmap_multi_train_step(
     optimizer: optax.GradientTransformation,
     weight_decay: float,
     value_loss_weight: float,
+    threat_loss_weight: float,
+    horizon_loss_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs_batches, policy_batches, value_batches):
+    def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
         def one_update(carry, inputs):
             current_params, current_opt_state = carry
-            obs, policy_target, value_target = inputs
+            obs, policy_target, value_target, horizon_target = inputs
 
             def loss_fn(trainable):
-                logits, value = model.apply(trainable, obs.astype(model.compute_dtype))
+                logits, value, threat_logits, horizon_logit = model.apply(
+                    trainable,
+                    obs.astype(model.compute_dtype),
+                    return_aux=True,
+                )
                 logits = logits.astype(jnp.float32)
                 value = value.astype(jnp.float32)
+                threat_logits = threat_logits.astype(jnp.float32)
+                horizon_logit = horizon_logit.astype(jnp.float32)
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
+                threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
+                threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
+                positives = jnp.sum(threat_target)
+                negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
+                pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
+                threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
+                threat_loss = jnp.mean(threat_bce * threat_weights)
+                horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
+                horizon_pred = jax.nn.sigmoid(horizon_logit)
+                horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = policy_loss + jnp.float32(value_loss_weight) * value_loss + reg
-                return total_loss, (policy_loss, value_loss)
+                total_loss = (
+                    policy_loss
+                    + jnp.float32(value_loss_weight) * value_loss
+                    + jnp.float32(threat_loss_weight) * threat_loss
+                    + jnp.float32(horizon_loss_weight) * horizon_loss
+                    + reg
+                )
+                return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
-            (loss, (policy_loss, value_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(current_params)
+            (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
+                loss_fn,
+                has_aux=True,
+            )(current_params)
             grads = jax.lax.pmean(grads, axis_name="device")
             loss = jax.lax.pmean(loss, axis_name="device")
             policy_loss = jax.lax.pmean(policy_loss, axis_name="device")
             value_loss = jax.lax.pmean(value_loss, axis_name="device")
+            threat_loss = jax.lax.pmean(threat_loss, axis_name="device")
+            horizon_loss = jax.lax.pmean(horizon_loss, axis_name="device")
             updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
             next_params = optax.apply_updates(current_params, updates)
-            return (next_params, next_opt_state), (loss, policy_loss, value_loss)
+            return (next_params, next_opt_state), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (new_params, new_opt_state), (losses, policy_losses, value_losses) = jax.lax.scan(
+        (new_params, new_opt_state), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
             one_update,
             (params, opt_state),
-            (obs_batches, policy_batches, value_batches),
+            (obs_batches, policy_batches, value_batches, horizon_batches),
         )
         return (
             new_params,
@@ -350,6 +533,8 @@ def make_pmap_multi_train_step(
             jnp.mean(losses),
             jnp.mean(policy_losses),
             jnp.mean(value_losses),
+            jnp.mean(threat_losses),
+            jnp.mean(horizon_losses),
         )
 
     return train_step
@@ -799,6 +984,7 @@ def _save_training_checkpoint(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
     replay_value: np.ndarray,
+    replay_horizon: np.ndarray,
     ema_params,
     best_params,
     best_step: int,
@@ -815,6 +1001,7 @@ def _save_training_checkpoint(
         "replay_obs": replay_obs,
         "replay_policy": replay_policy,
         "replay_value": replay_value,
+        "replay_horizon": replay_horizon,
         "ema_params": jax.device_get(ema_params),
         "best_params": jax.device_get(best_params),
         "best_step": int(best_step),
@@ -946,11 +1133,14 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "final_temperature": args.final_temperature,
         "root_dirichlet_fraction": args.root_dirichlet_fraction,
         "root_dirichlet_alpha": args.root_dirichlet_alpha,
+        "optimizer": args.optimizer,
         "lr": args.lr,
         "lr_warmup_steps": args.lr_warmup_steps,
         "lr_end_value": args.lr_end_value,
         "grad_clip_norm": args.grad_clip_norm,
         "value_loss_weight": args.value_loss_weight,
+        "threat_loss_weight": args.threat_loss_weight,
+        "horizon_loss_weight": args.horizon_loss_weight,
         "ema_decay": args.ema_decay,
         "compute_dtype": args.compute_dtype,
         "param_dtype": args.param_dtype,
@@ -1157,32 +1347,38 @@ def _append_replay(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
     replay_value: np.ndarray,
+    replay_horizon: np.ndarray,
     new_obs: np.ndarray,
     new_policy: np.ndarray,
     new_value: np.ndarray,
+    new_horizon: np.ndarray,
     replay_size: int,
 ):
     if replay_obs.size == 0:
         merged_obs = new_obs
         merged_policy = new_policy
         merged_value = new_value
+        merged_horizon = new_horizon
     else:
         merged_obs = np.concatenate([replay_obs, new_obs], axis=0)
         merged_policy = np.concatenate([replay_policy, new_policy], axis=0)
         merged_value = np.concatenate([replay_value, new_value], axis=0)
+        merged_horizon = np.concatenate([replay_horizon, new_horizon], axis=0)
 
     if merged_obs.shape[0] > replay_size:
         start = merged_obs.shape[0] - replay_size
         merged_obs = merged_obs[start:]
         merged_policy = merged_policy[start:]
         merged_value = merged_value[start:]
-    return merged_obs, merged_policy, merged_value
+        merged_horizon = merged_horizon[start:]
+    return merged_obs, merged_policy, merged_value, merged_horizon
 
 
 def _init_host_replay(
     replay_obs: np.ndarray,
     replay_policy: np.ndarray,
     replay_value: np.ndarray,
+    replay_horizon: np.ndarray,
     *,
     replay_size: int,
     board_size: int,
@@ -1191,58 +1387,67 @@ def _init_host_replay(
     obs_host = np.zeros((replay_size, board_size, board_size, 4), dtype=np.uint8)
     policy_host = np.zeros((replay_size, num_actions), dtype=np.float32)
     value_host = np.zeros((replay_size,), dtype=np.float32)
+    horizon_host = np.zeros((replay_size,), dtype=np.float32)
     replay_count = int(min(replay_obs.shape[0], replay_size))
     replay_head = replay_count % replay_size if replay_size > 0 else 0
     if replay_count > 0:
         obs_host[:replay_count] = replay_obs[-replay_count:]
         policy_host[:replay_count] = replay_policy[-replay_count:]
         value_host[:replay_count] = replay_value[-replay_count:]
-    return obs_host, policy_host, value_host, replay_head, replay_count
+        if replay_horizon.shape[0] >= replay_count:
+            horizon_host[:replay_count] = replay_horizon[-replay_count:]
+    return obs_host, policy_host, value_host, horizon_host, replay_head, replay_count
 
 
 def _append_replay_host(
     replay_obs_host: np.ndarray,
     replay_policy_host: np.ndarray,
     replay_value_host: np.ndarray,
+    replay_horizon_host: np.ndarray,
     *,
     replay_head: int,
     replay_count: int,
     new_obs: np.ndarray,
     new_policy: np.ndarray,
     new_value: np.ndarray,
+    new_horizon: np.ndarray,
 ):
     capacity = int(replay_obs_host.shape[0])
     new_count = int(new_obs.shape[0])
     if new_count <= 0 or capacity <= 0:
-        return replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count
+        return replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count
 
     if new_count >= capacity:
         replay_obs_host[:] = new_obs[-capacity:]
         replay_policy_host[:] = new_policy[-capacity:]
         replay_value_host[:] = new_value[-capacity:]
-        return replay_obs_host, replay_policy_host, replay_value_host, 0, capacity
+        replay_horizon_host[:] = new_horizon[-capacity:]
+        return replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, 0, capacity
 
     first = min(new_count, capacity - replay_head)
     if first > 0:
         replay_obs_host[replay_head : replay_head + first] = new_obs[:first]
         replay_policy_host[replay_head : replay_head + first] = new_policy[:first]
         replay_value_host[replay_head : replay_head + first] = new_value[:first]
+        replay_horizon_host[replay_head : replay_head + first] = new_horizon[:first]
 
     remaining = new_count - first
     if remaining > 0:
         replay_obs_host[:remaining] = new_obs[first:]
         replay_policy_host[:remaining] = new_policy[first:]
         replay_value_host[:remaining] = new_value[first:]
+        replay_horizon_host[:remaining] = new_horizon[first:]
 
     replay_head = (replay_head + new_count) % capacity
     replay_count = min(capacity, replay_count + new_count)
-    return replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count
+    return replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count
 
 
 def _materialize_replay_from_host(
     replay_obs_host: np.ndarray,
     replay_policy_host: np.ndarray,
     replay_value_host: np.ndarray,
+    replay_horizon_host: np.ndarray,
     *,
     replay_count: int,
 ):
@@ -1253,21 +1458,29 @@ def _materialize_replay_from_host(
             np.zeros((0,) + obs_shape, dtype=np.uint8),
             np.zeros((0, policy_dim), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
         )
-    return replay_obs_host[:replay_count].copy(), replay_policy_host[:replay_count].copy(), replay_value_host[:replay_count].copy()
+    return (
+        replay_obs_host[:replay_count].copy(),
+        replay_policy_host[:replay_count].copy(),
+        replay_value_host[:replay_count].copy(),
+        replay_horizon_host[:replay_count].copy(),
+    )
 
 
 def _stabilize_replay_payload_examples(
     flat_obs: np.ndarray,
     flat_policy: np.ndarray,
     flat_value: np.ndarray,
+    flat_horizon: np.ndarray,
     valid: np.ndarray,
     *,
     fixed_examples: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     compact_obs = flat_obs[valid]
     compact_policy = flat_policy[valid]
     compact_value = flat_value[valid]
+    compact_horizon = flat_horizon[valid]
     compact_count = int(compact_obs.shape[0])
 
     if fixed_examples <= 0 or compact_count <= 0:
@@ -1275,6 +1488,7 @@ def _stabilize_replay_payload_examples(
             np.asarray(compact_obs, dtype=np.uint8),
             np.asarray(compact_policy, dtype=np.float32),
             np.asarray(compact_value, dtype=np.float32),
+            np.asarray(compact_horizon, dtype=np.float32),
             compact_count,
         )
 
@@ -1283,6 +1497,7 @@ def _stabilize_replay_payload_examples(
             np.asarray(compact_obs[:fixed_examples], dtype=np.uint8),
             np.asarray(compact_policy[:fixed_examples], dtype=np.float32),
             np.asarray(compact_value[:fixed_examples], dtype=np.float32),
+            np.asarray(compact_horizon[:fixed_examples], dtype=np.float32),
             fixed_examples,
         )
 
@@ -1291,12 +1506,13 @@ def _stabilize_replay_payload_examples(
         np.asarray(compact_obs[pad_index], dtype=np.uint8),
         np.asarray(compact_policy[pad_index], dtype=np.float32),
         np.asarray(compact_value[pad_index], dtype=np.float32),
+        np.asarray(compact_horizon[pad_index], dtype=np.float32),
         fixed_examples,
     )
 
 
 def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBatch:
-    new_obs, new_policy, new_value, black_win, white_win, draw, new_examples = payload
+    new_obs, new_policy, new_value, new_horizon, black_win, white_win, draw, new_examples = payload
     local_examples = int(new_examples)
 
     counts_out = multihost_utils.process_allgather(jnp.asarray(np.array([local_examples], dtype=np.int32)))
@@ -1307,6 +1523,7 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
             np.zeros((0,) + new_obs.shape[1:], dtype=np.uint8),
             np.zeros((0, new_policy.shape[1]), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
             0,
             0,
             0,
@@ -1316,17 +1533,20 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
     obs_pad = np.zeros((max_examples,) + new_obs.shape[1:], dtype=np.uint8)
     policy_pad = np.zeros((max_examples, new_policy.shape[1]), dtype=np.float32)
     value_pad = np.zeros((max_examples,), dtype=np.float32)
+    horizon_pad = np.zeros((max_examples,), dtype=np.float32)
     if local_examples > 0:
         obs_pad[:local_examples] = new_obs[:local_examples]
         policy_pad[:local_examples] = new_policy[:local_examples]
         value_pad[:local_examples] = new_value[:local_examples]
+        horizon_pad[:local_examples] = new_horizon[:local_examples]
 
     stats_local = np.asarray([black_win, white_win, draw], dtype=np.int32)
-    obs_all, policy_all, value_all, _counts_dup, stats_all = multihost_utils.process_allgather(
+    obs_all, policy_all, value_all, horizon_all, _counts_dup, stats_all = multihost_utils.process_allgather(
         (
             jnp.asarray(obs_pad),
             jnp.asarray(policy_pad),
             jnp.asarray(value_pad),
+            jnp.asarray(horizon_pad),
             jnp.asarray(np.array([local_examples], dtype=np.int32)),
             jnp.asarray(stats_local),
         )
@@ -1335,11 +1555,13 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
     obs_all_np = np.asarray(jax.device_get(obs_all), dtype=np.uint8)
     policy_all_np = np.asarray(jax.device_get(policy_all), dtype=np.float32)
     value_all_np = np.asarray(jax.device_get(value_all), dtype=np.float32)
+    horizon_all_np = np.asarray(jax.device_get(horizon_all), dtype=np.float32)
     stats_all_np = np.asarray(jax.device_get(stats_all), dtype=np.int32)
 
     merged_obs_parts = []
     merged_policy_parts = []
     merged_value_parts = []
+    merged_horizon_parts = []
     for proc_i, proc_examples in enumerate(counts_np):
         proc_n = int(proc_examples)
         if proc_n <= 0:
@@ -1347,15 +1569,18 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
         merged_obs_parts.append(obs_all_np[proc_i, :proc_n])
         merged_policy_parts.append(policy_all_np[proc_i, :proc_n])
         merged_value_parts.append(value_all_np[proc_i, :proc_n])
+        merged_horizon_parts.append(horizon_all_np[proc_i, :proc_n])
 
     if merged_obs_parts:
         merged_obs = np.concatenate(merged_obs_parts, axis=0)
         merged_policy = np.concatenate(merged_policy_parts, axis=0)
         merged_value = np.concatenate(merged_value_parts, axis=0)
+        merged_horizon = np.concatenate(merged_horizon_parts, axis=0)
     else:
         merged_obs = np.zeros((0,) + new_obs.shape[1:], dtype=np.uint8)
         merged_policy = np.zeros((0, new_policy.shape[1]), dtype=np.float32)
         merged_value = np.zeros((0,), dtype=np.float32)
+        merged_horizon = np.zeros((0,), dtype=np.float32)
 
     stats_sum = stats_all_np if stats_all_np.ndim == 1 else stats_all_np.sum(axis=0)
     merged_examples = int(counts_np.sum()) if counts_np.size > 0 else 0
@@ -1363,6 +1588,7 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
         np.asarray(merged_obs, dtype=np.uint8),
         np.asarray(merged_policy, dtype=np.float32),
         np.asarray(merged_value, dtype=np.float32),
+        np.asarray(merged_horizon, dtype=np.float32),
         int(stats_sum[0]),
         int(stats_sum[1]),
         int(stats_sum[2]),
@@ -1516,6 +1742,7 @@ def _pack_collect_payload(
     policy,
     value,
     mask,
+    steps,
     winners,
     board_size: int,
     fixed_examples: int,
@@ -1525,36 +1752,44 @@ def _pack_collect_payload(
     print("pack_collect ready_start")
     ready_start = time.perf_counter()
     if actions is None:
-        jax.block_until_ready((obs, policy, value, mask, winners))
+        jax.block_until_ready((obs, policy, value, mask, steps, winners))
     else:
-        jax.block_until_ready((obs, policy, value, mask, winners, actions))
+        jax.block_until_ready((obs, policy, value, mask, steps, winners, actions))
     ready_ms = (time.perf_counter() - ready_start) * 1000.0
     print(f"pack_collect ready_done ready_ms={ready_ms:.1f}")
 
     print("pack_collect device_get_start")
     device_get_start = time.perf_counter()
     if actions is None:
-        obs_np, policy_np, value_np, mask_np, winners_np = jax.device_get((obs, policy, value, mask, winners))
+        obs_np, policy_np, value_np, mask_np, steps_np, winners_np = jax.device_get((obs, policy, value, mask, steps, winners))
         actions_np = None
     else:
-        obs_np, policy_np, value_np, mask_np, winners_np, actions_np = jax.device_get((obs, policy, value, mask, winners, actions))
+        obs_np, policy_np, value_np, mask_np, steps_np, winners_np, actions_np = jax.device_get(
+            (obs, policy, value, mask, steps, winners, actions)
+        )
     device_get_ms = (time.perf_counter() - device_get_start) * 1000.0
     print(f"pack_collect device_get_done device_get_ms={device_get_ms:.1f}")
     obs_np = np.asarray(obs_np)
     policy_np = np.asarray(policy_np)
     value_np = np.asarray(value_np)
     mask_np = np.asarray(mask_np)
+    steps_np = np.asarray(steps_np)
     winners_np = np.asarray(winners_np)
 
+    max_steps = int(mask_np.shape[-1])
+    step_idx = np.arange(max_steps, dtype=np.int32)
+    horizon_np = np.maximum(steps_np[..., None].astype(np.int32) - 1 - step_idx[None, ...], 0).astype(np.float32)
     flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
     flat_policy = policy_np.reshape((-1, board_size * board_size))
     flat_value = value_np.reshape((-1,))
+    flat_horizon = horizon_np.reshape((-1,))
     valid = mask_np.reshape((-1,)).astype(bool)
 
-    packed_obs, packed_policy, packed_value, stored_examples = _stabilize_replay_payload_examples(
+    packed_obs, packed_policy, packed_value, packed_horizon, stored_examples = _stabilize_replay_payload_examples(
         flat_obs,
         flat_policy,
         flat_value,
+        flat_horizon,
         valid,
         fixed_examples=fixed_examples,
     )
@@ -1563,6 +1798,7 @@ def _pack_collect_payload(
         packed_obs,
         packed_policy,
         packed_value,
+        packed_horizon,
         int((winners_np == 1).sum()),
         int((winners_np == -1).sum()),
         int((winners_np == 0).sum()),
@@ -1719,13 +1955,13 @@ def _run_actor_role(
             if use_pmap:
                 collect_keys = jax.random.split(collect_key, local_devices)
                 collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
-                obs, policy, value, mask, actions, _, winners = collect_step(
+                obs, policy, value, mask, actions, steps, winners = collect_step(
                     params,
                     collect_keys,
                     collect_temperature,
                 )
             else:
-                obs, policy, value, mask, actions, _, winners = collect_step(
+                obs, policy, value, mask, actions, steps, winners = collect_step(
                     params,
                     collect_key,
                     jnp.float32(args.temperature),
@@ -1740,6 +1976,7 @@ def _run_actor_role(
                 policy=policy,
                 value=value,
                 mask=mask,
+                steps=steps,
                 winners=winners,
                 board_size=args.board_size,
                 fixed_examples=args.replay_fixed_update_size,
@@ -1749,7 +1986,7 @@ def _run_actor_role(
             payload_ms = (time.perf_counter() - payload_start) * 1000.0
             print(
                 f"actor[{process_index}] payload_done batch={next_batch_idx} "
-                f"examples={payload[6]} payload_ms={payload_ms:.1f}"
+                f"examples={payload[7]} payload_ms={payload_ms:.1f}"
             )
             collect_ms = (time.perf_counter() - collect_start) * 1000.0
             print(f"actor[{process_index}] upload_start batch={next_batch_idx}")
@@ -1768,7 +2005,7 @@ def _run_actor_role(
                 f"upload_ms={upload_ms:.1f}"
             )
             sent_batches += 1
-            sent_examples += payload[6]
+            sent_examples += payload[7]
 
             if sample_log is not None:
                 if should_sample:
@@ -1933,11 +2170,14 @@ def main() -> None:
     parser.add_argument("--updates-per-step", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-size", type=int, default=50000)
+    parser.add_argument("--optimizer", choices=("muon", "adam"), default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--lr-end-value", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--value-loss-weight", type=float, default=1.25)
+    parser.add_argument("--threat-loss-weight", type=float, default=0.10)
+    parser.add_argument("--horizon-loss-weight", type=float, default=0.02)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="float32")
@@ -2090,6 +2330,10 @@ def main() -> None:
         raise ValueError("grad-clip-norm must be >= 0")
     if args.value_loss_weight <= 0:
         raise ValueError("value-loss-weight must be > 0")
+    if args.threat_loss_weight < 0:
+        raise ValueError("threat-loss-weight must be >= 0")
+    if args.horizon_loss_weight < 0:
+        raise ValueError("horizon-loss-weight must be >= 0")
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError("ema-decay must be in [0, 1)")
     compute_dtype = _dtype_from_name(args.compute_dtype)
@@ -2226,17 +2470,22 @@ def main() -> None:
         decay_steps=decay_steps,
         end_value=args.lr_end_value,
     )
+    base_optimizer = _build_base_optimizer(
+        optimizer_name=args.optimizer,
+        lr_schedule=lr_schedule,
+    )
     if args.grad_clip_norm > 0:
         optimizer = optax.chain(
             optax.clip_by_global_norm(args.grad_clip_norm),
-            optax.adam(learning_rate=lr_schedule),
+            base_optimizer,
         )
     else:
-        optimizer = optax.adam(learning_rate=lr_schedule)
+        optimizer = base_optimizer
     opt_state = optimizer.init(params)
     replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.uint8)
     replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
     replay_value = np.zeros((0,), dtype=np.float32)
+    replay_horizon = np.zeros((0,), dtype=np.float32)
     np_rng = np.random.default_rng(args.seed + 13)
     optimizer_updates = 0
     best_params = _clone_tree(params)
@@ -2270,6 +2519,10 @@ def main() -> None:
             replay_obs = np.asarray(payload["replay_obs"], dtype=np.uint8)
             replay_policy = np.asarray(payload["replay_policy"], dtype=np.float32)
             replay_value = np.asarray(payload["replay_value"], dtype=np.float32)
+            if "replay_horizon" in payload:
+                replay_horizon = np.asarray(payload["replay_horizon"], dtype=np.float32)
+            else:
+                replay_horizon = np.zeros_like(replay_value, dtype=np.float32)
 
         np_rng = np.random.default_rng(args.seed + 13)
         if "np_rng_state" in payload:
@@ -2427,12 +2680,16 @@ def main() -> None:
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
+            threat_loss_weight=args.threat_loss_weight,
+            horizon_loss_weight=args.horizon_loss_weight,
         )
         train_step_multi = make_pmap_multi_train_step(
             train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
+            threat_loss_weight=args.threat_loss_weight,
+            horizon_loss_weight=args.horizon_loss_weight,
         )
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
@@ -2454,7 +2711,9 @@ def main() -> None:
             f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
             f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
             f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
-            f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
+            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"optimizer={args.optimizer}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
@@ -2464,12 +2723,16 @@ def main() -> None:
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
+            threat_loss_weight=args.threat_loss_weight,
+            horizon_loss_weight=args.horizon_loss_weight,
         )
         train_step_multi = make_single_multi_train_step(
             train_model,
             optimizer,
             weight_decay=args.weight_decay,
             value_loss_weight=args.value_loss_weight,
+            threat_loss_weight=args.threat_loss_weight,
+            horizon_loss_weight=args.horizon_loss_weight,
         )
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
@@ -2488,16 +2751,19 @@ def main() -> None:
             f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
             f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
             f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
-            f"value_loss_weight={args.value_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
+            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"optimizer={args.optimizer}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
 
     best_params = jax.tree_util.tree_map(jnp.asarray, best_params)
-    replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _init_host_replay(
+    replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count = _init_host_replay(
         replay_obs,
         replay_policy,
         replay_value,
+        replay_horizon,
         replay_size=args.replay_size,
         board_size=args.board_size,
     )
@@ -2511,10 +2777,11 @@ def main() -> None:
         save_start = time.perf_counter()
         current_params = _extract_host_tree(params, use_pmap=use_pmap)
         current_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
-        replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_host(
+        replay_obs_np, replay_policy_np, replay_value_np, replay_horizon_np = _materialize_replay_from_host(
             replay_obs_host,
             replay_policy_host,
             replay_value_host,
+            replay_horizon_host,
             replay_count=replay_count,
         )
         cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
@@ -2530,6 +2797,7 @@ def main() -> None:
             replay_obs=replay_obs_np,
             replay_policy=replay_policy_np,
             replay_value=replay_value_np,
+            replay_horizon=replay_horizon_np,
             ema_params=_extract_host_tree(ema_params, use_pmap=use_pmap),
             best_params=best_params,
             best_step=best_step,
@@ -2578,13 +2846,13 @@ def main() -> None:
         if use_pmap:
             collect_keys = jax.random.split(collect_rng_key, local_devices)
             collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
-            obs, policy, value, mask, _, _, winners = collect_step(
+            obs, policy, value, mask, _, steps, winners = collect_step(
                 params_for_collect,
                 collect_keys,
                 collect_temperature,
             )
         else:
-            obs, policy, value, mask, _, _, winners = collect_step(
+            obs, policy, value, mask, _, steps, winners = collect_step(
                 params_for_collect,
                 collect_rng_key,
                 jnp.float32(args.temperature),
@@ -2594,6 +2862,7 @@ def main() -> None:
             policy=policy,
             value=value,
             mask=mask,
+            steps=steps,
             winners=winners,
             board_size=args.board_size,
             fixed_examples=args.replay_fixed_update_size,
@@ -2768,7 +3037,7 @@ def main() -> None:
                                 jnp.float32(args.temperature),
                                 dtype=jnp.float32,
                             )
-                            obs, policy, value, mask, _, _, winners = actor_collect_steps[actor_idx](
+                            obs, policy, value, mask, _, steps, winners = actor_collect_steps[actor_idx](
                                 collect_params_actor,
                                 collect_keys,
                                 collect_temperature,
@@ -2778,6 +3047,7 @@ def main() -> None:
                                 policy=policy,
                                 value=value,
                                 mask=mask,
+                                steps=steps,
                                 winners=winners,
                                 board_size=args.board_size,
                                 fixed_examples=args.replay_fixed_update_size,
@@ -2790,7 +3060,7 @@ def main() -> None:
                                 replay_queue.put(payload, timeout=0.2)
                                 with actor_stats_lock:
                                     actor_batches_total += 1
-                                    actor_examples_total += payload[6]
+                                    actor_examples_total += payload[7]
                                 break
                             except queue_lib.Full:
                                 continue
@@ -2849,6 +3119,7 @@ def main() -> None:
                             new_obs,
                             new_policy,
                             new_value,
+                            new_horizon,
                             black_win,
                             white_win,
                             draw,
@@ -2874,7 +3145,7 @@ def main() -> None:
                 learner_wait_total_sec += wait_sec
                 learner_wait_count += 1
                 payloads_to_append = [
-                    (new_obs, new_policy, new_value, black_win, white_win, draw, new_examples)
+                    (new_obs, new_policy, new_value, new_horizon, black_win, white_win, draw, new_examples)
                 ]
                 if args.learner_drain_max_batches > 0:
                     drained = 0
@@ -2886,12 +3157,12 @@ def main() -> None:
                         payloads_to_append.append(drained_payload)
                         with actor_stats_lock:
                             actor_batches_total += 1
-                            actor_examples_total += drained_payload[6]
+                            actor_examples_total += drained_payload[7]
                         drained += 1
-                new_examples = int(sum(item[6] for item in payloads_to_append))
-                black_win = int(sum(item[3] for item in payloads_to_append))
-                white_win = int(sum(item[4] for item in payloads_to_append))
-                draw = int(sum(item[5] for item in payloads_to_append))
+                new_examples = int(sum(item[7] for item in payloads_to_append))
+                black_win = int(sum(item[4] for item in payloads_to_append))
+                white_win = int(sum(item[5] for item in payloads_to_append))
+                draw = int(sum(item[6] for item in payloads_to_append))
             elif args.async_selfplay:
                 assert actor_stop is not None
                 wait_start = time.perf_counter()
@@ -2911,6 +3182,7 @@ def main() -> None:
                                 new_obs,
                                 new_policy,
                                 new_value,
+                                new_horizon,
                                 black_win,
                                 white_win,
                                 draw,
@@ -2925,6 +3197,7 @@ def main() -> None:
                                 new_obs,
                                 new_policy,
                                 new_value,
+                                new_horizon,
                                 black_win,
                                 white_win,
                                 draw,
@@ -2959,6 +3232,7 @@ def main() -> None:
                     new_obs,
                     new_policy,
                     new_value,
+                    new_horizon,
                     black_win,
                     white_win,
                     draw,
@@ -2972,30 +3246,36 @@ def main() -> None:
                     append_obs = payloads_to_append[0][0]
                     append_policy = payloads_to_append[0][1]
                     append_value = payloads_to_append[0][2]
+                    append_horizon = payloads_to_append[0][3]
                 else:
                     append_obs = np.concatenate([payload[0] for payload in payloads_to_append], axis=0)
                     append_policy = np.concatenate([payload[1] for payload in payloads_to_append], axis=0)
                     append_value = np.concatenate([payload[2] for payload in payloads_to_append], axis=0)
-                replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _append_replay_host(
+                    append_horizon = np.concatenate([payload[3] for payload in payloads_to_append], axis=0)
+                replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count = _append_replay_host(
                     replay_obs_host,
                     replay_policy_host,
                     replay_value_host,
+                    replay_horizon_host,
                     replay_head=replay_head,
                     replay_count=replay_count,
                     new_obs=append_obs,
                     new_policy=append_policy,
                     new_value=append_value,
+                    new_horizon=append_horizon,
                 )
             else:
-                replay_obs_host, replay_policy_host, replay_value_host, replay_head, replay_count = _append_replay_host(
+                replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count = _append_replay_host(
                     replay_obs_host,
                     replay_policy_host,
                     replay_value_host,
+                    replay_horizon_host,
                     replay_head=replay_head,
                     replay_count=replay_count,
                     new_obs=new_obs,
                     new_policy=new_policy,
                     new_value=new_value,
+                    new_horizon=new_horizon,
                 )
             replay_append_ms = (time.perf_counter() - replay_append_start) * 1000.0
 
@@ -3007,11 +3287,14 @@ def main() -> None:
             loss_sum = 0.0
             policy_sum = 0.0
             value_sum = 0.0
+            threat_sum = 0.0
+            horizon_sum = 0.0
             train_updates_start = time.perf_counter()
             if fused_train_updates:
                 obs_batches = []
                 policy_batches = []
                 value_batches = []
+                horizon_batches = []
                 for _ in range(args.updates_per_step):
                     sample_ids = _sample_replay_indices(
                         np_rng=np_rng,
@@ -3023,6 +3306,7 @@ def main() -> None:
                     obs = jnp.asarray(replay_obs_host[sample_ids])
                     policy_target = jnp.asarray(replay_policy_host[sample_ids])
                     value_target = jnp.asarray(replay_value_host[sample_ids])
+                    horizon_target = jnp.asarray(replay_horizon_host[sample_ids])
                     if not args.disable_symmetry_augmentation:
                         rng_key, aug_key = jax.random.split(rng_key)
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
@@ -3031,14 +3315,17 @@ def main() -> None:
                         obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
                         policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
                         value_target = value_target.reshape((local_devices, per_device_batch))
+                        horizon_target = horizon_target.reshape((local_devices, per_device_batch))
 
                     obs_batches.append(obs)
                     policy_batches.append(policy_target)
                     value_batches.append(value_target)
+                    horizon_batches.append(horizon_target)
 
                 obs_stack = jnp.stack(obs_batches, axis=0)
                 policy_stack = jnp.stack(policy_batches, axis=0)
                 value_stack = jnp.stack(value_batches, axis=0)
+                horizon_stack = jnp.stack(horizon_batches, axis=0)
                 if use_pmap:
                     # pmap maps over leading axis (local_devices). For fused updates we first
                     # stack by update index, so move device axis to front before calling pmap.
@@ -3047,24 +3334,32 @@ def main() -> None:
                     obs_stack = jnp.swapaxes(obs_stack, 0, 1)
                     policy_stack = jnp.swapaxes(policy_stack, 0, 1)
                     value_stack = jnp.swapaxes(value_stack, 0, 1)
-                params, opt_state, loss_mean, policy_mean, value_mean = train_step_multi(
+                    horizon_stack = jnp.swapaxes(horizon_stack, 0, 1)
+                params, opt_state, loss_mean, policy_mean, value_mean, threat_mean, horizon_mean = train_step_multi(
                     params,
                     opt_state,
                     obs_stack,
                     policy_stack,
                     value_stack,
+                    horizon_stack,
                 )
                 if use_pmap:
                     loss_scalar = float(loss_mean[0])
                     policy_scalar = float(policy_mean[0])
                     value_scalar = float(value_mean[0])
+                    threat_scalar = float(threat_mean[0])
+                    horizon_scalar = float(horizon_mean[0])
                 else:
                     loss_scalar = float(loss_mean)
                     policy_scalar = float(policy_mean)
                     value_scalar = float(value_mean)
+                    threat_scalar = float(threat_mean)
+                    horizon_scalar = float(horizon_mean)
                 loss_sum = loss_scalar * args.updates_per_step
                 policy_sum = policy_scalar * args.updates_per_step
                 value_sum = value_scalar * args.updates_per_step
+                threat_sum = threat_scalar * args.updates_per_step
+                horizon_sum = horizon_scalar * args.updates_per_step
                 prev_optimizer_updates = optimizer_updates
                 optimizer_updates += args.updates_per_step
                 if ema_decay_step > 0.0:
@@ -3105,6 +3400,7 @@ def main() -> None:
                     obs = jnp.asarray(replay_obs_host[sample_ids])
                     policy_target = jnp.asarray(replay_policy_host[sample_ids])
                     value_target = jnp.asarray(replay_value_host[sample_ids])
+                    horizon_target = jnp.asarray(replay_horizon_host[sample_ids])
                     if not args.disable_symmetry_augmentation:
                         rng_key, aug_key = jax.random.split(rng_key)
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
@@ -3113,27 +3409,34 @@ def main() -> None:
                         obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
                         policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
                         value_target = value_target.reshape((local_devices, per_device_batch))
-                        params, opt_state, loss, policy_loss, value_loss = train_step(
+                        horizon_target = horizon_target.reshape((local_devices, per_device_batch))
+                        params, opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
                             params,
                             opt_state,
                             obs,
                             policy_target,
                             value_target,
+                            horizon_target,
                         )
                         loss_sum += float(loss[0])
                         policy_sum += float(policy_loss[0])
                         value_sum += float(value_loss[0])
+                        threat_sum += float(threat_loss[0])
+                        horizon_sum += float(horizon_loss[0])
                     else:
-                        params, opt_state, loss, policy_loss, value_loss = train_step(
+                        params, opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
                             params,
                             opt_state,
                             obs,
                             policy_target,
                             value_target,
+                            horizon_target,
                         )
                         loss_sum += float(loss)
                         policy_sum += float(policy_loss)
                         value_sum += float(value_loss)
+                        threat_sum += float(threat_loss)
+                        horizon_sum += float(horizon_loss)
                     optimizer_updates += 1
                     if ema_decay_step > 0.0:
                         ema_params = _update_ema_params(ema_params, params, ema_decay_step)
@@ -3182,6 +3485,8 @@ def main() -> None:
             loss_val = loss_sum / args.updates_per_step
             pol_val = policy_sum / args.updates_per_step
             val_val = value_sum / args.updates_per_step
+            threat_val = threat_sum / args.updates_per_step
+            horizon_val = horizon_sum / args.updates_per_step
             lr_val = float(lr_schedule(jnp.asarray(max(optimizer_updates - 1, 0), dtype=jnp.int32)))
             step_ms = (time.perf_counter() - step_start) * 1000.0
             elapsed_sec = max(time.perf_counter() - train_start_time, 1e-6)
@@ -3204,6 +3509,7 @@ def main() -> None:
                     )
                 print(
                 f"step={step} lr={lr_val:.6f} loss={loss_val:.4f} policy={pol_val:.4f} value={val_val:.4f} "
+                f"threat={threat_val:.4f} horizon={horizon_val:.4f} "
                 f"replay={replay_count} new_examples={new_examples} "
                 f"bw={black_win} ww={white_win} d={draw} "
                 f"step_ms={step_ms:.1f} collect_ms={collect_wait_ms:.1f} wait_avg_ms={avg_wait_ms:.1f} "
@@ -3295,10 +3601,11 @@ def main() -> None:
 
     final_params = _extract_host_tree(params, use_pmap=use_pmap)
     final_opt_state = _extract_host_tree(opt_state, use_pmap=use_pmap)
-    replay_obs_np, replay_policy_np, replay_value_np = _materialize_replay_from_host(
+    replay_obs_np, replay_policy_np, replay_value_np, replay_horizon_np = _materialize_replay_from_host(
         replay_obs_host,
         replay_policy_host,
         replay_value_host,
+        replay_horizon_host,
         replay_count=replay_count,
     )
     cfg = _checkpoint_config(args, optimizer_updates=optimizer_updates, best_step=best_step)
@@ -3315,6 +3622,7 @@ def main() -> None:
             replay_obs=replay_obs_np,
             replay_policy=replay_policy_np,
             replay_value=replay_value_np,
+            replay_horizon=replay_horizon_np,
             ema_params=_extract_host_tree(ema_params, use_pmap=use_pmap),
             best_params=best_params,
             best_step=best_step,
