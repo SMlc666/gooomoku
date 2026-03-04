@@ -7,6 +7,9 @@ import sys
 
 import jax
 import jax.numpy as jnp
+from flax.core import freeze
+from flax.core import unfreeze
+from flax.core.frozen_dict import FrozenDict
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "src"))
@@ -36,8 +39,31 @@ def _load_checkpoint(path: Path):
     with path.open("rb") as fp:
         payload = pickle.load(fp)
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+    params = _maybe_adjust_token_embed_input_planes(params, target_planes=env.OBS_PLANES)
     config = payload.get("config", {})
     return params, config
+
+
+def _maybe_adjust_token_embed_input_planes(params, *, target_planes: int):
+    mutable = unfreeze(params)
+    param_tree = mutable.get("params")
+    if not isinstance(param_tree, dict):
+        return params
+    token_embed = param_tree.get("token_embed")
+    if not isinstance(token_embed, dict):
+        return params
+    kernel = token_embed.get("kernel")
+    if kernel is None or getattr(kernel, "ndim", 0) != 2:
+        return params
+    cur_planes = int(kernel.shape[0])
+    if cur_planes == target_planes:
+        return params
+    if cur_planes > target_planes:
+        token_embed["kernel"] = kernel[:target_planes, :]
+    else:
+        pad = jnp.zeros((target_planes - cur_planes, int(kernel.shape[1])), dtype=kernel.dtype)
+        token_embed["kernel"] = jnp.concatenate([kernel, pad], axis=0)
+    return freeze(mutable) if isinstance(params, FrozenDict) else mutable
 
 
 def build_play_vs_random_fn(

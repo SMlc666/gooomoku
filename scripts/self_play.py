@@ -41,6 +41,95 @@ def _add_batch_dim(state: env.GomokuState) -> env.GomokuState:
     return jax.tree_util.tree_map(lambda x: x[None, ...], state)
 
 
+def _build_mixed_init_state(
+    *,
+    board_size: int,
+    num_games: int,
+    rng_key: jnp.ndarray,
+    mode_freestyle_weight: float,
+    mode_forbidden_weight: float,
+    mode_swap2_weight: float,
+    mode_swap2_forbidden_weight: float,
+    swap2_swap_prob: float,
+) -> env.GomokuState:
+    num_actions = board_size * board_size
+    if num_actions < 3:
+        raise ValueError("swap2 requires board_size*board_size >= 3")
+
+    mode_weights = jnp.asarray(
+        [
+            max(0.0, float(mode_freestyle_weight)),
+            max(0.0, float(mode_forbidden_weight)),
+            max(0.0, float(mode_swap2_weight)),
+            max(0.0, float(mode_swap2_forbidden_weight)),
+        ],
+        dtype=jnp.float32,
+    )
+    mode_total = jnp.sum(mode_weights)
+    mode_probs = jnp.where(
+        mode_total > 0.0,
+        mode_weights / jnp.maximum(mode_total, 1e-12),
+        jnp.asarray([1.0, 0.0, 0.0, 0.0], dtype=jnp.float32),
+    )
+    mode_logits = jnp.log(jnp.clip(mode_probs, 1e-12, 1.0))
+
+    mode_key, opening_key, swap_key = jax.random.split(rng_key, 3)
+    mode_ids = jax.random.categorical(mode_key, mode_logits, shape=(num_games,)).astype(jnp.int32)
+    is_forbidden = (mode_ids == 1) | (mode_ids == 3)
+    is_swap2 = (mode_ids == 2) | (mode_ids == 3)
+
+    opening_scores = jax.random.uniform(opening_key, shape=(num_games, num_actions), dtype=jnp.float32)
+    _, opening_idx = jax.lax.top_k(opening_scores, k=3)
+    first = opening_idx[:, 0]
+    second = opening_idx[:, 1]
+    third = opening_idx[:, 2]
+    batch_idx = jnp.arange(num_games, dtype=jnp.int32)
+
+    black_bits = jnp.zeros((num_games, num_actions), dtype=jnp.bool_)
+    white_bits = jnp.zeros((num_games, num_actions), dtype=jnp.bool_)
+    black_bits = black_bits.at[batch_idx, first].set(is_swap2)
+    white_bits = white_bits.at[batch_idx, second].set(is_swap2)
+    black_bits = black_bits.at[batch_idx, third].set(is_swap2)
+
+    board = jnp.zeros((num_games, board_size, board_size), dtype=jnp.int8)
+    first_row, first_col = first // board_size, first % board_size
+    second_row, second_col = second // board_size, second % board_size
+    third_row, third_col = third // board_size, third % board_size
+    board = board.at[batch_idx, first_row, first_col].set(jnp.where(is_swap2, jnp.int8(1), jnp.int8(0)))
+    board = board.at[batch_idx, second_row, second_col].set(jnp.where(is_swap2, jnp.int8(-1), jnp.int8(0)))
+    board = board.at[batch_idx, third_row, third_col].set(jnp.where(is_swap2, jnp.int8(1), jnp.int8(0)))
+
+    to_play = jnp.where(is_swap2, jnp.int8(-1), jnp.int8(1))
+    last_action = jnp.where(is_swap2, third.astype(jnp.int32), jnp.int32(-1))
+    num_moves = jnp.where(is_swap2, jnp.int32(3), jnp.int32(0))
+    terminated = jnp.zeros((num_games,), dtype=jnp.bool_)
+    winner = jnp.zeros((num_games,), dtype=jnp.int8)
+    rule_flags = jnp.where(is_forbidden, jnp.int8(env.RULE_RENJU_FULL), jnp.int8(0))
+
+    swap_pick = jax.random.bernoulli(swap_key, p=jnp.float32(max(0.0, min(1.0, float(swap2_swap_prob)))), shape=(num_games,))
+    swap_applied = is_swap2 & swap_pick
+    black_before_swap = black_bits
+    white_before_swap = white_bits
+    black_bits = jnp.where(swap_applied[:, None], white_before_swap, black_before_swap)
+    white_bits = jnp.where(swap_applied[:, None], black_before_swap, white_before_swap)
+    board = jnp.where(swap_applied[:, None, None], -board, board)
+    to_play = jnp.where(swap_applied, -to_play, to_play).astype(jnp.int8)
+
+    return env.GomokuState(
+        board=board,
+        black_bits=black_bits,
+        white_bits=white_bits,
+        to_play=to_play,
+        last_action=last_action.astype(jnp.int32),
+        num_moves=num_moves.astype(jnp.int32),
+        terminated=terminated,
+        winner=winner,
+        rule_flags=rule_flags.astype(jnp.int8),
+        swap_source_flag=is_swap2.astype(jnp.int8),
+        swap_applied_flag=swap_applied.astype(jnp.int8),
+    )
+
+
 def _sample_action_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperature: jnp.ndarray) -> jnp.ndarray:
     def greedy(_):
         return jnp.argmax(visit_probs).astype(jnp.int32)
@@ -108,7 +197,7 @@ def build_play_one_game_fn(
     @jax.jit
     def play_one_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
         state = env.reset(board_size)
-        obs_buf = jnp.zeros((max_steps, board_size, board_size, 4), dtype=jnp.float32)
+        obs_buf = jnp.zeros((max_steps, board_size, board_size, env.OBS_PLANES), dtype=jnp.float32)
         pi_buf = jnp.zeros((max_steps, num_actions), dtype=jnp.float32)
         to_play_buf = jnp.zeros((max_steps,), dtype=jnp.int8)
 
@@ -175,14 +264,14 @@ def build_play_many_games_fn(
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
     c_lcb: float = 0.0,
+    mode_freestyle_weight: float = 1.0,
+    mode_forbidden_weight: float = 0.0,
+    mode_swap2_weight: float = 0.0,
+    mode_swap2_forbidden_weight: float = 0.0,
+    swap2_swap_prob: float = 0.5,
 ):
     max_steps = board_size * board_size
     num_actions = max_steps
-    init_state = env.reset(board_size)
-    batched_init_state = jax.tree_util.tree_map(
-        lambda x: jnp.broadcast_to(x, (num_games,) + x.shape),
-        init_state,
-    )
     # Keep root-defense heuristics off for self-play throughput: they add
     # many gather/scatter/bincount ops to the MCTS jaxpr and can make TPU
     # compile + runtime dramatically slower for large batches.
@@ -204,7 +293,19 @@ def build_play_many_games_fn(
 
     @jax.jit
     def play_many_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
-        obs_buf = jnp.zeros((num_games, max_steps, board_size, board_size, 4), dtype=jnp.float32)
+        setup_key, loop_key = jax.random.split(rng_key)
+        batched_init_state = _build_mixed_init_state(
+            board_size=board_size,
+            num_games=num_games,
+            rng_key=setup_key,
+            mode_freestyle_weight=mode_freestyle_weight,
+            mode_forbidden_weight=mode_forbidden_weight,
+            mode_swap2_weight=mode_swap2_weight,
+            mode_swap2_forbidden_weight=mode_swap2_forbidden_weight,
+            swap2_swap_prob=swap2_swap_prob,
+        )
+
+        obs_buf = jnp.zeros((num_games, max_steps, board_size, board_size, env.OBS_PLANES), dtype=jnp.float32)
         pi_buf = jnp.zeros((num_games, max_steps, num_actions), dtype=jnp.float32)
         to_play_buf = jnp.zeros((num_games, max_steps), dtype=jnp.int8)
         mask_buf = jnp.zeros((num_games, max_steps), dtype=jnp.bool_)
@@ -268,7 +369,7 @@ def build_play_many_games_fn(
             body_fn,
             (
                 batched_init_state,
-                rng_key,
+                loop_key,
                 jnp.int32(0),
                 obs_buf,
                 pi_buf,
@@ -371,6 +472,11 @@ def play_many_games(
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
     c_lcb: float = 0.0,
+    mode_freestyle_weight: float = 1.0,
+    mode_forbidden_weight: float = 0.0,
+    mode_swap2_weight: float = 0.0,
+    mode_swap2_forbidden_weight: float = 0.0,
+    swap2_swap_prob: float = 0.5,
 ) -> Tuple[List[TrainingExample], dict]:
     play_many_fn = build_play_many_games_fn(
         model=model,
@@ -389,6 +495,11 @@ def play_many_games(
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
         c_lcb=c_lcb,
+        mode_freestyle_weight=mode_freestyle_weight,
+        mode_forbidden_weight=mode_forbidden_weight,
+        mode_swap2_weight=mode_swap2_weight,
+        mode_swap2_forbidden_weight=mode_swap2_forbidden_weight,
+        swap2_swap_prob=swap2_swap_prob,
     )
     obs, pi, value, mask, _, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
     obs = jax.device_get(obs)
@@ -398,7 +509,7 @@ def play_many_games(
     winners = jax.device_get(winners)
 
     all_examples: List[TrainingExample] = []
-    flat_obs = obs.reshape((-1, board_size, board_size, 4))
+    flat_obs = obs.reshape((-1, board_size, board_size, env.OBS_PLANES))
     flat_pi = pi.reshape((-1, board_size * board_size))
     flat_value = value.reshape((-1,))
     flat_mask = mask.reshape((-1,))
@@ -452,7 +563,7 @@ def main() -> None:
         param_dtype=param_dtype,
     )
     init_key, game_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
+    params = model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, env.OBS_PLANES), dtype=compute_dtype))
     samples, winner = play_one_game(
         params=params,
         model=model,

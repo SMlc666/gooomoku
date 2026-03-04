@@ -14,6 +14,9 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from flax.core import freeze
+from flax.core import unfreeze
+from flax.core.frozen_dict import FrozenDict
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -108,6 +111,28 @@ def _resolve_artifact_checkpoint(artifact_path: Path, expected_sha256: str | Non
 
 def _add_batch_dim(state: env.GomokuState) -> env.GomokuState:
     return jax.tree_util.tree_map(lambda x: x[None, ...], state)
+
+
+def _maybe_adjust_token_embed_input_planes(params, *, target_planes: int):
+    mutable = unfreeze(params)
+    param_tree = mutable.get("params")
+    if not isinstance(param_tree, dict):
+        return params
+    token_embed = param_tree.get("token_embed")
+    if not isinstance(token_embed, dict):
+        return params
+    kernel = token_embed.get("kernel")
+    if kernel is None or getattr(kernel, "ndim", 0) != 2:
+        return params
+    cur_planes = int(kernel.shape[0])
+    if cur_planes == target_planes:
+        return params
+    if cur_planes > target_planes:
+        token_embed["kernel"] = kernel[:target_planes, :]
+    else:
+        pad = jnp.zeros((target_planes - cur_planes, int(kernel.shape[1])), dtype=kernel.dtype)
+        token_embed["kernel"] = jnp.concatenate([kernel, pad], axis=0)
+    return freeze(mutable) if isinstance(params, FrozenDict) else mutable
 
 
 def _state_to_board_list(state: env.GomokuState) -> list[list[int]]:
@@ -321,6 +346,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     param_dtype = _dtype_from_name(param_dtype_name)
     params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+    params = _maybe_adjust_token_embed_input_planes(params, target_planes=env.OBS_PLANES)
 
     def _build_engine_with_compute_dtype(compute_name: str) -> GameEngine:
         compute_dtype = _dtype_from_name(compute_name)

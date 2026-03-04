@@ -123,6 +123,11 @@ def _run_cross_process_actor(
         endgame_considered_actions=int(cfg.get("considered_actions_endgame", 160)),
         midgame_start_move=int(cfg.get("considered_actions_mid_move", 12)),
         endgame_start_move=int(cfg.get("considered_actions_endgame_move", 40)),
+        mode_freestyle_weight=float(cfg.get("mode_freestyle_weight", 1.0)),
+        mode_forbidden_weight=float(cfg.get("mode_forbidden_weight", 0.0)),
+        mode_swap2_weight=float(cfg.get("mode_swap2_weight", 0.0)),
+        mode_swap2_forbidden_weight=float(cfg.get("mode_swap2_forbidden_weight", 0.0)),
+        swap2_swap_prob=float(cfg.get("swap2_swap_prob", 0.5)),
     )
 
     rng = jax.random.PRNGKey(int(cfg["seed"]) + 100003 * (actor_idx + 1))
@@ -166,7 +171,7 @@ def _run_cross_process_actor(
             max_steps = int(mask_np.shape[-1])
             step_idx = np.arange(max_steps, dtype=np.int32)
             horizon_np = np.maximum(steps_np[..., None].astype(np.int32) - 1 - step_idx[None, ...], 0).astype(np.float32)
-            flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
+            flat_obs = obs_np.reshape((-1, board_size, board_size, env.OBS_PLANES))
             flat_policy = policy_np.reshape((-1, board_size * board_size))
             flat_value = value_np.reshape((-1,))
             flat_horizon = horizon_np.reshape((-1,))
@@ -213,7 +218,7 @@ def _dtype_from_name(name: str):
     return table[name]
 
 
-def _build_base_optimizer(*, optimizer_name: str, lr_schedule):
+def _build_base_optimizer(*, optimizer_name: str, lr_schedule, params, weight_decay: float):
     name = str(optimizer_name).strip().lower()
     if name == "adam":
         return optax.adam(learning_rate=lr_schedule)
@@ -230,11 +235,40 @@ def _build_base_optimizer(*, optimizer_name: str, lr_schedule):
                 "(requirements.txt has optax>=0.2.6)."
             )
         sig = inspect.signature(muon_fn)
+        muon_kwargs: dict[str, Any] = {}
         if "learning_rate" in sig.parameters:
-            return muon_fn(learning_rate=lr_schedule)
-        if "lr" in sig.parameters:
-            return muon_fn(lr=lr_schedule)
-        return muon_fn(lr_schedule)
+            muon_kwargs["learning_rate"] = lr_schedule
+        elif "lr" in sig.parameters:
+            muon_kwargs["lr"] = lr_schedule
+        else:
+            muon_kwargs = {}
+
+        if weight_decay > 0.0:
+            if "weight_decay" in sig.parameters:
+                muon_kwargs["weight_decay"] = float(weight_decay)
+            elif "wd" in sig.parameters:
+                muon_kwargs["wd"] = float(weight_decay)
+            else:
+                print("warning: muon API has no weight_decay argument; skipping optimizer weight decay")
+
+        if muon_kwargs:
+            muon_tx = muon_fn(**muon_kwargs)
+        else:
+            muon_tx = muon_fn(lr_schedule)
+
+        # Use Muon for matrix-like tensors and Adam for vectors/scalars.
+        adam_tx = optax.adam(learning_rate=lr_schedule)
+        labels = jax.tree_util.tree_map(
+            lambda x: "muon" if getattr(x, "ndim", 0) >= 2 else "adam",
+            params,
+        )
+        return optax.multi_transform(
+            {
+                "muon": muon_tx,
+                "adam": adam_tx,
+            },
+            labels,
+        )
     raise ValueError(f"unsupported optimizer: {optimizer_name}")
 
 
@@ -263,6 +297,18 @@ def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
     last_action = jnp.where(has_last, last_action, jnp.int32(-1))
     occupied = black_bits | white_bits
     num_moves = jnp.sum(occupied.astype(jnp.int32), axis=1).astype(jnp.int32)
+    if obs.shape[-1] > 4:
+        rule_flags = jnp.where(obs[:, 0, 0, 4] > 0.5, jnp.int8(env.RULE_RENJU_FULL), jnp.int8(0))
+    else:
+        rule_flags = jnp.zeros((batch,), dtype=jnp.int8)
+    if obs.shape[-1] > 5:
+        swap_source_flag = jnp.where(obs[:, 0, 0, 5] > 0.5, jnp.int8(1), jnp.int8(0))
+    else:
+        swap_source_flag = jnp.zeros((batch,), dtype=jnp.int8)
+    if obs.shape[-1] > 6:
+        swap_applied_flag = jnp.where(obs[:, 0, 0, 6] > 0.5, jnp.int8(1), jnp.int8(0))
+    else:
+        swap_applied_flag = jnp.zeros((batch,), dtype=jnp.int8)
     return env.GomokuState(
         board=jnp.zeros((batch, board_size, board_size), dtype=jnp.int8),
         black_bits=black_bits,
@@ -272,6 +318,9 @@ def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
         num_moves=num_moves,
         terminated=jnp.zeros((batch,), dtype=jnp.bool_),
         winner=jnp.zeros((batch,), dtype=jnp.int8),
+        rule_flags=rule_flags,
+        swap_source_flag=swap_source_flag,
+        swap_applied_flag=swap_applied_flag,
     )
 
 
@@ -966,6 +1015,7 @@ def _pull_params_from_network(*, host: str, port: int, last_optimizer_updates: i
             raise RuntimeError(f"unknown param sync payload schema: {payload.get('schema')}")
         pulled_updates = int(payload.get("optimizer_updates", -1))
         pulled_params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+        pulled_params = _maybe_adjust_token_embed_input_planes(pulled_params, target_planes=env.OBS_PLANES)
         return pulled_params, pulled_updates
     finally:
         sock.close()
@@ -1024,6 +1074,41 @@ def _extract_host_tree(params, use_pmap: bool):
 
 def _clone_tree(tree):
     return jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), tree)
+
+
+def _maybe_adjust_token_embed_input_planes(params, *, target_planes: int):
+    mutable = unfreeze(params)
+    param_tree = mutable.get("params")
+    if not isinstance(param_tree, dict):
+        return params
+    token_embed = param_tree.get("token_embed")
+    if not isinstance(token_embed, dict):
+        return params
+    kernel = token_embed.get("kernel")
+    if kernel is None or getattr(kernel, "ndim", 0) != 2:
+        return params
+    cur_planes = int(kernel.shape[0])
+    if cur_planes == target_planes:
+        return params
+    if cur_planes > target_planes:
+        token_embed["kernel"] = kernel[:target_planes, :]
+    else:
+        pad = jnp.zeros((target_planes - cur_planes, int(kernel.shape[1])), dtype=kernel.dtype)
+        token_embed["kernel"] = jnp.concatenate([kernel, pad], axis=0)
+    return freeze(mutable) if isinstance(params, FrozenDict) else mutable
+
+
+def _maybe_adjust_obs_planes(obs: np.ndarray, *, target_planes: int) -> np.ndarray:
+    if obs.ndim != 4:
+        return obs
+    cur_planes = int(obs.shape[-1])
+    if cur_planes == target_planes:
+        return obs
+    if cur_planes > target_planes:
+        return np.asarray(obs[..., :target_planes], dtype=np.uint8)
+    pad_shape = obs.shape[:-1] + (target_planes - cur_planes,)
+    pad = np.zeros(pad_shape, dtype=np.uint8)
+    return np.concatenate([obs, pad], axis=-1).astype(np.uint8, copy=False)
 
 
 def _slice_axis_prefix(x, *, axis: int, size: int):
@@ -1119,6 +1204,7 @@ def _add_batch_dim_state(state: env.GomokuState) -> env.GomokuState:
 def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str, Any]:
     return {
         "board_size": args.board_size,
+        "obs_planes": int(env.OBS_PLANES),
         "channels": args.channels,
         "blocks": args.blocks,
         "search_blocks": args.search_blocks,
@@ -1138,6 +1224,11 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "final_temperature": args.final_temperature,
         "root_dirichlet_fraction": args.root_dirichlet_fraction,
         "root_dirichlet_alpha": args.root_dirichlet_alpha,
+        "mode_freestyle_weight": args.mode_freestyle_weight,
+        "mode_forbidden_weight": args.mode_forbidden_weight,
+        "mode_swap2_weight": args.mode_swap2_weight,
+        "mode_swap2_forbidden_weight": args.mode_swap2_forbidden_weight,
+        "swap2_swap_prob": args.swap2_swap_prob,
         "optimizer": args.optimizer,
         "lr": args.lr,
         "lr_warmup_steps": args.lr_warmup_steps,
@@ -1389,7 +1480,7 @@ def _init_host_replay(
     board_size: int,
 ):
     num_actions = board_size * board_size
-    obs_host = np.zeros((replay_size, board_size, board_size, 4), dtype=np.uint8)
+    obs_host = np.zeros((replay_size, board_size, board_size, env.OBS_PLANES), dtype=np.uint8)
     policy_host = np.zeros((replay_size, num_actions), dtype=np.float32)
     value_host = np.zeros((replay_size,), dtype=np.float32)
     horizon_host = np.zeros((replay_size,), dtype=np.float32)
@@ -1690,7 +1781,7 @@ def _sample_ordered_position_from_collect(
     obs_arr = np.asarray(obs_np, dtype=np.uint8)
     if obs_arr.ndim < 5:
         return None
-    obs_flat = obs_arr.reshape((-1, obs_arr.shape[-4], board_size, board_size, 4))
+    obs_flat = obs_arr.reshape((-1, obs_arr.shape[-4], board_size, board_size, obs_arr.shape[-1]))
     actions_flat = np.asarray(actions_np, dtype=np.int32).reshape((-1, actions_np.shape[-1]))
     if flat_game_idx >= obs_flat.shape[0] or flat_game_idx >= actions_flat.shape[0]:
         return None
@@ -1784,7 +1875,7 @@ def _pack_collect_payload(
     max_steps = int(mask_np.shape[-1])
     step_idx = np.arange(max_steps, dtype=np.int32)
     horizon_np = np.maximum(steps_np[..., None].astype(np.int32) - 1 - step_idx[None, ...], 0).astype(np.float32)
-    flat_obs = obs_np.reshape((-1, board_size, board_size, 4))
+    flat_obs = obs_np.reshape((-1, board_size, board_size, env.OBS_PLANES))
     flat_policy = policy_np.reshape((-1, board_size * board_size))
     flat_value = value_np.reshape((-1,))
     flat_horizon = horizon_np.reshape((-1,))
@@ -1839,6 +1930,7 @@ def _maybe_reload_actor_params(
     if ckpt_optimizer_updates >= 0 and ckpt_optimizer_updates <= last_optimizer_updates:
         return None, last_optimizer_updates
     loaded = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+    loaded = _maybe_adjust_token_embed_input_planes(loaded, target_planes=env.OBS_PLANES)
     if use_pmap:
         loaded = _replicate_tree_for_pmap(loaded, local_devices=local_devices)
     return loaded, ckpt_optimizer_updates
@@ -1881,6 +1973,11 @@ def _run_actor_role(
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
         c_lcb=args.c_lcb,
+        mode_freestyle_weight=args.mode_freestyle_weight,
+        mode_forbidden_weight=args.mode_forbidden_weight,
+        mode_swap2_weight=args.mode_swap2_weight,
+        mode_swap2_forbidden_weight=args.mode_swap2_forbidden_weight,
+        swap2_swap_prob=args.swap2_swap_prob,
     )
     collect_step = make_pmap_collect_step(play_many_games_fn) if use_pmap else play_many_games_fn
 
@@ -2201,6 +2298,11 @@ def main() -> None:
     parser.add_argument("--final-temperature", type=float, default=0.0)
     parser.add_argument("--root-dirichlet-fraction", type=float, default=0.25)
     parser.add_argument("--root-dirichlet-alpha", type=float, default=0.03)
+    parser.add_argument("--mode-freestyle-weight", type=float, default=1.0)
+    parser.add_argument("--mode-forbidden-weight", type=float, default=0.0)
+    parser.add_argument("--mode-swap2-weight", type=float, default=0.0)
+    parser.add_argument("--mode-swap2-forbidden-weight", type=float, default=0.0)
+    parser.add_argument("--swap2-swap-prob", type=float, default=0.5)
     parser.add_argument("--disable-symmetry-augmentation", action="store_true")
     parser.add_argument("--arena-every-steps", type=int, default=10)
     parser.add_argument("--arena-games", type=int, default=64)
@@ -2317,6 +2419,14 @@ def main() -> None:
         raise ValueError("max-attention-heads must be >= 1")
     if args.max_num_considered_actions < 1:
         raise ValueError("max-num-considered-actions must be >= 1")
+    if args.mode_freestyle_weight < 0 or args.mode_forbidden_weight < 0 or args.mode_swap2_weight < 0 or args.mode_swap2_forbidden_weight < 0:
+        raise ValueError("mode weights must be >= 0")
+    if (args.mode_freestyle_weight + args.mode_forbidden_weight + args.mode_swap2_weight + args.mode_swap2_forbidden_weight) <= 0:
+        raise ValueError("at least one self-play mode weight must be > 0")
+    if args.swap2_swap_prob < 0.0 or args.swap2_swap_prob > 1.0:
+        raise ValueError("swap2-swap-prob must be in [0, 1]")
+    if (args.mode_swap2_weight > 0 or args.mode_swap2_forbidden_weight > 0) and (args.board_size * args.board_size < 3):
+        raise ValueError("swap2 modes require board_size*board_size >= 3")
     if args.search_blocks < 0:
         raise ValueError("search-blocks must be >= 0")
     if args.search_blocks > args.blocks:
@@ -2463,7 +2573,7 @@ def main() -> None:
         )
     )
     rng_key, init_key = jax.random.split(jax.random.PRNGKey(args.seed))
-    params = train_model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, 4), dtype=compute_dtype))
+    params = train_model.init(init_key, jnp.zeros((1, args.board_size, args.board_size, env.OBS_PLANES), dtype=compute_dtype))
 
     total_optimizer_updates = max(1, args.train_steps * args.updates_per_step)
     warmup_steps = max(0, min(args.lr_warmup_steps, total_optimizer_updates - 1))
@@ -2478,6 +2588,8 @@ def main() -> None:
     base_optimizer = _build_base_optimizer(
         optimizer_name=args.optimizer,
         lr_schedule=lr_schedule,
+        params=params,
+        weight_decay=args.weight_decay,
     )
     if args.grad_clip_norm > 0:
         optimizer = optax.chain(
@@ -2487,7 +2599,7 @@ def main() -> None:
     else:
         optimizer = base_optimizer
     opt_state = optimizer.init(params)
-    replay_obs = np.zeros((0, args.board_size, args.board_size, 4), dtype=np.uint8)
+    replay_obs = np.zeros((0, args.board_size, args.board_size, env.OBS_PLANES), dtype=np.uint8)
     replay_policy = np.zeros((0, args.board_size * args.board_size), dtype=np.float32)
     replay_value = np.zeros((0,), dtype=np.float32)
     replay_horizon = np.zeros((0,), dtype=np.float32)
@@ -2501,9 +2613,9 @@ def main() -> None:
     if args.resume_from is not None:
         payload = _load_checkpoint_payload(args.resume_from)
         resume_cfg = payload.get("config", {})
-        for key in ("board_size", "channels", "blocks", "max_attention_heads", "compute_dtype", "param_dtype"):
+        for key in ("board_size", "obs_planes", "channels", "blocks", "max_attention_heads", "compute_dtype", "param_dtype"):
             cfg_val = resume_cfg.get(key)
-            arg_val = getattr(args, key)
+            arg_val = int(env.OBS_PLANES) if key == "obs_planes" else getattr(args, key)
             if cfg_val is not None and str(cfg_val) != str(arg_val):
                 raise ValueError(
                     f"resume config mismatch for {key}: checkpoint={cfg_val} current={arg_val}"
@@ -2512,8 +2624,18 @@ def main() -> None:
         if "params" not in payload:
             raise ValueError(f"invalid resume checkpoint (missing params): {args.resume_from}")
         params = jax.tree_util.tree_map(jnp.asarray, payload["params"])
+        params = _maybe_adjust_token_embed_input_planes(params, target_planes=env.OBS_PLANES)
         if "opt_state" in payload:
-            opt_state = jax.tree_util.tree_map(jnp.asarray, payload["opt_state"])
+            loaded_opt_state = jax.tree_util.tree_map(jnp.asarray, payload["opt_state"])
+            expected_opt_state = optimizer.init(params)
+            if jax.tree_util.tree_structure(loaded_opt_state) == jax.tree_util.tree_structure(expected_opt_state):
+                opt_state = loaded_opt_state
+            else:
+                opt_state = expected_opt_state
+                print(
+                    "resume opt_state structure mismatch with current optimizer; "
+                    "reinitializing optimizer state."
+                )
         else:
             opt_state = optimizer.init(params)
 
@@ -2522,6 +2644,7 @@ def main() -> None:
 
         if "replay_obs" in payload and "replay_policy" in payload and "replay_value" in payload:
             replay_obs = np.asarray(payload["replay_obs"], dtype=np.uint8)
+            replay_obs = _maybe_adjust_obs_planes(replay_obs, target_planes=env.OBS_PLANES)
             replay_policy = np.asarray(payload["replay_policy"], dtype=np.float32)
             replay_value = np.asarray(payload["replay_value"], dtype=np.float32)
             if "replay_horizon" in payload:
@@ -2538,10 +2661,12 @@ def main() -> None:
         start_step = max(1, last_step + 1)
         if "best_params" in payload:
             best_params = jax.tree_util.tree_map(jnp.asarray, payload["best_params"])
+            best_params = _maybe_adjust_token_embed_input_planes(best_params, target_planes=env.OBS_PLANES)
         else:
             best_params = _clone_tree(params)
         if "ema_params" in payload:
             ema_params = jax.tree_util.tree_map(jnp.asarray, payload["ema_params"])
+            ema_params = _maybe_adjust_token_embed_input_planes(ema_params, target_planes=env.OBS_PLANES)
         else:
             ema_params = _clone_tree(params)
         best_step = int(payload.get("best_step", 0))
@@ -2664,6 +2789,11 @@ def main() -> None:
         root_dirichlet_fraction=args.root_dirichlet_fraction,
         root_dirichlet_alpha=args.root_dirichlet_alpha,
         c_lcb=args.c_lcb,
+        mode_freestyle_weight=args.mode_freestyle_weight,
+        mode_forbidden_weight=args.mode_forbidden_weight,
+        mode_swap2_weight=args.mode_swap2_weight,
+        mode_swap2_forbidden_weight=args.mode_swap2_forbidden_weight,
+        swap2_swap_prob=args.swap2_swap_prob,
     )
     arena_num_simulations = args.arena_num_simulations or args.num_simulations
     arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
@@ -2677,13 +2807,15 @@ def main() -> None:
         temperature=args.arena_temperature,
     )
     pmap_arena_step = make_pmap_arena_step(arena_fn) if use_pmap else None
+    # Muon path uses optimizer-side weight decay on matrix parameters only.
+    loss_l2_weight_decay = args.weight_decay if args.optimizer == "adam" else 0.0
 
     if use_pmap:
         per_device_batch = args.batch_size // local_devices
         train_step = make_pmap_train_step(
             train_model,
             optimizer,
-            weight_decay=args.weight_decay,
+            weight_decay=loss_l2_weight_decay,
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
@@ -2691,7 +2823,7 @@ def main() -> None:
         train_step_multi = make_pmap_multi_train_step(
             train_model,
             optimizer,
-            weight_decay=args.weight_decay,
+            weight_decay=loss_l2_weight_decay,
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
@@ -2716,9 +2848,12 @@ def main() -> None:
             f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
             f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
             f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
+            f"selfplay_modes(free/forbid/swap2/swap2_forbid)=({args.mode_freestyle_weight:.2f},"
+            f"{args.mode_forbidden_weight:.2f},{args.mode_swap2_weight:.2f},{args.mode_swap2_forbidden_weight:.2f}), "
+            f"swap2_swap_prob={args.swap2_swap_prob:.2f}, "
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
             f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
-            f"optimizer={args.optimizer}, "
+            f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
@@ -2726,7 +2861,7 @@ def main() -> None:
         train_step = make_single_train_step(
             train_model,
             optimizer,
-            weight_decay=args.weight_decay,
+            weight_decay=loss_l2_weight_decay,
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
@@ -2734,7 +2869,7 @@ def main() -> None:
         train_step_multi = make_single_multi_train_step(
             train_model,
             optimizer,
-            weight_decay=args.weight_decay,
+            weight_decay=loss_l2_weight_decay,
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
@@ -2756,9 +2891,12 @@ def main() -> None:
             f"dynamic_considered_actions={not args.disable_dynamic_considered_actions}, "
             f"considered(open/mid/end)=({args.considered_actions_opening},{args.considered_actions_midgame},{args.considered_actions_endgame}), "
             f"considered_moves(mid/end)=({args.considered_actions_mid_move},{args.considered_actions_endgame_move}), "
+            f"selfplay_modes(free/forbid/swap2/swap2_forbid)=({args.mode_freestyle_weight:.2f},"
+            f"{args.mode_forbidden_weight:.2f},{args.mode_swap2_weight:.2f},{args.mode_swap2_forbidden_weight:.2f}), "
+            f"swap2_swap_prob={args.swap2_swap_prob:.2f}, "
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
             f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
-            f"optimizer={args.optimizer}, "
+            f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
         )
@@ -2974,6 +3112,11 @@ def main() -> None:
                 "root_dirichlet_fraction": args.root_dirichlet_fraction,
                 "root_dirichlet_alpha": args.root_dirichlet_alpha,
                 "c_lcb": args.c_lcb,
+                "mode_freestyle_weight": args.mode_freestyle_weight,
+                "mode_forbidden_weight": args.mode_forbidden_weight,
+                "mode_swap2_weight": args.mode_swap2_weight,
+                "mode_swap2_forbidden_weight": args.mode_swap2_forbidden_weight,
+                "swap2_swap_prob": args.swap2_swap_prob,
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "actor_jax_platforms": actor_jax_platforms,
@@ -3317,7 +3460,7 @@ def main() -> None:
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
 
                     if use_pmap:
-                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, env.OBS_PLANES))
                         policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
                         value_target = value_target.reshape((local_devices, per_device_batch))
                         horizon_target = horizon_target.reshape((local_devices, per_device_batch))
@@ -3411,7 +3554,7 @@ def main() -> None:
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
 
                     if use_pmap:
-                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, 4))
+                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, env.OBS_PLANES))
                         policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
                         value_target = value_target.reshape((local_devices, per_device_batch))
                         horizon_target = horizon_target.reshape((local_devices, per_device_batch))
