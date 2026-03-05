@@ -307,7 +307,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-simulations", type=int, default=None)
     parser.add_argument("--max-num-considered-actions", type=int, default=None)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
-    parser.add_argument("--param-dtype", type=str, default="float32")
+    parser.add_argument("--param-dtype", type=str, default="bfloat16")
     parser.add_argument("--ai-temperature", type=float, default=0.0)
     parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)

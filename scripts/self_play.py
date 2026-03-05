@@ -117,8 +117,8 @@ def _build_mixed_init_state(
 
     return env.GomokuState(
         board=board,
-        black_bits=black_bits,
-        white_bits=white_bits,
+        black_words=env.pack_bits(black_bits),
+        white_words=env.pack_bits(white_bits),
         to_play=to_play,
         last_action=last_action.astype(jnp.int32),
         num_moves=num_moves.astype(jnp.int32),
@@ -549,8 +549,8 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--c-lcb", type=float, default=0.0)
     parser.add_argument("--max-attention-heads", type=int, default=4)
-    parser.add_argument("--compute-dtype", type=str, default="float32")
-    parser.add_argument("--param-dtype", type=str, default="float32")
+    parser.add_argument("--compute-dtype", type=str, default="bfloat16")
+    parser.add_argument("--param-dtype", type=str, default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 

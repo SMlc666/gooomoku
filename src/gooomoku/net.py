@@ -28,13 +28,19 @@ def _relative_position_index(board_size: int) -> jnp.ndarray:
     return delta_row * span + delta_col
 
 
+def _intermediate_tap_indices(num_blocks: int, stride: int) -> tuple[int, ...]:
+    if num_blocks <= 1 or stride <= 0:
+        return ()
+    return tuple(i for i in range(stride - 1, num_blocks - 1, stride))
+
+
 class TransformerBlock(nn.Module):
     board_size: int
     channels: int
     num_heads: int
     mlp_hidden: int
-    compute_dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
+    compute_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -119,12 +125,15 @@ class TransformerScanCell(nn.Module):
     channels: int
     num_heads: int
     mlp_hidden: int
-    compute_dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
+    total_blocks: int
+    stochastic_depth_rate: float = 0.0
+    train: bool = False
+    compute_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, carry: jnp.ndarray, _: jnp.ndarray) -> tuple[jnp.ndarray, None]:
-        carry = TransformerBlock(
+    def __call__(self, carry: jnp.ndarray, layer_idx: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        block_out = TransformerBlock(
             board_size=self.board_size,
             channels=self.channels,
             num_heads=self.num_heads,
@@ -132,7 +141,20 @@ class TransformerScanCell(nn.Module):
             compute_dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
         )(carry)
-        return carry, None
+        residual = block_out - carry
+        if self.train and self.stochastic_depth_rate > 0.0:
+            layer_ratio = (layer_idx.astype(jnp.float32) + jnp.float32(1.0)) / jnp.float32(max(1, self.total_blocks))
+            drop_rate = jnp.float32(self.stochastic_depth_rate) * layer_ratio
+            keep_prob = jnp.clip(jnp.float32(1.0) - drop_rate, jnp.float32(1e-3), jnp.float32(1.0))
+            sd_key = jax.random.fold_in(self.make_rng("stochastic_depth"), layer_idx.astype(jnp.uint32))
+            keep_mask = jax.random.bernoulli(
+                sd_key,
+                p=keep_prob,
+                shape=(carry.shape[0], 1, 1),
+            )
+            residual = residual * keep_mask.astype(residual.dtype) / keep_prob.astype(residual.dtype)
+        out = carry + residual
+        return out, out
 
 
 class PolicyValueNet(nn.Module):
@@ -140,8 +162,10 @@ class PolicyValueNet(nn.Module):
     channels: int = 64
     blocks: int = 6
     max_attention_heads: int = 4
-    compute_dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
+    stochastic_depth_rate: float = 0.0
+    intermediate_supervision_stride: int = 0
+    compute_dtype: Any = jnp.bfloat16
+    param_dtype: Any = jnp.bfloat16
 
     @nn.compact
     def __call__(
@@ -149,7 +173,9 @@ class PolicyValueNet(nn.Module):
         obs: jnp.ndarray,
         *,
         return_aux: bool = False,
-    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        return_intermediate: bool = False,
+        train: bool = False,
+    ) -> tuple[jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray] | tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         tokens = self.board_size * self.board_size
         x = obs.astype(self.compute_dtype).reshape((obs.shape[0], tokens, obs.shape[-1]))
         x = nn.Dense(
@@ -167,6 +193,7 @@ class PolicyValueNet(nn.Module):
         )
         x = x + pos_embedding[None, :, :].astype(self.compute_dtype)
 
+        layer_outputs = None
         if self.blocks > 0:
             heads = _pick_attention_heads(self.channels, self.max_attention_heads)
             transformer_stack = nn.scan(
@@ -181,6 +208,9 @@ class PolicyValueNet(nn.Module):
                 channels=self.channels,
                 num_heads=heads,
                 mlp_hidden=self.channels * 4,
+                total_blocks=self.blocks,
+                stochastic_depth_rate=self.stochastic_depth_rate,
+                train=train,
                 compute_dtype=self.compute_dtype,
                 param_dtype=self.param_dtype,
                 name="transformer_stack",
@@ -188,6 +218,8 @@ class PolicyValueNet(nn.Module):
                 x,
                 jnp.arange(self.blocks, dtype=jnp.int32),
             )
+        else:
+            layer_outputs = jnp.zeros((0, x.shape[0], x.shape[1], x.shape[2]), dtype=x.dtype)
 
         x = nn.LayerNorm(
             dtype=self.compute_dtype,
@@ -195,75 +227,105 @@ class PolicyValueNet(nn.Module):
             name="final_norm",
         )(x)
 
-        policy = nn.Dense(
+        policy_head = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="policy_head",
-        )(x).squeeze(-1)
-        threat_logits = nn.Dense(
+        )
+        threat_head = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="threat_head",
-        )(x).squeeze(-1)
-        legality_logits = nn.Dense(
+        )
+        legality_head = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="legality_head",
-        )(x).squeeze(-1)
-        win1_logits = nn.Dense(
+        )
+        win1_head = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="win1_head",
-        )(x).squeeze(-1)
-
-        pooled = nn.LayerNorm(
+        )
+        global_pool_norm = nn.LayerNorm(
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="global_pool_norm",
-        )(x)
-        attn_logits = nn.Dense(
+        )
+        global_attn_logits = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="global_attn_logits",
-        )(pooled).squeeze(-1)
-        attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=1).astype(self.compute_dtype)
-        attn_pool = jnp.sum(pooled * attn_weights[..., None], axis=1)
-        mean_pool = jnp.mean(pooled, axis=1)
-        max_pool = jnp.max(pooled, axis=1)
-        value = jnp.concatenate([attn_pool, mean_pool, max_pool], axis=-1)
-        value_features = nn.Dense(
+        )
+        global_fuse = nn.Dense(
             self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="global_fuse",
-        )(value)
-        value_features = nn.gelu(value_features, approximate=True)
-        value_features = nn.Dense(
+        )
+        value_dense_0 = nn.Dense(
             self.channels,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="value_dense_0",
-        )(value_features)
-        value_features = nn.gelu(value_features, approximate=True)
-        value = nn.Dense(
+        )
+        value_dense_1 = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="value_dense_1",
-        )(value_features)
-        horizon_logit = nn.Dense(
+        )
+        horizon_head = nn.Dense(
             1,
             dtype=self.compute_dtype,
             param_dtype=self.param_dtype,
             name="horizon_head",
-        )(value_features)
-        value = jnp.tanh(value).squeeze(-1)
-        horizon_logit = horizon_logit.squeeze(-1)
+        )
+
+        def _value_heads(tokens_x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            pooled = global_pool_norm(tokens_x)
+            attn_logits = global_attn_logits(pooled).squeeze(-1)
+            attn_weights = jax.nn.softmax(attn_logits.astype(jnp.float32), axis=1).astype(self.compute_dtype)
+            attn_pool = jnp.sum(pooled * attn_weights[..., None], axis=1)
+            mean_pool = jnp.mean(pooled, axis=1)
+            max_pool = jnp.max(pooled, axis=1)
+            value_concat = jnp.concatenate([attn_pool, mean_pool, max_pool], axis=-1)
+            value_features = global_fuse(value_concat)
+            value_features = nn.gelu(value_features, approximate=True)
+            value_features = value_dense_0(value_features)
+            value_features = nn.gelu(value_features, approximate=True)
+            value = value_dense_1(value_features)
+            horizon_logit = horizon_head(value_features)
+            return value.squeeze(-1), horizon_logit.squeeze(-1)
+
+        policy = policy_head(x).squeeze(-1)
+        threat_logits = threat_head(x).squeeze(-1)
+        legality_logits = legality_head(x).squeeze(-1)
+        win1_logits = win1_head(x).squeeze(-1)
+        value, horizon_logit = _value_heads(x)
+        value = jnp.tanh(value)
+        tap_policy_logits = jnp.zeros((0, x.shape[0], tokens), dtype=self.compute_dtype)
+        tap_values = jnp.zeros((0, x.shape[0]), dtype=self.compute_dtype)
+        if return_intermediate:
+            tap_indices = _intermediate_tap_indices(self.blocks, self.intermediate_supervision_stride)
+            if tap_indices:
+                tap_policies = []
+                tap_vals = []
+                for tap_idx in tap_indices:
+                    tap_x = layer_outputs[tap_idx]
+                    tap_policies.append(policy_head(tap_x).squeeze(-1))
+                    tap_value, _tap_h = _value_heads(tap_x)
+                    del _tap_h
+                    tap_vals.append(jnp.tanh(tap_value))
+                tap_policy_logits = jnp.stack(tap_policies, axis=0)
+                tap_values = jnp.stack(tap_vals, axis=0)
         if return_aux:
+            if return_intermediate:
+                return policy, value, threat_logits, horizon_logit, legality_logits, win1_logits, tap_policy_logits, tap_values
             return policy, value, threat_logits, horizon_logit, legality_logits, win1_logits
         return policy, value

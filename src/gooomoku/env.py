@@ -15,12 +15,15 @@ RULE_RENJU_FULL = np.int8(
 )
 OBS_PLANES = 7
 
+_WORD_BITS = 32
+_WORD_DTYPE = jnp.uint32
+
 
 @struct.dataclass
 class GomokuState:
     board: jnp.ndarray
-    black_bits: jnp.ndarray
-    white_bits: jnp.ndarray
+    black_words: jnp.ndarray
+    white_words: jnp.ndarray
     to_play: jnp.ndarray
     last_action: jnp.ndarray
     num_moves: jnp.ndarray
@@ -62,6 +65,136 @@ def _line_start_masks(board_size: int, line_len: int = 5):
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _line_windows_np(board_size: int, line_len: int, offset: int):
+    east, south, diag_dr, diag_dl = _line_start_masks_np(board_size, line_len)
+    if offset == 1:
+        starts = east
+    elif offset == board_size:
+        starts = south
+    elif offset == board_size + 1:
+        starts = diag_dr
+    elif offset == board_size - 1:
+        starts = diag_dl
+    else:
+        raise ValueError(f"unsupported offset for board_size={board_size}: {offset}")
+
+    start_idx = np.flatnonzero(starts).astype(np.int32)
+    if start_idx.size == 0:
+        return np.zeros((0, line_len), dtype=np.int32)
+    steps = np.arange(line_len, dtype=np.int32)[None, :]
+    return start_idx[:, None] + steps * np.int32(offset)
+
+
+@functools.lru_cache(maxsize=None)
+def _packed_line_tables(board_size: int, line_len: int, offset: int):
+    windows = _line_windows_np(board_size, line_len, offset)
+    word_idx = windows // _WORD_BITS
+    bit_idx = (windows % _WORD_BITS).astype(np.uint32)
+    bit_masks = (np.uint32(1) << bit_idx).astype(np.uint32)
+    return (
+        jnp.asarray(word_idx, dtype=jnp.int32),
+        jnp.asarray(bit_masks, dtype=_WORD_DTYPE),
+    )
+
+
+def _num_words_for_actions(num_actions: int) -> int:
+    return (num_actions + _WORD_BITS - 1) // _WORD_BITS
+
+
+def _state_num_actions(state: GomokuState) -> int:
+    board_size = int(state.board.shape[-1])
+    return board_size * board_size
+
+
+def _expand_mask(mask: jnp.ndarray, target_ndim: int) -> jnp.ndarray:
+    while mask.ndim < target_ndim:
+        mask = mask[..., None]
+    return mask
+
+
+def pack_bits(bits: jnp.ndarray) -> jnp.ndarray:
+    num_actions = int(bits.shape[-1])
+    pad = (-num_actions) % _WORD_BITS
+    padded = bits
+    if pad:
+        pad_width = [(0, 0)] * bits.ndim
+        pad_width[-1] = (0, pad)
+        padded = jnp.pad(bits, pad_width=pad_width, mode="constant", constant_values=False)
+
+    words_shape = padded.shape[:-1] + (-1, _WORD_BITS)
+    words_src = padded.reshape(words_shape).astype(_WORD_DTYPE)
+    shifts = jnp.arange(_WORD_BITS, dtype=_WORD_DTYPE)
+    masks = jnp.left_shift(jnp.ones((_WORD_BITS,), dtype=_WORD_DTYPE), shifts)
+    return jnp.sum(words_src * masks, axis=-1, dtype=_WORD_DTYPE)
+
+
+def unpack_bits(words: jnp.ndarray, *, num_actions: int) -> jnp.ndarray:
+    idx = jnp.arange(num_actions, dtype=jnp.int32)
+    word_idx = idx // _WORD_BITS
+    bit_idx = (idx % _WORD_BITS).astype(_WORD_DTYPE)
+    selected = jnp.take(words, word_idx, axis=-1)
+    one = jnp.asarray(1, dtype=_WORD_DTYPE)
+    return jnp.not_equal(jnp.bitwise_and(jnp.right_shift(selected, bit_idx), one), 0)
+
+
+def black_bits(state: GomokuState) -> jnp.ndarray:
+    return unpack_bits(state.black_words, num_actions=_state_num_actions(state))
+
+
+def white_bits(state: GomokuState) -> jnp.ndarray:
+    return unpack_bits(state.white_words, num_actions=_state_num_actions(state))
+
+
+def color_bits(state: GomokuState) -> tuple[jnp.ndarray, jnp.ndarray]:
+    num_actions = _state_num_actions(state)
+    return (
+        unpack_bits(state.black_words, num_actions=num_actions),
+        unpack_bits(state.white_words, num_actions=num_actions),
+    )
+
+
+def occupied_bits(state: GomokuState) -> jnp.ndarray:
+    black, white = color_bits(state)
+    return black | white
+
+
+def current_player_bits(state: GomokuState) -> jnp.ndarray:
+    black, white = color_bits(state)
+    return jnp.where(_expand_mask(state.to_play == 1, black.ndim), black, white)
+
+
+def opponent_bits(state: GomokuState) -> jnp.ndarray:
+    black, white = color_bits(state)
+    return jnp.where(_expand_mask(state.to_play == 1, black.ndim), white, black)
+
+
+def player_view_bits(state: GomokuState) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    black, white = color_bits(state)
+    occupied = black | white
+    to_play_black = _expand_mask(state.to_play == 1, black.ndim)
+    my_bits = jnp.where(to_play_black, black, white)
+    opp_bits = jnp.where(to_play_black, white, black)
+    return my_bits, opp_bits, occupied
+
+
+def _bit_is_set(words: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    word_idx = action // _WORD_BITS
+    bit_idx = (action % _WORD_BITS).astype(_WORD_DTYPE)
+    word = words[word_idx]
+    one = jnp.asarray(1, dtype=_WORD_DTYPE)
+    return jnp.not_equal(jnp.bitwise_and(jnp.right_shift(word, bit_idx), one), 0)
+
+
+def _set_bit(words: jnp.ndarray, action: jnp.ndarray, enabled: jnp.ndarray) -> jnp.ndarray:
+    word_idx = action // _WORD_BITS
+    bit_idx = (action % _WORD_BITS).astype(_WORD_DTYPE)
+    mask = jnp.left_shift(jnp.asarray(1, dtype=_WORD_DTYPE), bit_idx)
+    current = words[word_idx]
+    updated = jnp.where(enabled, jnp.bitwise_or(current, mask), current)
+    return words.at[word_idx].set(updated)
+
+
 def _shift_bits(bits: jnp.ndarray, offset: int) -> jnp.ndarray:
     if offset <= 0:
         return bits
@@ -91,6 +224,31 @@ def _has_six_from_bits(bits: jnp.ndarray, board_size: int) -> jnp.ndarray:
     south = _has_line(bits, south_starts, board_size, line_len=6)
     diag_dr = _has_line(bits, dr_starts, board_size + 1, line_len=6)
     diag_dl = _has_line(bits, dl_starts, board_size - 1, line_len=6)
+    return east | south | diag_dr | diag_dl
+
+
+def _has_line_from_words(words: jnp.ndarray, board_size: int, *, offset: int, line_len: int) -> jnp.ndarray:
+    word_idx, bit_masks = _packed_line_tables(board_size, line_len, offset)
+    if word_idx.shape[0] == 0:
+        return jnp.bool_(False)
+    selected = words[word_idx]
+    hits = jnp.not_equal(jnp.bitwise_and(selected, bit_masks), jnp.asarray(0, dtype=_WORD_DTYPE))
+    return jnp.any(jnp.all(hits, axis=-1))
+
+
+def _has_five_from_words(words: jnp.ndarray, board_size: int) -> jnp.ndarray:
+    east = _has_line_from_words(words, board_size, offset=1, line_len=5)
+    south = _has_line_from_words(words, board_size, offset=board_size, line_len=5)
+    diag_dr = _has_line_from_words(words, board_size, offset=board_size + 1, line_len=5)
+    diag_dl = _has_line_from_words(words, board_size, offset=board_size - 1, line_len=5)
+    return east | south | diag_dr | diag_dl
+
+
+def _has_six_from_words(words: jnp.ndarray, board_size: int) -> jnp.ndarray:
+    east = _has_line_from_words(words, board_size, offset=1, line_len=6)
+    south = _has_line_from_words(words, board_size, offset=board_size, line_len=6)
+    diag_dr = _has_line_from_words(words, board_size, offset=board_size + 1, line_len=6)
+    diag_dl = _has_line_from_words(words, board_size, offset=board_size - 1, line_len=6)
     return east | south | diag_dr | diag_dl
 
 
@@ -189,10 +347,11 @@ def reset(
     swap_applied_flag: int = 0,
 ) -> GomokuState:
     num_actions = board_size * board_size
+    num_words = _num_words_for_actions(num_actions)
     return GomokuState(
         board=jnp.zeros((board_size, board_size), dtype=jnp.int8),
-        black_bits=jnp.zeros((num_actions,), dtype=jnp.bool_),
-        white_bits=jnp.zeros((num_actions,), dtype=jnp.bool_),
+        black_words=jnp.zeros((num_words,), dtype=_WORD_DTYPE),
+        white_words=jnp.zeros((num_words,), dtype=_WORD_DTYPE),
         to_play=jnp.int8(1),
         last_action=jnp.int32(-1),
         num_moves=jnp.int32(0),
@@ -205,9 +364,9 @@ def reset(
 
 
 def legal_action_mask(state: GomokuState) -> jnp.ndarray:
-    occupied = state.black_bits | state.white_bits
-    legal = ~occupied
-    return jnp.where(state.terminated, jnp.zeros_like(legal), legal)
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
+    legal = ~unpack_bits(occupied_words, num_actions=_state_num_actions(state))
+    return jnp.where(_expand_mask(state.terminated, legal.ndim), jnp.zeros_like(legal), legal)
 
 
 def step(state: GomokuState, action: jnp.ndarray):
@@ -216,11 +375,11 @@ def step(state: GomokuState, action: jnp.ndarray):
     action = jnp.int32(action)
     safe_action = jnp.clip(action, 0, num_actions - 1).astype(jnp.int32)
 
-    legal = legal_action_mask(state)
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
     in_range = (action >= 0) & (action < num_actions)
     legal_at_action = jax.lax.cond(
         in_range,
-        lambda a: legal[a],
+        lambda a: ~_bit_is_set(occupied_words, a),
         lambda _: jnp.bool_(False),
         operand=safe_action,
     )
@@ -229,7 +388,6 @@ def step(state: GomokuState, action: jnp.ndarray):
     col = safe_action % board_size
     can_play_proposed = (~state.terminated) & legal_at_action
 
-    black_set_proposed = can_play_proposed & (state.to_play == 1)
     board_after_proposed = jax.lax.cond(
         can_play_proposed,
         lambda b: b.at[row, col].set(state.to_play),
@@ -249,10 +407,10 @@ def step(state: GomokuState, action: jnp.ndarray):
 
     black_set = can_play & (state.to_play == 1)
     white_set = can_play & (state.to_play == -1)
-    black_after = state.black_bits.at[safe_action].set(state.black_bits[safe_action] | black_set)
-    white_after = state.white_bits.at[safe_action].set(state.white_bits[safe_action] | white_set)
+    black_after = _set_bit(state.black_words, safe_action, black_set)
+    white_after = _set_bit(state.white_words, safe_action, white_set)
 
-    player_bits_after = jax.lax.cond(
+    player_words_after = jax.lax.cond(
         state.to_play == 1,
         lambda _: black_after,
         lambda _: white_after,
@@ -260,7 +418,7 @@ def step(state: GomokuState, action: jnp.ndarray):
     )
     win = jax.lax.cond(
         can_play,
-        lambda _: _has_five_from_bits(player_bits_after, board_size),
+        lambda _: _has_five_from_words(player_words_after, board_size),
         lambda _: jnp.bool_(False),
         operand=None,
     )
@@ -281,8 +439,8 @@ def step(state: GomokuState, action: jnp.ndarray):
 
     next_state = GomokuState(
         board=board_after,
-        black_bits=black_after,
-        white_bits=white_after,
+        black_words=black_after,
+        white_words=white_after,
         to_play=next_to_play,
         last_action=last_action,
         num_moves=num_moves.astype(jnp.int32),
@@ -299,18 +457,7 @@ def encode_state(state: GomokuState) -> jnp.ndarray:
     board_size = state.board.shape[0]
     num_actions = board_size * board_size
 
-    mine_bits = jax.lax.cond(
-        state.to_play == 1,
-        lambda _: state.black_bits,
-        lambda _: state.white_bits,
-        operand=None,
-    )
-    opp_bits = jax.lax.cond(
-        state.to_play == 1,
-        lambda _: state.white_bits,
-        lambda _: state.black_bits,
-        operand=None,
-    )
+    mine_bits, opp_bits, _ = player_view_bits(state)
     mine = mine_bits.reshape(board_size, board_size).astype(jnp.float32)
     opp = opp_bits.reshape(board_size, board_size).astype(jnp.float32)
 

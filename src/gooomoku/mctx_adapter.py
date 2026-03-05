@@ -18,202 +18,187 @@ def _masked_logits(logits: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
 
 
 @functools.lru_cache(maxsize=None)
-def _line_window_indices_np(board_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _line_window_tables_np(
+    board_size: int,
+) -> tuple[
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+]:
     east_starts, south_starts, dr_starts, dl_starts = env._line_start_masks_np(board_size)
 
-    def make_indices(starts: np.ndarray, offset: int) -> np.ndarray:
+    def make_table(starts: np.ndarray, offset: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         start_idx = np.nonzero(starts)[0].astype(np.int32)
         if start_idx.size == 0:
-            return np.zeros((0, 5), dtype=np.int32)
-        offsets = np.arange(5, dtype=np.int32)[None, :] * np.int32(offset)
-        return start_idx[:, None] + offsets
+            action_idx = np.zeros((0, 5), dtype=np.int32)
+        else:
+            offsets = np.arange(5, dtype=np.int32)[None, :] * np.int32(offset)
+            action_idx = start_idx[:, None] + offsets
+        word_idx = action_idx // np.int32(32)
+        bit_idx = (action_idx % np.int32(32)).astype(np.uint32)
+        bit_masks = (np.uint32(1) << bit_idx).astype(np.uint32)
+        return action_idx, word_idx, bit_masks
 
     return (
-        make_indices(east_starts, 1),
-        make_indices(south_starts, board_size),
-        make_indices(dr_starts, board_size + 1),
-        make_indices(dl_starts, board_size - 1),
+        make_table(east_starts, 1),
+        make_table(south_starts, board_size),
+        make_table(dr_starts, board_size + 1),
+        make_table(dl_starts, board_size - 1),
     )
 
 
-def _line_window_indices(board_size: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    east, south, dr, dl = _line_window_indices_np(board_size)
-    return (
-        jnp.asarray(east, dtype=jnp.int32),
-        jnp.asarray(south, dtype=jnp.int32),
-        jnp.asarray(dr, dtype=jnp.int32),
-        jnp.asarray(dl, dtype=jnp.int32),
-    )
+def _line_window_tables(
+    board_size: int,
+) -> tuple[
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+]:
+    tables_np = _line_window_tables_np(board_size)
+
+    def as_jax(table_np):
+        action_idx, word_idx, bit_masks = table_np
+        return (
+            jnp.asarray(action_idx, dtype=jnp.int32),
+            jnp.asarray(word_idx, dtype=jnp.int32),
+            jnp.asarray(bit_masks, dtype=jnp.uint32),
+        )
+
+    return tuple(as_jax(table_np) for table_np in tables_np)
 
 
-def _segment_add(indices: jnp.ndarray, picks: jnp.ndarray, num_actions: int) -> jnp.ndarray:
-    if indices.shape[0] == 0:
+def _segment_add(action_indices: jnp.ndarray, picks: jnp.ndarray, num_actions: int) -> jnp.ndarray:
+    if action_indices.shape[0] == 0:
         return jnp.zeros((num_actions,), dtype=jnp.int32)
     return jnp.bincount(
-        indices.reshape(-1),
+        action_indices.reshape(-1),
         weights=picks.astype(jnp.int32).reshape(-1),
         length=num_actions,
     ).astype(jnp.int32)
 
 
-def _winning_counts_from_windows(
+def _window_hits(
+    words: jnp.ndarray,
     *,
-    player_bits: jnp.ndarray,
-    legal: jnp.ndarray,
-    window_indices: jnp.ndarray,
+    word_indices: jnp.ndarray,
+    bit_masks: jnp.ndarray,
+) -> jnp.ndarray:
+    if word_indices.shape[0] == 0:
+        return jnp.zeros((0, 5), dtype=jnp.bool_)
+    selected = words[word_indices]
+    return jnp.not_equal(jnp.bitwise_and(selected, bit_masks), jnp.uint32(0))
+
+
+def _window_pattern_counts(
+    *,
+    player_words: jnp.ndarray,
+    legal_words: jnp.ndarray,
+    action_indices: jnp.ndarray,
+    word_indices: jnp.ndarray,
+    bit_masks: jnp.ndarray,
+    target_stones: int,
+    target_empties: int,
     num_actions: int,
 ) -> jnp.ndarray:
-    if window_indices.shape[0] == 0:
+    if action_indices.shape[0] == 0:
         return jnp.zeros((num_actions,), dtype=jnp.int32)
-    stone_windows = player_bits[window_indices]
-    empty_windows = legal[window_indices]
-    winning_window = (jnp.sum(stone_windows.astype(jnp.int32), axis=1) == 4) & (
-        jnp.sum(empty_windows.astype(jnp.int32), axis=1) == 1
+    stone_windows = _window_hits(player_words, word_indices=word_indices, bit_masks=bit_masks)
+    empty_windows = _window_hits(legal_words, word_indices=word_indices, bit_masks=bit_masks)
+    matches = (jnp.sum(stone_windows.astype(jnp.int32), axis=1) == target_stones) & (
+        jnp.sum(empty_windows.astype(jnp.int32), axis=1) == target_empties
     )
-    winning_picks = winning_window[:, None] & empty_windows
-    return _segment_add(window_indices, winning_picks, num_actions)
+    picks = matches[:, None] & empty_windows
+    return _segment_add(action_indices, picks, num_actions)
 
 
-def _forcing_threat_counts_from_windows(
+def _winning_moves_for_words(
     *,
-    player_bits: jnp.ndarray,
-    legal: jnp.ndarray,
-    window_indices: jnp.ndarray,
-    num_actions: int,
-) -> jnp.ndarray:
-    if window_indices.shape[0] == 0:
-        return jnp.zeros((num_actions,), dtype=jnp.int32)
-    stone_windows = player_bits[window_indices]
-    empty_windows = legal[window_indices]
-    forcing_window = (jnp.sum(stone_windows.astype(jnp.int32), axis=1) == 3) & (
-        jnp.sum(empty_windows.astype(jnp.int32), axis=1) == 2
-    )
-    forcing_picks = forcing_window[:, None] & empty_windows
-    return _segment_add(window_indices, forcing_picks, num_actions)
-
-
-def _winning_moves_for_bits(
-    *,
-    player_bits: jnp.ndarray,
-    occupied: jnp.ndarray,
+    player_words: jnp.ndarray,
+    legal_bits: jnp.ndarray,
     board_size: int,
     num_actions: int,
 ) -> jnp.ndarray:
-    legal = ~occupied
-    east_idx, south_idx, dr_idx, dl_idx = _line_window_indices(board_size)
+    legal_words = env.pack_bits(legal_bits)
+    tables = _line_window_tables(board_size)
     counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    counts = counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=east_idx,
-        num_actions=num_actions,
-    )
-    counts = counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=south_idx,
-        num_actions=num_actions,
-    )
-    counts = counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dr_idx,
-        num_actions=num_actions,
-    )
-    counts = counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dl_idx,
-        num_actions=num_actions,
-    )
-    return legal & (counts > 0)
+    for action_idx, word_idx, bit_masks in tables:
+        counts = counts + _window_pattern_counts(
+            player_words=player_words,
+            legal_words=legal_words,
+            action_indices=action_idx,
+            word_indices=word_idx,
+            bit_masks=bit_masks,
+            target_stones=4,
+            target_empties=1,
+            num_actions=num_actions,
+        )
+    return legal_bits & (counts > 0)
 
 
-def _urgent_moves_for_player(
+def _urgent_moves_for_words(
     *,
-    player_bits: jnp.ndarray,
-    occupied: jnp.ndarray,
-    legal: jnp.ndarray,
+    player_words: jnp.ndarray,
+    legal_bits: jnp.ndarray,
     board_size: int,
     num_actions: int,
 ) -> jnp.ndarray:
-    del occupied
-    legal = legal.astype(jnp.bool_)
-
-    east_idx, south_idx, dr_idx, dl_idx = _line_window_indices(board_size)
+    legal_words = env.pack_bits(legal_bits)
+    tables = _line_window_tables(board_size)
 
     win_counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    win_counts = win_counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=east_idx,
-        num_actions=num_actions,
-    )
-    win_counts = win_counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=south_idx,
-        num_actions=num_actions,
-    )
-    win_counts = win_counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dr_idx,
-        num_actions=num_actions,
-    )
-    win_counts = win_counts + _winning_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dl_idx,
-        num_actions=num_actions,
-    )
-    win_mask = legal & (win_counts > 0)
+    for action_idx, word_idx, bit_masks in tables:
+        win_counts = win_counts + _window_pattern_counts(
+            player_words=player_words,
+            legal_words=legal_words,
+            action_indices=action_idx,
+            word_indices=word_idx,
+            bit_masks=bit_masks,
+            target_stones=4,
+            target_empties=1,
+            num_actions=num_actions,
+        )
+    win_mask = legal_bits & (win_counts > 0)
 
     forcing_counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    forcing_counts = forcing_counts + _forcing_threat_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=east_idx,
-        num_actions=num_actions,
-    )
-    forcing_counts = forcing_counts + _forcing_threat_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=south_idx,
-        num_actions=num_actions,
-    )
-    forcing_counts = forcing_counts + _forcing_threat_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dr_idx,
-        num_actions=num_actions,
-    )
-    forcing_counts = forcing_counts + _forcing_threat_counts_from_windows(
-        player_bits=player_bits,
-        legal=legal,
-        window_indices=dl_idx,
-        num_actions=num_actions,
-    )
-    forcing_mask = legal & (forcing_counts > 0)
+    for action_idx, word_idx, bit_masks in tables:
+        forcing_counts = forcing_counts + _window_pattern_counts(
+            player_words=player_words,
+            legal_words=legal_words,
+            action_indices=action_idx,
+            word_indices=word_idx,
+            bit_masks=bit_masks,
+            target_stones=3,
+            target_empties=2,
+            num_actions=num_actions,
+        )
+    forcing_mask = legal_bits & (forcing_counts > 0)
 
     num_winning_actions = jnp.sum(win_mask.astype(jnp.int32))
     remaining_win_after_move = (num_winning_actions - win_mask.astype(jnp.int32)) > 0
-    return legal & (win_mask | remaining_win_after_move | forcing_mask)
+    return legal_bits & (win_mask | remaining_win_after_move | forcing_mask)
+
+
+def _legal_bits_from_words(occupied_words: jnp.ndarray, *, num_actions: int, terminated: jnp.ndarray) -> jnp.ndarray:
+    legal = env.unpack_bits(jnp.bitwise_not(occupied_words), num_actions=num_actions)
+    return jnp.where(terminated, jnp.zeros_like(legal), legal)
 
 
 def _current_player_winning_mask(state: env.GomokuState) -> jnp.ndarray:
     board_size = int(state.board.shape[0])
-    num_actions = int(state.black_bits.shape[0])
-    my_bits = jax.lax.cond(
+    num_actions = board_size * board_size
+    my_words = jax.lax.cond(
         state.to_play == 1,
-        lambda _: state.black_bits,
-        lambda _: state.white_bits,
+        lambda _: state.black_words,
+        lambda _: state.white_words,
         operand=None,
     )
-    occupied = state.black_bits | state.white_bits
-    return _winning_moves_for_bits(
-        player_bits=my_bits,
-        occupied=occupied,
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
+    legal_bits = _legal_bits_from_words(occupied_words, num_actions=num_actions, terminated=state.terminated)
+    return _winning_moves_for_words(
+        player_words=my_words,
+        legal_bits=legal_bits,
         board_size=board_size,
         num_actions=num_actions,
     )
@@ -221,21 +206,19 @@ def _current_player_winning_mask(state: env.GomokuState) -> jnp.ndarray:
 
 def _opponent_threat_block_mask(state: env.GomokuState) -> jnp.ndarray:
     board_size = int(state.board.shape[0])
-    num_actions = int(state.black_bits.shape[0])
-
-    opp_bits = jax.lax.cond(
+    num_actions = board_size * board_size
+    opp_words = jax.lax.cond(
         state.to_play == 1,
-        lambda _: state.white_bits,
-        lambda _: state.black_bits,
+        lambda _: state.white_words,
+        lambda _: state.black_words,
         operand=None,
     )
-    occupied = state.black_bits | state.white_bits
-    legal = env.legal_action_mask(state)
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
+    legal_bits = _legal_bits_from_words(occupied_words, num_actions=num_actions, terminated=state.terminated)
     # Block all opponent next moves that would create immediate win or rush-four.
-    return _urgent_moves_for_player(
-        player_bits=opp_bits,
-        occupied=occupied,
-        legal=legal,
+    return _urgent_moves_for_words(
+        player_words=opp_words,
+        legal_bits=legal_bits,
         board_size=board_size,
         num_actions=num_actions,
     )
@@ -243,19 +226,18 @@ def _opponent_threat_block_mask(state: env.GomokuState) -> jnp.ndarray:
 
 def _current_player_urgent_mask(state: env.GomokuState) -> jnp.ndarray:
     board_size = int(state.board.shape[0])
-    num_actions = int(state.black_bits.shape[0])
-    my_bits = jax.lax.cond(
+    num_actions = board_size * board_size
+    my_words = jax.lax.cond(
         state.to_play == 1,
-        lambda _: state.black_bits,
-        lambda _: state.white_bits,
+        lambda _: state.black_words,
+        lambda _: state.white_words,
         operand=None,
     )
-    occupied = state.black_bits | state.white_bits
-    legal = env.legal_action_mask(state)
-    return _urgent_moves_for_player(
-        player_bits=my_bits,
-        occupied=occupied,
-        legal=legal,
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
+    legal_bits = _legal_bits_from_words(occupied_words, num_actions=num_actions, terminated=state.terminated)
+    return _urgent_moves_for_words(
+        player_words=my_words,
+        legal_bits=legal_bits,
         board_size=board_size,
         num_actions=num_actions,
     )
@@ -263,17 +245,18 @@ def _current_player_urgent_mask(state: env.GomokuState) -> jnp.ndarray:
 
 def _opponent_immediate_winning_mask(state: env.GomokuState) -> jnp.ndarray:
     board_size = int(state.board.shape[0])
-    num_actions = int(state.black_bits.shape[0])
-    opp_bits = jax.lax.cond(
+    num_actions = board_size * board_size
+    opp_words = jax.lax.cond(
         state.to_play == 1,
-        lambda _: state.white_bits,
-        lambda _: state.black_bits,
+        lambda _: state.white_words,
+        lambda _: state.black_words,
         operand=None,
     )
-    occupied = state.black_bits | state.white_bits
-    return _winning_moves_for_bits(
-        player_bits=opp_bits,
-        occupied=occupied,
+    occupied_words = jnp.bitwise_or(state.black_words, state.white_words)
+    legal_bits = _legal_bits_from_words(occupied_words, num_actions=num_actions, terminated=state.terminated)
+    return _winning_moves_for_words(
+        player_words=opp_words,
+        legal_bits=legal_bits,
         board_size=board_size,
         num_actions=num_actions,
     )

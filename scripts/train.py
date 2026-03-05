@@ -321,8 +321,8 @@ def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
         swap_applied_flag = jnp.zeros((batch,), dtype=jnp.int8)
     return env.GomokuState(
         board=jnp.zeros((batch, board_size, board_size), dtype=jnp.int8),
-        black_bits=black_bits,
-        white_bits=white_bits,
+        black_words=env.pack_bits(black_bits),
+        white_words=env.pack_bits(white_bits),
         to_play=jnp.where(to_play_black, jnp.int8(1), jnp.int8(-1)),
         last_action=last_action,
         num_moves=num_moves,
@@ -348,7 +348,8 @@ def _win1_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
 
 
 def _current_player_forbidden_mask(state: env.GomokuState) -> jnp.ndarray:
-    num_actions = int(state.black_bits.shape[0])
+    board_size = int(state.board.shape[0])
+    num_actions = board_size * board_size
     legal = env.legal_action_mask(state)
     can_forbid = (state.to_play == jnp.int8(1)) & (state.rule_flags != jnp.int8(0)) & (~state.terminated)
 
@@ -379,6 +380,103 @@ def _legality_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
     return jax.vmap(_current_player_forbidden_mask)(states)
 
 
+def _compute_training_loss(
+    *,
+    trainable,
+    model: PolicyValueNet,
+    obs: jnp.ndarray,
+    policy_target: jnp.ndarray,
+    value_target: jnp.ndarray,
+    horizon_target: jnp.ndarray,
+    model_rng: jnp.ndarray,
+    weight_decay: float,
+    value_loss_weight: float,
+    threat_loss_weight: float,
+    horizon_loss_weight: float,
+    legality_loss_weight: float,
+    win1_loss_weight: float,
+    intermediate_supervision_weight: float,
+):
+    use_intermediate = (
+        intermediate_supervision_weight > 0.0
+        and int(model.intermediate_supervision_stride) > 0
+        and int(model.blocks) > 1
+    )
+    if use_intermediate:
+        (
+            logits,
+            value,
+            threat_logits,
+            horizon_logit,
+            legality_logits,
+            win1_logits,
+            tap_policy_logits,
+            tap_values,
+        ) = model.apply(
+            trainable,
+            obs.astype(model.compute_dtype),
+            return_aux=True,
+            return_intermediate=True,
+            train=True,
+            rngs={"stochastic_depth": model_rng},
+        )
+    else:
+        logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
+            trainable,
+            obs.astype(model.compute_dtype),
+            return_aux=True,
+            train=True,
+            rngs={"stochastic_depth": model_rng},
+        )
+        tap_policy_logits = jnp.zeros((0, logits.shape[0], logits.shape[1]), dtype=logits.dtype)
+        tap_values = jnp.zeros((0, value.shape[0]), dtype=value.dtype)
+
+    logits = logits.astype(jnp.float32)
+    value = value.astype(jnp.float32)
+    threat_logits = threat_logits.astype(jnp.float32)
+    horizon_logit = horizon_logit.astype(jnp.float32)
+    legality_logits = legality_logits.astype(jnp.float32)
+    win1_logits = win1_logits.astype(jnp.float32)
+    tap_policy_logits = tap_policy_logits.astype(jnp.float32)
+    tap_values = tap_values.astype(jnp.float32)
+
+    policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
+    value_loss = jnp.mean(jnp.square(value - value_target))
+    threat_target = _threat_target_from_obs(obs)
+    threat_loss = _balanced_bce_loss(threat_logits, threat_target)
+    horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
+    horizon_pred = jax.nn.sigmoid(horizon_logit)
+    horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
+    legality_loss = jnp.float32(0.0)
+    if legality_loss_weight > 0.0:
+        legality_target = _legality_target_from_obs(obs)
+        legality_loss = _balanced_bce_loss(legality_logits, legality_target)
+    win1_loss = jnp.float32(0.0)
+    if win1_loss_weight > 0.0:
+        win1_target = _win1_target_from_obs(obs)
+        win1_loss = _balanced_bce_loss(win1_logits, win1_target)
+
+    intermediate_loss = jnp.float32(0.0)
+    if intermediate_supervision_weight > 0.0 and tap_policy_logits.shape[0] > 0:
+        aux_log_probs = jax.nn.log_softmax(tap_policy_logits, axis=-1)
+        aux_policy_loss = -jnp.mean(jnp.sum(policy_target[None, ...] * aux_log_probs, axis=-1))
+        aux_value_loss = jnp.mean(jnp.square(tap_values - value_target[None, ...]))
+        intermediate_loss = aux_policy_loss + jnp.float32(value_loss_weight) * aux_value_loss
+
+    reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
+    total_loss = (
+        policy_loss
+        + jnp.float32(value_loss_weight) * value_loss
+        + jnp.float32(threat_loss_weight) * threat_loss
+        + jnp.float32(horizon_loss_weight) * horizon_loss
+        + jnp.float32(legality_loss_weight) * legality_loss
+        + jnp.float32(win1_loss_weight) * win1_loss
+        + jnp.float32(intermediate_supervision_weight) * intermediate_loss
+        + reg
+    )
+    return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
+
+
 def make_single_train_step(
     model: PolicyValueNet,
     optimizer: optax.GradientTransformation,
@@ -388,47 +486,29 @@ def make_single_train_step(
     horizon_loss_weight: float,
     legality_loss_weight: float,
     win1_loss_weight: float,
+    intermediate_supervision_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
+    def train_step(params, opt_state, rng_key, obs, policy_target, value_target, horizon_target):
+        rng_key, model_key = jax.random.split(rng_key)
+
         def loss_fn(trainable):
-            logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
-                trainable,
-                obs.astype(model.compute_dtype),
-                return_aux=True,
+            return _compute_training_loss(
+                trainable=trainable,
+                model=model,
+                obs=obs,
+                policy_target=policy_target,
+                value_target=value_target,
+                horizon_target=horizon_target,
+                model_rng=model_key,
+                weight_decay=weight_decay,
+                value_loss_weight=value_loss_weight,
+                threat_loss_weight=threat_loss_weight,
+                horizon_loss_weight=horizon_loss_weight,
+                legality_loss_weight=legality_loss_weight,
+                win1_loss_weight=win1_loss_weight,
+                intermediate_supervision_weight=intermediate_supervision_weight,
             )
-            logits = logits.astype(jnp.float32)
-            value = value.astype(jnp.float32)
-            threat_logits = threat_logits.astype(jnp.float32)
-            horizon_logit = horizon_logit.astype(jnp.float32)
-            legality_logits = legality_logits.astype(jnp.float32)
-            win1_logits = win1_logits.astype(jnp.float32)
-            policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
-            value_loss = jnp.mean(jnp.square(value - value_target))
-            threat_target = _threat_target_from_obs(obs)
-            threat_loss = _balanced_bce_loss(threat_logits, threat_target)
-            horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
-            horizon_pred = jax.nn.sigmoid(horizon_logit)
-            horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
-            legality_loss = jnp.float32(0.0)
-            if legality_loss_weight > 0.0:
-                legality_target = _legality_target_from_obs(obs)
-                legality_loss = _balanced_bce_loss(legality_logits, legality_target)
-            win1_loss = jnp.float32(0.0)
-            if win1_loss_weight > 0.0:
-                win1_target = _win1_target_from_obs(obs)
-                win1_loss = _balanced_bce_loss(win1_logits, win1_target)
-            reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = (
-                policy_loss
-                + jnp.float32(value_loss_weight) * value_loss
-                + jnp.float32(threat_loss_weight) * threat_loss
-                + jnp.float32(horizon_loss_weight) * horizon_loss
-                + jnp.float32(legality_loss_weight) * legality_loss
-                + jnp.float32(win1_loss_weight) * win1_loss
-                + reg
-            )
-            return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
         (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
             loss_fn,
@@ -436,7 +516,7 @@ def make_single_train_step(
         )(params)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss
+        return new_params, new_opt_state, rng_key, loss, policy_loss, value_loss, threat_loss, horizon_loss
 
     return train_step
 
@@ -450,47 +530,29 @@ def make_pmap_train_step(
     horizon_loss_weight: float,
     legality_loss_weight: float,
     win1_loss_weight: float,
+    intermediate_supervision_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
+    def train_step(params, opt_state, rng_key, obs, policy_target, value_target, horizon_target):
+        rng_key, model_key = jax.random.split(rng_key)
+
         def loss_fn(trainable):
-            logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
-                trainable,
-                obs.astype(model.compute_dtype),
-                return_aux=True,
+            return _compute_training_loss(
+                trainable=trainable,
+                model=model,
+                obs=obs,
+                policy_target=policy_target,
+                value_target=value_target,
+                horizon_target=horizon_target,
+                model_rng=model_key,
+                weight_decay=weight_decay,
+                value_loss_weight=value_loss_weight,
+                threat_loss_weight=threat_loss_weight,
+                horizon_loss_weight=horizon_loss_weight,
+                legality_loss_weight=legality_loss_weight,
+                win1_loss_weight=win1_loss_weight,
+                intermediate_supervision_weight=intermediate_supervision_weight,
             )
-            logits = logits.astype(jnp.float32)
-            value = value.astype(jnp.float32)
-            threat_logits = threat_logits.astype(jnp.float32)
-            horizon_logit = horizon_logit.astype(jnp.float32)
-            legality_logits = legality_logits.astype(jnp.float32)
-            win1_logits = win1_logits.astype(jnp.float32)
-            policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
-            value_loss = jnp.mean(jnp.square(value - value_target))
-            threat_target = _threat_target_from_obs(obs)
-            threat_loss = _balanced_bce_loss(threat_logits, threat_target)
-            horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
-            horizon_pred = jax.nn.sigmoid(horizon_logit)
-            horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
-            legality_loss = jnp.float32(0.0)
-            if legality_loss_weight > 0.0:
-                legality_target = _legality_target_from_obs(obs)
-                legality_loss = _balanced_bce_loss(legality_logits, legality_target)
-            win1_loss = jnp.float32(0.0)
-            if win1_loss_weight > 0.0:
-                win1_target = _win1_target_from_obs(obs)
-                win1_loss = _balanced_bce_loss(win1_logits, win1_target)
-            reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-            total_loss = (
-                policy_loss
-                + jnp.float32(value_loss_weight) * value_loss
-                + jnp.float32(threat_loss_weight) * threat_loss
-                + jnp.float32(horizon_loss_weight) * horizon_loss
-                + jnp.float32(legality_loss_weight) * legality_loss
-                + jnp.float32(win1_loss_weight) * win1_loss
-                + reg
-            )
-            return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
         (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
             loss_fn,
@@ -504,7 +566,7 @@ def make_pmap_train_step(
         horizon_loss = jax.lax.pmean(horizon_loss, axis_name="device")
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss
+        return new_params, new_opt_state, rng_key, loss, policy_loss, value_loss, threat_loss, horizon_loss
 
     return train_step
 
@@ -518,51 +580,32 @@ def make_single_multi_train_step(
     horizon_loss_weight: float,
     legality_loss_weight: float,
     win1_loss_weight: float,
+    intermediate_supervision_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
+    def train_step(params, opt_state, rng_key, obs_batches, policy_batches, value_batches, horizon_batches):
         def one_update(carry, inputs):
-            current_params, current_opt_state = carry
+            current_params, current_opt_state, current_rng = carry
             obs, policy_target, value_target, horizon_target = inputs
+            current_rng, model_key = jax.random.split(current_rng)
 
             def loss_fn(trainable):
-                logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
-                    trainable,
-                    obs.astype(model.compute_dtype),
-                    return_aux=True,
+                return _compute_training_loss(
+                    trainable=trainable,
+                    model=model,
+                    obs=obs,
+                    policy_target=policy_target,
+                    value_target=value_target,
+                    horizon_target=horizon_target,
+                    model_rng=model_key,
+                    weight_decay=weight_decay,
+                    value_loss_weight=value_loss_weight,
+                    threat_loss_weight=threat_loss_weight,
+                    horizon_loss_weight=horizon_loss_weight,
+                    legality_loss_weight=legality_loss_weight,
+                    win1_loss_weight=win1_loss_weight,
+                    intermediate_supervision_weight=intermediate_supervision_weight,
                 )
-                logits = logits.astype(jnp.float32)
-                value = value.astype(jnp.float32)
-                threat_logits = threat_logits.astype(jnp.float32)
-                horizon_logit = horizon_logit.astype(jnp.float32)
-                legality_logits = legality_logits.astype(jnp.float32)
-                win1_logits = win1_logits.astype(jnp.float32)
-                policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
-                value_loss = jnp.mean(jnp.square(value - value_target))
-                threat_target = _threat_target_from_obs(obs)
-                threat_loss = _balanced_bce_loss(threat_logits, threat_target)
-                horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
-                horizon_pred = jax.nn.sigmoid(horizon_logit)
-                horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
-                legality_loss = jnp.float32(0.0)
-                if legality_loss_weight > 0.0:
-                    legality_target = _legality_target_from_obs(obs)
-                    legality_loss = _balanced_bce_loss(legality_logits, legality_target)
-                win1_loss = jnp.float32(0.0)
-                if win1_loss_weight > 0.0:
-                    win1_target = _win1_target_from_obs(obs)
-                    win1_loss = _balanced_bce_loss(win1_logits, win1_target)
-                reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = (
-                    policy_loss
-                    + jnp.float32(value_loss_weight) * value_loss
-                    + jnp.float32(threat_loss_weight) * threat_loss
-                    + jnp.float32(horizon_loss_weight) * horizon_loss
-                    + jnp.float32(legality_loss_weight) * legality_loss
-                    + jnp.float32(win1_loss_weight) * win1_loss
-                    + reg
-                )
-                return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
             (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
                 loss_fn,
@@ -570,16 +613,17 @@ def make_single_multi_train_step(
             )(current_params)
             updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
             next_params = optax.apply_updates(current_params, updates)
-            return (next_params, next_opt_state), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
+            return (next_params, next_opt_state, current_rng), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (new_params, new_opt_state), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
+        (new_params, new_opt_state, new_rng_key), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
             one_update,
-            (params, opt_state),
+            (params, opt_state, rng_key),
             (obs_batches, policy_batches, value_batches, horizon_batches),
         )
         return (
             new_params,
             new_opt_state,
+            new_rng_key,
             jnp.mean(losses),
             jnp.mean(policy_losses),
             jnp.mean(value_losses),
@@ -599,51 +643,32 @@ def make_pmap_multi_train_step(
     horizon_loss_weight: float,
     legality_loss_weight: float,
     win1_loss_weight: float,
+    intermediate_supervision_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
-    def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
+    def train_step(params, opt_state, rng_key, obs_batches, policy_batches, value_batches, horizon_batches):
         def one_update(carry, inputs):
-            current_params, current_opt_state = carry
+            current_params, current_opt_state, current_rng = carry
             obs, policy_target, value_target, horizon_target = inputs
+            current_rng, model_key = jax.random.split(current_rng)
 
             def loss_fn(trainable):
-                logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
-                    trainable,
-                    obs.astype(model.compute_dtype),
-                    return_aux=True,
+                return _compute_training_loss(
+                    trainable=trainable,
+                    model=model,
+                    obs=obs,
+                    policy_target=policy_target,
+                    value_target=value_target,
+                    horizon_target=horizon_target,
+                    model_rng=model_key,
+                    weight_decay=weight_decay,
+                    value_loss_weight=value_loss_weight,
+                    threat_loss_weight=threat_loss_weight,
+                    horizon_loss_weight=horizon_loss_weight,
+                    legality_loss_weight=legality_loss_weight,
+                    win1_loss_weight=win1_loss_weight,
+                    intermediate_supervision_weight=intermediate_supervision_weight,
                 )
-                logits = logits.astype(jnp.float32)
-                value = value.astype(jnp.float32)
-                threat_logits = threat_logits.astype(jnp.float32)
-                horizon_logit = horizon_logit.astype(jnp.float32)
-                legality_logits = legality_logits.astype(jnp.float32)
-                win1_logits = win1_logits.astype(jnp.float32)
-                policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
-                value_loss = jnp.mean(jnp.square(value - value_target))
-                threat_target = _threat_target_from_obs(obs)
-                threat_loss = _balanced_bce_loss(threat_logits, threat_target)
-                horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
-                horizon_pred = jax.nn.sigmoid(horizon_logit)
-                horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
-                legality_loss = jnp.float32(0.0)
-                if legality_loss_weight > 0.0:
-                    legality_target = _legality_target_from_obs(obs)
-                    legality_loss = _balanced_bce_loss(legality_logits, legality_target)
-                win1_loss = jnp.float32(0.0)
-                if win1_loss_weight > 0.0:
-                    win1_target = _win1_target_from_obs(obs)
-                    win1_loss = _balanced_bce_loss(win1_logits, win1_target)
-                reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
-                total_loss = (
-                    policy_loss
-                    + jnp.float32(value_loss_weight) * value_loss
-                    + jnp.float32(threat_loss_weight) * threat_loss
-                    + jnp.float32(horizon_loss_weight) * horizon_loss
-                    + jnp.float32(legality_loss_weight) * legality_loss
-                    + jnp.float32(win1_loss_weight) * win1_loss
-                    + reg
-                )
-                return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
 
             (loss, (policy_loss, value_loss, threat_loss, horizon_loss)), grads = jax.value_and_grad(
                 loss_fn,
@@ -657,16 +682,17 @@ def make_pmap_multi_train_step(
             horizon_loss = jax.lax.pmean(horizon_loss, axis_name="device")
             updates, next_opt_state = optimizer.update(grads, current_opt_state, current_params)
             next_params = optax.apply_updates(current_params, updates)
-            return (next_params, next_opt_state), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
+            return (next_params, next_opt_state, current_rng), (loss, policy_loss, value_loss, threat_loss, horizon_loss)
 
-        (new_params, new_opt_state), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
+        (new_params, new_opt_state, new_rng_key), (losses, policy_losses, value_losses, threat_losses, horizon_losses) = jax.lax.scan(
             one_update,
-            (params, opt_state),
+            (params, opt_state, rng_key),
             (obs_batches, policy_batches, value_batches, horizon_batches),
         )
         return (
             new_params,
             new_opt_state,
+            new_rng_key,
             jnp.mean(losses),
             jnp.mean(policy_losses),
             jnp.mean(value_losses),
@@ -1322,6 +1348,9 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "horizon_loss_weight": args.horizon_loss_weight,
         "legality_loss_weight": args.legality_loss_weight,
         "win1_loss_weight": args.win1_loss_weight,
+        "stochastic_depth_rate": args.stochastic_depth_rate,
+        "intermediate_supervision_weight": args.intermediate_supervision_weight,
+        "intermediate_supervision_stride": args.intermediate_supervision_stride,
         "ema_decay": args.ema_decay,
         "compute_dtype": args.compute_dtype,
         "param_dtype": args.param_dtype,
@@ -2367,9 +2396,12 @@ def main() -> None:
     parser.add_argument("--horizon-loss-weight", type=float, default=0.02)
     parser.add_argument("--legality-loss-weight", type=float, default=0.0)
     parser.add_argument("--win1-loss-weight", type=float, default=0.0)
+    parser.add_argument("--stochastic-depth-rate", type=float, default=0.10)
+    parser.add_argument("--intermediate-supervision-weight", type=float, default=0.20)
+    parser.add_argument("--intermediate-supervision-stride", type=int, default=2)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
-    parser.add_argument("--param-dtype", type=str, default="float32")
+    parser.add_argument("--param-dtype", type=str, default="bfloat16")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
@@ -2540,6 +2572,12 @@ def main() -> None:
         raise ValueError("legality-loss-weight must be >= 0")
     if args.win1_loss_weight < 0:
         raise ValueError("win1-loss-weight must be >= 0")
+    if not (0.0 <= args.stochastic_depth_rate < 1.0):
+        raise ValueError("stochastic-depth-rate must be in [0, 1)")
+    if args.intermediate_supervision_weight < 0:
+        raise ValueError("intermediate-supervision-weight must be >= 0")
+    if args.intermediate_supervision_stride < 0:
+        raise ValueError("intermediate-supervision-stride must be >= 0")
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError("ema-decay must be in [0, 1)")
     compute_dtype = _dtype_from_name(args.compute_dtype)
@@ -2648,6 +2686,8 @@ def main() -> None:
         channels=args.channels,
         blocks=args.blocks,
         max_attention_heads=args.max_attention_heads,
+        stochastic_depth_rate=args.stochastic_depth_rate,
+        intermediate_supervision_stride=args.intermediate_supervision_stride,
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
     )
@@ -2659,6 +2699,8 @@ def main() -> None:
             channels=args.channels,
             blocks=effective_search_blocks,
             max_attention_heads=args.max_attention_heads,
+            stochastic_depth_rate=args.stochastic_depth_rate,
+            intermediate_supervision_stride=args.intermediate_supervision_stride,
             compute_dtype=compute_dtype,
             param_dtype=param_dtype,
         )
@@ -2704,7 +2746,17 @@ def main() -> None:
     if args.resume_from is not None:
         payload = _load_checkpoint_payload(args.resume_from)
         resume_cfg = payload.get("config", {})
-        for key in ("board_size", "obs_planes", "channels", "blocks", "max_attention_heads", "compute_dtype", "param_dtype"):
+        for key in (
+            "board_size",
+            "obs_planes",
+            "channels",
+            "blocks",
+            "max_attention_heads",
+            "stochastic_depth_rate",
+            "intermediate_supervision_stride",
+            "compute_dtype",
+            "param_dtype",
+        ):
             cfg_val = resume_cfg.get(key)
             arg_val = int(env.OBS_PLANES) if key == "obs_planes" else getattr(args, key)
             if cfg_val is not None and str(cfg_val) != str(arg_val):
@@ -2912,6 +2964,7 @@ def main() -> None:
             horizon_loss_weight=args.horizon_loss_weight,
             legality_loss_weight=args.legality_loss_weight,
             win1_loss_weight=args.win1_loss_weight,
+            intermediate_supervision_weight=args.intermediate_supervision_weight,
         )
         train_step_multi = make_pmap_multi_train_step(
             train_model,
@@ -2922,6 +2975,7 @@ def main() -> None:
             horizon_loss_weight=args.horizon_loss_weight,
             legality_loss_weight=args.legality_loss_weight,
             win1_loss_weight=args.win1_loss_weight,
+            intermediate_supervision_weight=args.intermediate_supervision_weight,
         )
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
@@ -2949,6 +3003,9 @@ def main() -> None:
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
             f"horizon_loss_weight={args.horizon_loss_weight:.3f}, "
             f"legality_loss_weight={args.legality_loss_weight:.3f}, win1_loss_weight={args.win1_loss_weight:.3f}, "
+            f"stochastic_depth_rate={args.stochastic_depth_rate:.3f}, "
+            f"intermediate_supervision_weight={args.intermediate_supervision_weight:.3f}, "
+            f"intermediate_supervision_stride={args.intermediate_supervision_stride}, "
             f"grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
@@ -2964,6 +3021,7 @@ def main() -> None:
             horizon_loss_weight=args.horizon_loss_weight,
             legality_loss_weight=args.legality_loss_weight,
             win1_loss_weight=args.win1_loss_weight,
+            intermediate_supervision_weight=args.intermediate_supervision_weight,
         )
         train_step_multi = make_single_multi_train_step(
             train_model,
@@ -2974,6 +3032,7 @@ def main() -> None:
             horizon_loss_weight=args.horizon_loss_weight,
             legality_loss_weight=args.legality_loss_weight,
             win1_loss_weight=args.win1_loss_weight,
+            intermediate_supervision_weight=args.intermediate_supervision_weight,
         )
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
@@ -2998,6 +3057,9 @@ def main() -> None:
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
             f"horizon_loss_weight={args.horizon_loss_weight:.3f}, "
             f"legality_loss_weight={args.legality_loss_weight:.3f}, win1_loss_weight={args.win1_loss_weight:.3f}, "
+            f"stochastic_depth_rate={args.stochastic_depth_rate:.3f}, "
+            f"intermediate_supervision_weight={args.intermediate_supervision_weight:.3f}, "
+            f"intermediate_supervision_stride={args.intermediate_supervision_stride}, "
             f"grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
@@ -3586,14 +3648,19 @@ def main() -> None:
                     policy_stack = jnp.swapaxes(policy_stack, 0, 1)
                     value_stack = jnp.swapaxes(value_stack, 0, 1)
                     horizon_stack = jnp.swapaxes(horizon_stack, 0, 1)
-                params, opt_state, loss_mean, policy_mean, value_mean, threat_mean, horizon_mean = train_step_multi(
+                rng_key, train_step_key = jax.random.split(rng_key)
+                if use_pmap:
+                    train_step_key = jax.random.split(train_step_key, local_devices)
+                params, opt_state, _train_step_key, loss_mean, policy_mean, value_mean, threat_mean, horizon_mean = train_step_multi(
                     params,
                     opt_state,
+                    train_step_key,
                     obs_stack,
                     policy_stack,
                     value_stack,
                     horizon_stack,
                 )
+                del _train_step_key
                 if use_pmap:
                     loss_scalar = float(loss_mean[0])
                     policy_scalar = float(policy_mean[0])
@@ -3661,28 +3728,35 @@ def main() -> None:
                         policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
                         value_target = value_target.reshape((local_devices, per_device_batch))
                         horizon_target = horizon_target.reshape((local_devices, per_device_batch))
-                        params, opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
+                        rng_key, train_step_key = jax.random.split(rng_key)
+                        train_step_key = jax.random.split(train_step_key, local_devices)
+                        params, opt_state, _train_step_key, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
                             params,
                             opt_state,
+                            train_step_key,
                             obs,
                             policy_target,
                             value_target,
                             horizon_target,
                         )
+                        del _train_step_key
                         loss_sum += float(loss[0])
                         policy_sum += float(policy_loss[0])
                         value_sum += float(value_loss[0])
                         threat_sum += float(threat_loss[0])
                         horizon_sum += float(horizon_loss[0])
                     else:
-                        params, opt_state, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
+                        rng_key, train_step_key = jax.random.split(rng_key)
+                        params, opt_state, _train_step_key, loss, policy_loss, value_loss, threat_loss, horizon_loss = train_step(
                             params,
                             opt_state,
+                            train_step_key,
                             obs,
                             policy_target,
                             value_target,
                             horizon_target,
                         )
+                        del _train_step_key
                         loss_sum += float(loss)
                         policy_sum += float(policy_loss)
                         value_sum += float(value_loss)

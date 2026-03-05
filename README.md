@@ -51,7 +51,7 @@ PYTHONPATH=src python scripts/train.py \
   --arena-games 64 \
   --arena-replace-threshold 0.55 \
   --compute-dtype bfloat16 \
-  --param-dtype float32 \
+  --param-dtype bfloat16 \
   --lr 1e-3 \
   --lr-warmup-steps 100 \
   --lr-end-value 1e-4 \
@@ -174,7 +174,7 @@ gcloud compute tpus tpu-vm ssh node-1 \
     --board-size 15 --channels 96 --blocks 8 \
     --train-steps 300 --updates-per-step 16 --batch-size 1024 \
     --replay-size 100000 --num-simulations 64 --max-num-considered-actions 64 \
-    --compute-dtype bfloat16 --param-dtype float32 \
+    --compute-dtype bfloat16 --param-dtype bfloat16 \
     --checkpoint-every-steps 0 --arena-every-steps 0 \
     --output /tmp/gooomoku_latest.pkl"
 
@@ -189,7 +189,7 @@ gcloud compute tpus tpu-vm ssh node-1 \
     --board-size 15 --channels 96 --blocks 8 \
     --selfplay-batch-games 128 \
     --num-simulations 64 --max-num-considered-actions 64 \
-    --compute-dtype bfloat16 --param-dtype float32 \
+    --compute-dtype bfloat16 --param-dtype bfloat16 \
     --actor-sync-every-batches 8 --actor-steps 0"
 ```
 
@@ -224,7 +224,7 @@ PYTHONPATH=src python scripts/web_play.py \
   --num-simulations 256 \
   --max-num-considered-actions 64 \
   --compute-dtype bfloat16 \
-  --param-dtype float32 \
+  --param-dtype bfloat16 \
   --host 127.0.0.1 \
   --port 8000
 ```
@@ -260,7 +260,7 @@ Your training command contains these architecture/search arguments that must mat
 - `--num-simulations 256`
 - `--max-num-considered-actions 64`
 - `--compute-dtype bfloat16`
-- `--param-dtype float32`
+- `--param-dtype bfloat16`
 
 `scripts/web_play.py` will prefer checkpoint `config` values if present, otherwise it falls back to the CLI values above.
 
