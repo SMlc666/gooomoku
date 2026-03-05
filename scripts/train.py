@@ -280,6 +280,16 @@ def _l2_regularization(params) -> jnp.ndarray:
     )
 
 
+def _balanced_bce_loss(logits: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    target_f = target.astype(jnp.float32)
+    bce = optax.sigmoid_binary_cross_entropy(logits, target_f)
+    positives = jnp.sum(target_f)
+    negatives = jnp.asarray(target_f.size, dtype=jnp.float32) - positives
+    pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
+    weights = jnp.where(target_f > 0.5, pos_weight, jnp.float32(1.0))
+    return jnp.mean(bce * weights)
+
+
 def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
     batch = obs.shape[0]
     board_size = obs.shape[1]
@@ -332,6 +342,43 @@ def _threat_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
     return (win_mask | block_mask) & legal
 
 
+def _win1_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
+    states = _states_from_obs_for_aux(obs)
+    return jax.vmap(_current_player_winning_mask)(states)
+
+
+def _current_player_forbidden_mask(state: env.GomokuState) -> jnp.ndarray:
+    num_actions = int(state.black_bits.shape[0])
+    legal = env.legal_action_mask(state)
+    can_forbid = (state.to_play == jnp.int8(1)) & (state.rule_flags != jnp.int8(0)) & (~state.terminated)
+
+    def compute(_):
+        actions = jnp.arange(num_actions, dtype=jnp.int32)
+
+        def one_action(action: jnp.ndarray) -> jnp.ndarray:
+            next_state, _, _ = env.step(state, action)
+            return (
+                legal[action]
+                & next_state.terminated
+                & (next_state.winner == jnp.int8(-1))
+                & (next_state.num_moves == state.num_moves)
+            )
+
+        return jax.vmap(one_action)(actions)
+
+    return jax.lax.cond(
+        can_forbid,
+        compute,
+        lambda _: jnp.zeros((num_actions,), dtype=jnp.bool_),
+        operand=None,
+    )
+
+
+def _legality_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
+    states = _states_from_obs_for_aux(obs)
+    return jax.vmap(_current_player_forbidden_mask)(states)
+
+
 def make_single_train_step(
     model: PolicyValueNet,
     optimizer: optax.GradientTransformation,
@@ -339,11 +386,13 @@ def make_single_train_step(
     value_loss_weight: float,
     threat_loss_weight: float,
     horizon_loss_weight: float,
+    legality_loss_weight: float,
+    win1_loss_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
         def loss_fn(trainable):
-            logits, value, threat_logits, horizon_logit = model.apply(
+            logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
                 trainable,
                 obs.astype(model.compute_dtype),
                 return_aux=True,
@@ -352,24 +401,31 @@ def make_single_train_step(
             value = value.astype(jnp.float32)
             threat_logits = threat_logits.astype(jnp.float32)
             horizon_logit = horizon_logit.astype(jnp.float32)
+            legality_logits = legality_logits.astype(jnp.float32)
+            win1_logits = win1_logits.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
-            threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
-            threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
-            positives = jnp.sum(threat_target)
-            negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
-            pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
-            threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
-            threat_loss = jnp.mean(threat_bce * threat_weights)
+            threat_target = _threat_target_from_obs(obs)
+            threat_loss = _balanced_bce_loss(threat_logits, threat_target)
             horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
             horizon_pred = jax.nn.sigmoid(horizon_logit)
             horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
+            legality_loss = jnp.float32(0.0)
+            if legality_loss_weight > 0.0:
+                legality_target = _legality_target_from_obs(obs)
+                legality_loss = _balanced_bce_loss(legality_logits, legality_target)
+            win1_loss = jnp.float32(0.0)
+            if win1_loss_weight > 0.0:
+                win1_target = _win1_target_from_obs(obs)
+                win1_loss = _balanced_bce_loss(win1_logits, win1_target)
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
             total_loss = (
                 policy_loss
                 + jnp.float32(value_loss_weight) * value_loss
                 + jnp.float32(threat_loss_weight) * threat_loss
                 + jnp.float32(horizon_loss_weight) * horizon_loss
+                + jnp.float32(legality_loss_weight) * legality_loss
+                + jnp.float32(win1_loss_weight) * win1_loss
                 + reg
             )
             return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
@@ -392,11 +448,13 @@ def make_pmap_train_step(
     value_loss_weight: float,
     threat_loss_weight: float,
     horizon_loss_weight: float,
+    legality_loss_weight: float,
+    win1_loss_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs, policy_target, value_target, horizon_target):
         def loss_fn(trainable):
-            logits, value, threat_logits, horizon_logit = model.apply(
+            logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
                 trainable,
                 obs.astype(model.compute_dtype),
                 return_aux=True,
@@ -405,24 +463,31 @@ def make_pmap_train_step(
             value = value.astype(jnp.float32)
             threat_logits = threat_logits.astype(jnp.float32)
             horizon_logit = horizon_logit.astype(jnp.float32)
+            legality_logits = legality_logits.astype(jnp.float32)
+            win1_logits = win1_logits.astype(jnp.float32)
             policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
             value_loss = jnp.mean(jnp.square(value - value_target))
-            threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
-            threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
-            positives = jnp.sum(threat_target)
-            negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
-            pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
-            threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
-            threat_loss = jnp.mean(threat_bce * threat_weights)
+            threat_target = _threat_target_from_obs(obs)
+            threat_loss = _balanced_bce_loss(threat_logits, threat_target)
             horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
             horizon_pred = jax.nn.sigmoid(horizon_logit)
             horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
+            legality_loss = jnp.float32(0.0)
+            if legality_loss_weight > 0.0:
+                legality_target = _legality_target_from_obs(obs)
+                legality_loss = _balanced_bce_loss(legality_logits, legality_target)
+            win1_loss = jnp.float32(0.0)
+            if win1_loss_weight > 0.0:
+                win1_target = _win1_target_from_obs(obs)
+                win1_loss = _balanced_bce_loss(win1_logits, win1_target)
             reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
             total_loss = (
                 policy_loss
                 + jnp.float32(value_loss_weight) * value_loss
                 + jnp.float32(threat_loss_weight) * threat_loss
                 + jnp.float32(horizon_loss_weight) * horizon_loss
+                + jnp.float32(legality_loss_weight) * legality_loss
+                + jnp.float32(win1_loss_weight) * win1_loss
                 + reg
             )
             return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
@@ -451,6 +516,8 @@ def make_single_multi_train_step(
     value_loss_weight: float,
     threat_loss_weight: float,
     horizon_loss_weight: float,
+    legality_loss_weight: float,
+    win1_loss_weight: float,
 ):
     @functools.partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
@@ -459,7 +526,7 @@ def make_single_multi_train_step(
             obs, policy_target, value_target, horizon_target = inputs
 
             def loss_fn(trainable):
-                logits, value, threat_logits, horizon_logit = model.apply(
+                logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
                     trainable,
                     obs.astype(model.compute_dtype),
                     return_aux=True,
@@ -468,24 +535,31 @@ def make_single_multi_train_step(
                 value = value.astype(jnp.float32)
                 threat_logits = threat_logits.astype(jnp.float32)
                 horizon_logit = horizon_logit.astype(jnp.float32)
+                legality_logits = legality_logits.astype(jnp.float32)
+                win1_logits = win1_logits.astype(jnp.float32)
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
-                threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
-                threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
-                positives = jnp.sum(threat_target)
-                negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
-                pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
-                threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
-                threat_loss = jnp.mean(threat_bce * threat_weights)
+                threat_target = _threat_target_from_obs(obs)
+                threat_loss = _balanced_bce_loss(threat_logits, threat_target)
                 horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
                 horizon_pred = jax.nn.sigmoid(horizon_logit)
                 horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
+                legality_loss = jnp.float32(0.0)
+                if legality_loss_weight > 0.0:
+                    legality_target = _legality_target_from_obs(obs)
+                    legality_loss = _balanced_bce_loss(legality_logits, legality_target)
+                win1_loss = jnp.float32(0.0)
+                if win1_loss_weight > 0.0:
+                    win1_target = _win1_target_from_obs(obs)
+                    win1_loss = _balanced_bce_loss(win1_logits, win1_target)
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
                 total_loss = (
                     policy_loss
                     + jnp.float32(value_loss_weight) * value_loss
                     + jnp.float32(threat_loss_weight) * threat_loss
                     + jnp.float32(horizon_loss_weight) * horizon_loss
+                    + jnp.float32(legality_loss_weight) * legality_loss
+                    + jnp.float32(win1_loss_weight) * win1_loss
                     + reg
                 )
                 return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
@@ -523,6 +597,8 @@ def make_pmap_multi_train_step(
     value_loss_weight: float,
     threat_loss_weight: float,
     horizon_loss_weight: float,
+    legality_loss_weight: float,
+    win1_loss_weight: float,
 ):
     @functools.partial(jax.pmap, axis_name="device", donate_argnums=(0, 1))
     def train_step(params, opt_state, obs_batches, policy_batches, value_batches, horizon_batches):
@@ -531,7 +607,7 @@ def make_pmap_multi_train_step(
             obs, policy_target, value_target, horizon_target = inputs
 
             def loss_fn(trainable):
-                logits, value, threat_logits, horizon_logit = model.apply(
+                logits, value, threat_logits, horizon_logit, legality_logits, win1_logits = model.apply(
                     trainable,
                     obs.astype(model.compute_dtype),
                     return_aux=True,
@@ -540,24 +616,31 @@ def make_pmap_multi_train_step(
                 value = value.astype(jnp.float32)
                 threat_logits = threat_logits.astype(jnp.float32)
                 horizon_logit = horizon_logit.astype(jnp.float32)
+                legality_logits = legality_logits.astype(jnp.float32)
+                win1_logits = win1_logits.astype(jnp.float32)
                 policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
                 value_loss = jnp.mean(jnp.square(value - value_target))
-                threat_target = _threat_target_from_obs(obs).astype(jnp.float32)
-                threat_bce = optax.sigmoid_binary_cross_entropy(threat_logits, threat_target)
-                positives = jnp.sum(threat_target)
-                negatives = jnp.asarray(threat_target.size, dtype=jnp.float32) - positives
-                pos_weight = jnp.clip(negatives / jnp.maximum(positives, 1.0), 1.0, 16.0)
-                threat_weights = jnp.where(threat_target > 0.5, pos_weight, jnp.float32(1.0))
-                threat_loss = jnp.mean(threat_bce * threat_weights)
+                threat_target = _threat_target_from_obs(obs)
+                threat_loss = _balanced_bce_loss(threat_logits, threat_target)
                 horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
                 horizon_pred = jax.nn.sigmoid(horizon_logit)
                 horizon_loss = jnp.mean(jnp.square(horizon_pred - horizon_target_norm))
+                legality_loss = jnp.float32(0.0)
+                if legality_loss_weight > 0.0:
+                    legality_target = _legality_target_from_obs(obs)
+                    legality_loss = _balanced_bce_loss(legality_logits, legality_target)
+                win1_loss = jnp.float32(0.0)
+                if win1_loss_weight > 0.0:
+                    win1_target = _win1_target_from_obs(obs)
+                    win1_loss = _balanced_bce_loss(win1_logits, win1_target)
                 reg = jnp.float32(weight_decay) * _l2_regularization(trainable)
                 total_loss = (
                     policy_loss
                     + jnp.float32(value_loss_weight) * value_loss
                     + jnp.float32(threat_loss_weight) * threat_loss
                     + jnp.float32(horizon_loss_weight) * horizon_loss
+                    + jnp.float32(legality_loss_weight) * legality_loss
+                    + jnp.float32(win1_loss_weight) * win1_loss
                     + reg
                 )
                 return total_loss, (policy_loss, value_loss, threat_loss, horizon_loss)
@@ -1237,6 +1320,8 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "value_loss_weight": args.value_loss_weight,
         "threat_loss_weight": args.threat_loss_weight,
         "horizon_loss_weight": args.horizon_loss_weight,
+        "legality_loss_weight": args.legality_loss_weight,
+        "win1_loss_weight": args.win1_loss_weight,
         "ema_decay": args.ema_decay,
         "compute_dtype": args.compute_dtype,
         "param_dtype": args.param_dtype,
@@ -2280,6 +2365,8 @@ def main() -> None:
     parser.add_argument("--value-loss-weight", type=float, default=1.25)
     parser.add_argument("--threat-loss-weight", type=float, default=0.10)
     parser.add_argument("--horizon-loss-weight", type=float, default=0.02)
+    parser.add_argument("--legality-loss-weight", type=float, default=0.0)
+    parser.add_argument("--win1-loss-weight", type=float, default=0.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="float32")
@@ -2449,6 +2536,10 @@ def main() -> None:
         raise ValueError("threat-loss-weight must be >= 0")
     if args.horizon_loss_weight < 0:
         raise ValueError("horizon-loss-weight must be >= 0")
+    if args.legality_loss_weight < 0:
+        raise ValueError("legality-loss-weight must be >= 0")
+    if args.win1_loss_weight < 0:
+        raise ValueError("win1-loss-weight must be >= 0")
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError("ema-decay must be in [0, 1)")
     compute_dtype = _dtype_from_name(args.compute_dtype)
@@ -2819,6 +2910,8 @@ def main() -> None:
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
+            legality_loss_weight=args.legality_loss_weight,
+            win1_loss_weight=args.win1_loss_weight,
         )
         train_step_multi = make_pmap_multi_train_step(
             train_model,
@@ -2827,6 +2920,8 @@ def main() -> None:
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
+            legality_loss_weight=args.legality_loss_weight,
+            win1_loss_weight=args.win1_loss_weight,
         )
         collect_step = make_pmap_collect_step(play_many_games_fn)
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
@@ -2852,7 +2947,9 @@ def main() -> None:
             f"{args.mode_forbidden_weight:.2f},{args.mode_swap2_weight:.2f},{args.mode_swap2_forbidden_weight:.2f}), "
             f"swap2_swap_prob={args.swap2_swap_prob:.2f}, "
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
-            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, "
+            f"legality_loss_weight={args.legality_loss_weight:.3f}, win1_loss_weight={args.win1_loss_weight:.3f}, "
+            f"grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
@@ -2865,6 +2962,8 @@ def main() -> None:
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
+            legality_loss_weight=args.legality_loss_weight,
+            win1_loss_weight=args.win1_loss_weight,
         )
         train_step_multi = make_single_multi_train_step(
             train_model,
@@ -2873,6 +2972,8 @@ def main() -> None:
             value_loss_weight=args.value_loss_weight,
             threat_loss_weight=args.threat_loss_weight,
             horizon_loss_weight=args.horizon_loss_weight,
+            legality_loss_weight=args.legality_loss_weight,
+            win1_loss_weight=args.win1_loss_weight,
         )
         collect_step = play_many_games_fn
         per_device_batch = args.batch_size
@@ -2895,7 +2996,9 @@ def main() -> None:
             f"{args.mode_forbidden_weight:.2f},{args.mode_swap2_weight:.2f},{args.mode_swap2_forbidden_weight:.2f}), "
             f"swap2_swap_prob={args.swap2_swap_prob:.2f}, "
             f"value_loss_weight={args.value_loss_weight:.3f}, threat_loss_weight={args.threat_loss_weight:.3f}, "
-            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, grad_clip_norm={args.grad_clip_norm:.3f}, "
+            f"horizon_loss_weight={args.horizon_loss_weight:.3f}, "
+            f"legality_loss_weight={args.legality_loss_weight:.3f}, win1_loss_weight={args.win1_loss_weight:.3f}, "
+            f"grad_clip_norm={args.grad_clip_norm:.3f}, "
             f"optimizer={args.optimizer}, weight_decay={args.weight_decay:.2e}, loss_l2_weight_decay={loss_l2_weight_decay:.2e}, "
             f"ema_decay={args.ema_decay:.6f}, "
             f"compute_dtype={args.compute_dtype}, param_dtype={args.param_dtype}"
