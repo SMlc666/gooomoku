@@ -438,16 +438,15 @@ def play_one_game(
     value_np = jax.device_get(value_buf)
     mask_np = jax.device_get(mask)
 
-    valid_idx = np.flatnonzero(mask_np).tolist()
-    examples: List[TrainingExample] = []
-    for idx in valid_idx:
-        examples.append(
-            TrainingExample(
-                observation=obs_np[idx],
-                policy_target=pi_np[idx],
-                value_target=float(value_np[idx]),
-            )
+    valid_idx = np.flatnonzero(mask_np)
+    examples: List[TrainingExample] = [
+        TrainingExample(
+            observation=obs_np[idx],
+            policy_target=pi_np[idx],
+            value_target=float(value_np[idx]),
         )
+        for idx in valid_idx
+    ]
     return examples, int(winner)
 
 
@@ -508,20 +507,19 @@ def play_many_games(
     mask = jax.device_get(mask)
     winners = jax.device_get(winners)
 
-    all_examples: List[TrainingExample] = []
     flat_obs = obs.reshape((-1, board_size, board_size, env.OBS_PLANES))
     flat_pi = pi.reshape((-1, board_size * board_size))
     flat_value = value.reshape((-1,))
     flat_mask = mask.reshape((-1,))
-    valid_idx = np.flatnonzero(flat_mask).tolist()
-    for idx in valid_idx:
-        all_examples.append(
-            TrainingExample(
-                observation=flat_obs[idx],
-                policy_target=flat_pi[idx],
-                value_target=float(flat_value[idx]),
-            )
+    valid_idx = np.flatnonzero(flat_mask)
+    all_examples: List[TrainingExample] = [
+        TrainingExample(
+            observation=flat_obs[idx],
+            policy_target=flat_pi[idx],
+            value_target=float(flat_value[idx]),
         )
+        for idx in valid_idx
+    ]
 
     stats = {"black_win": int((winners == 1).sum()), "white_win": int((winners == -1).sum()), "draw": int((winners == 0).sum())}
     return all_examples, stats

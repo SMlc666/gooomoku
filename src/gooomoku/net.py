@@ -203,7 +203,7 @@ class PolicyValueNet(nn.Module):
                 in_axes=0,
                 out_axes=0,
             )
-            x, _ = transformer_stack(
+            x, layer_outputs = transformer_stack(
                 board_size=self.board_size,
                 channels=self.channels,
                 num_heads=heads,
@@ -314,16 +314,10 @@ class PolicyValueNet(nn.Module):
         if return_intermediate:
             tap_indices = _intermediate_tap_indices(self.blocks, self.intermediate_supervision_stride)
             if tap_indices:
-                tap_policies = []
-                tap_vals = []
-                for tap_idx in tap_indices:
-                    tap_x = layer_outputs[tap_idx]
-                    tap_policies.append(policy_head(tap_x).squeeze(-1))
-                    tap_value, _tap_h = _value_heads(tap_x)
-                    del _tap_h
-                    tap_vals.append(jnp.tanh(tap_value))
-                tap_policy_logits = jnp.stack(tap_policies, axis=0)
-                tap_values = jnp.stack(tap_vals, axis=0)
+                tap_x = jnp.take(layer_outputs, jnp.asarray(tap_indices, dtype=jnp.int32), axis=0)
+                tap_policy_logits = jax.vmap(lambda tx: policy_head(tx).squeeze(-1))(tap_x)
+                tap_value_raw, _ = jax.vmap(_value_heads)(tap_x)
+                tap_values = jnp.tanh(tap_value_raw)
         if return_aux:
             if return_intermediate:
                 return policy, value, threat_logits, horizon_logit, legality_logits, win1_logits, tap_policy_logits, tap_values

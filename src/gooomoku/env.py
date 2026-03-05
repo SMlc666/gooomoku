@@ -203,9 +203,10 @@ def _shift_bits(bits: jnp.ndarray, offset: int) -> jnp.ndarray:
 
 
 def _has_line(bits: jnp.ndarray, starts: jnp.ndarray, offset: int, line_len: int = 5) -> jnp.ndarray:
-    acc = starts
-    for i in range(line_len):
-        acc = acc & _shift_bits(bits, i * offset)
+    def body(i, acc):
+        return acc & _shift_bits(bits, i * offset)
+
+    acc = jax.lax.fori_loop(0, line_len, body, starts)
     return jnp.any(acc)
 
 
@@ -274,42 +275,45 @@ def _line_values_around_move(
 
 def _direction_has_overline(line: jnp.ndarray) -> jnp.ndarray:
     # line has length 11, center at idx=5.
-    found = jnp.bool_(False)
-    for start in range(0, 6):
-        seg = line[start : start + 6]
-        found = found | jnp.all(seg == jnp.int8(1))
-    return found
+    starts = jnp.arange(0, 6, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(0, 6, dtype=jnp.int32)[None, :]
+    windows = line[starts + cols]
+    return jnp.any(jnp.all(windows == jnp.int8(1), axis=1))
 
 
 def _direction_has_four(line: jnp.ndarray) -> jnp.ndarray:
     # Any 5-window through center with exactly one empty and no white/outside.
-    has_four = jnp.bool_(False)
-    for start in range(1, 6):
-        seg = line[start : start + 5]
-        black_n = jnp.sum((seg == jnp.int8(1)).astype(jnp.int32))
-        empty_n = jnp.sum((seg == jnp.int8(0)).astype(jnp.int32))
-        blocked_n = jnp.sum((seg == jnp.int8(-1)).astype(jnp.int32))
-        left = line[start - 1]
-        right = line[start + 5]
-        exact_five_if_fill = (left != jnp.int8(1)) & (right != jnp.int8(1))
-        has_four = has_four | ((black_n == 4) & (empty_n == 1) & (blocked_n == 0) & exact_five_if_fill)
-    return has_four
+    starts = jnp.arange(1, 6, dtype=jnp.int32)
+    cols = jnp.arange(0, 5, dtype=jnp.int32)[None, :]
+    segments = line[starts[:, None] + cols]
+
+    black_n = jnp.sum((segments == jnp.int8(1)).astype(jnp.int32), axis=1)
+    empty_n = jnp.sum((segments == jnp.int8(0)).astype(jnp.int32), axis=1)
+    blocked_n = jnp.sum((segments == jnp.int8(-1)).astype(jnp.int32), axis=1)
+    left = line[starts - 1]
+    right = line[starts + 5]
+    exact_five_if_fill = (left != jnp.int8(1)) & (right != jnp.int8(1))
+
+    match = (black_n == 4) & (empty_n == 1) & (blocked_n == 0) & exact_five_if_fill
+    return jnp.any(match)
 
 
 def _direction_has_open_three(line: jnp.ndarray) -> jnp.ndarray:
     # Open-three approximation aligned with Renju intent:
     # 6-window through center: 0 [4-cells with 3 black + 1 empty] 0
-    has_open_three = jnp.bool_(False)
-    for start in range(1, 5):
-        seg6 = line[start : start + 6]
-        left_open = seg6[0] == jnp.int8(0)
-        right_open = seg6[5] == jnp.int8(0)
-        inner = seg6[1:5]
-        black_n = jnp.sum((inner == jnp.int8(1)).astype(jnp.int32))
-        empty_n = jnp.sum((inner == jnp.int8(0)).astype(jnp.int32))
-        blocked_n = jnp.sum((inner == jnp.int8(-1)).astype(jnp.int32))
-        has_open_three = has_open_three | (left_open & right_open & (black_n == 3) & (empty_n == 1) & (blocked_n == 0))
-    return has_open_three
+    starts = jnp.arange(1, 5, dtype=jnp.int32)[:, None]
+    cols = jnp.arange(0, 6, dtype=jnp.int32)[None, :]
+    seg6 = line[starts + cols]
+
+    left_open = seg6[:, 0] == jnp.int8(0)
+    right_open = seg6[:, 5] == jnp.int8(0)
+    inner = seg6[:, 1:5]
+    black_n = jnp.sum((inner == jnp.int8(1)).astype(jnp.int32), axis=1)
+    empty_n = jnp.sum((inner == jnp.int8(0)).astype(jnp.int32), axis=1)
+    blocked_n = jnp.sum((inner == jnp.int8(-1)).astype(jnp.int32), axis=1)
+
+    match = left_open & right_open & (black_n == 3) & (empty_n == 1) & (blocked_n == 0)
+    return jnp.any(match)
 
 
 def _is_black_renju_forbidden(
@@ -322,14 +326,20 @@ def _is_black_renju_forbidden(
     if_not_enabled = jnp.bool_(False)
 
     def _compute(_):
-        overline = jnp.bool_(False)
-        four_dirs = jnp.int32(0)
-        open_three_dirs = jnp.int32(0)
-        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-            line = _line_values_around_move(board_after, row, col, dr=dr, dc=dc, radius=5)
-            overline = overline | _direction_has_overline(line)
-            four_dirs = four_dirs + _direction_has_four(line).astype(jnp.int32)
-            open_three_dirs = open_three_dirs + _direction_has_open_three(line).astype(jnp.int32)
+        directions = jnp.asarray(((0, 1), (1, 0), (1, 1), (1, -1)), dtype=jnp.int32)
+        lines = jax.vmap(
+            lambda d: _line_values_around_move(
+                board_after,
+                row,
+                col,
+                dr=d[0],
+                dc=d[1],
+                radius=5,
+            )
+        )(directions)
+        overline = jnp.any(jax.vmap(_direction_has_overline)(lines))
+        four_dirs = jnp.sum(jax.vmap(_direction_has_four)(lines).astype(jnp.int32))
+        open_three_dirs = jnp.sum(jax.vmap(_direction_has_open_three)(lines).astype(jnp.int32))
 
         forbid_overline = ((rule_flags & RULE_FORBID_BLACK_OVERLINE) != 0) & overline
         forbid_double_four = ((rule_flags & RULE_FORBID_BLACK_DOUBLE_FOUR) != 0) & (four_dirs >= 2)

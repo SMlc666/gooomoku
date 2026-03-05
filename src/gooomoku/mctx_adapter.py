@@ -69,6 +69,24 @@ def _line_window_tables(
     return tuple(as_jax(table_np) for table_np in tables_np)
 
 
+@functools.lru_cache(maxsize=None)
+def _line_window_merged_tables_np(board_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    east, south, diag_dr, diag_dl = _line_window_tables_np(board_size)
+    action_idx = np.concatenate((east[0], south[0], diag_dr[0], diag_dl[0]), axis=0)
+    word_idx = np.concatenate((east[1], south[1], diag_dr[1], diag_dl[1]), axis=0)
+    bit_masks = np.concatenate((east[2], south[2], diag_dr[2], diag_dl[2]), axis=0)
+    return action_idx, word_idx, bit_masks
+
+
+def _line_window_merged_tables(board_size: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    action_idx, word_idx, bit_masks = _line_window_merged_tables_np(board_size)
+    return (
+        jnp.asarray(action_idx, dtype=jnp.int32),
+        jnp.asarray(word_idx, dtype=jnp.int32),
+        jnp.asarray(bit_masks, dtype=jnp.uint32),
+    )
+
+
 def _segment_add(action_indices: jnp.ndarray, picks: jnp.ndarray, num_actions: int) -> jnp.ndarray:
     if action_indices.shape[0] == 0:
         return jnp.zeros((num_actions,), dtype=jnp.int32)
@@ -121,19 +139,17 @@ def _winning_moves_for_words(
     num_actions: int,
 ) -> jnp.ndarray:
     legal_words = env.pack_bits(legal_bits)
-    tables = _line_window_tables(board_size)
-    counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    for action_idx, word_idx, bit_masks in tables:
-        counts = counts + _window_pattern_counts(
-            player_words=player_words,
-            legal_words=legal_words,
-            action_indices=action_idx,
-            word_indices=word_idx,
-            bit_masks=bit_masks,
-            target_stones=4,
-            target_empties=1,
-            num_actions=num_actions,
-        )
+    action_idx, word_idx, bit_masks = _line_window_merged_tables(board_size)
+    counts = _window_pattern_counts(
+        player_words=player_words,
+        legal_words=legal_words,
+        action_indices=action_idx,
+        word_indices=word_idx,
+        bit_masks=bit_masks,
+        target_stones=4,
+        target_empties=1,
+        num_actions=num_actions,
+    )
     return legal_bits & (counts > 0)
 
 
@@ -145,34 +161,30 @@ def _urgent_moves_for_words(
     num_actions: int,
 ) -> jnp.ndarray:
     legal_words = env.pack_bits(legal_bits)
-    tables = _line_window_tables(board_size)
+    action_idx, word_idx, bit_masks = _line_window_merged_tables(board_size)
 
-    win_counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    for action_idx, word_idx, bit_masks in tables:
-        win_counts = win_counts + _window_pattern_counts(
-            player_words=player_words,
-            legal_words=legal_words,
-            action_indices=action_idx,
-            word_indices=word_idx,
-            bit_masks=bit_masks,
-            target_stones=4,
-            target_empties=1,
-            num_actions=num_actions,
-        )
+    win_counts = _window_pattern_counts(
+        player_words=player_words,
+        legal_words=legal_words,
+        action_indices=action_idx,
+        word_indices=word_idx,
+        bit_masks=bit_masks,
+        target_stones=4,
+        target_empties=1,
+        num_actions=num_actions,
+    )
     win_mask = legal_bits & (win_counts > 0)
 
-    forcing_counts = jnp.zeros((num_actions,), dtype=jnp.int32)
-    for action_idx, word_idx, bit_masks in tables:
-        forcing_counts = forcing_counts + _window_pattern_counts(
-            player_words=player_words,
-            legal_words=legal_words,
-            action_indices=action_idx,
-            word_indices=word_idx,
-            bit_masks=bit_masks,
-            target_stones=3,
-            target_empties=2,
-            num_actions=num_actions,
-        )
+    forcing_counts = _window_pattern_counts(
+        player_words=player_words,
+        legal_words=legal_words,
+        action_indices=action_idx,
+        word_indices=word_idx,
+        bit_masks=bit_masks,
+        target_stones=3,
+        target_empties=2,
+        num_actions=num_actions,
+    )
     forcing_mask = legal_bits & (forcing_counts > 0)
 
     num_winning_actions = jnp.sum(win_mask.astype(jnp.int32))

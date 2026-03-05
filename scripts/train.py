@@ -1265,6 +1265,18 @@ def _update_ema_params(ema_params, params, decay: float):
     )
 
 
+def _broadcast_collect_params_to_actor_queues(actor_params_queues: list[Any], params_host) -> None:
+    for param_q in actor_params_queues:
+        try:
+            param_q.get_nowait()
+        except queue_lib.Empty:
+            pass
+        try:
+            param_q.put_nowait(params_host)
+        except queue_lib.Full:
+            pass
+
+
 def _sample_replay_indices(
     *,
     np_rng: np.random.Generator,
@@ -1303,6 +1315,51 @@ def _sample_replay_indices(
         return parts[0]
     merged = np.concatenate(parts, axis=0)
     np_rng.shuffle(merged)
+    return merged.astype(np.int32, copy=False)
+
+
+def _sample_replay_indices_batch(
+    *,
+    np_rng: np.random.Generator,
+    replay_count: int,
+    batch_size: int,
+    num_batches: int,
+    recent_fraction: float,
+    recent_window: int,
+) -> np.ndarray:
+    if num_batches <= 0:
+        raise ValueError("num_batches must be > 0 for replay sampling")
+    if replay_count <= 0:
+        raise ValueError("replay_count must be > 0 for replay sampling")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0 for replay sampling")
+
+    frac = float(np.clip(recent_fraction, 0.0, 1.0))
+    if recent_window <= 0 or frac <= 0.0:
+        return np_rng.integers(0, replay_count, size=(num_batches, batch_size), dtype=np.int32)
+
+    recent_cap = min(int(recent_window), int(replay_count))
+    if recent_cap <= 0:
+        return np_rng.integers(0, replay_count, size=(num_batches, batch_size), dtype=np.int32)
+
+    recent_samples = int(round(batch_size * frac))
+    recent_samples = max(0, min(batch_size, recent_samples))
+    global_samples = batch_size - recent_samples
+
+    if recent_samples == 0:
+        return np_rng.integers(0, replay_count, size=(num_batches, batch_size), dtype=np.int32)
+    if global_samples == 0:
+        recent_start = replay_count - recent_cap
+        return np_rng.integers(recent_start, replay_count, size=(num_batches, batch_size), dtype=np.int32)
+
+    recent_start = replay_count - recent_cap
+    recent_part = np_rng.integers(recent_start, replay_count, size=(num_batches, recent_samples), dtype=np.int32)
+    global_part = np_rng.integers(0, replay_count, size=(num_batches, global_samples), dtype=np.int32)
+    merged = np.concatenate((recent_part, global_part), axis=1)
+
+    shuffle_noise = np_rng.random(size=(num_batches, batch_size))
+    perm = np.argsort(shuffle_noise, axis=1)
+    merged = np.take_along_axis(merged, perm, axis=1)
     return merged.astype(np.int32, copy=False)
 
 
@@ -1539,16 +1596,36 @@ def _augment_batch_with_random_symmetry(
     batch_size = obs.shape[0]
     symmetry_ids = np_rng.integers(0, 8, size=batch_size, dtype=np.int32)
 
-    augmented_obs = np.empty_like(obs)
     policy_grid = policy.reshape((-1, board_size, board_size))
-    augmented_policy_grid = np.empty_like(policy_grid)
-
-    for symmetry_id in range(8):
-        indices = np.nonzero(symmetry_ids == symmetry_id)[0]
-        if indices.size == 0:
-            continue
-        augmented_obs[indices] = _apply_dihedral_symmetry_obs(obs[indices], symmetry_id)
-        augmented_policy_grid[indices] = _apply_dihedral_symmetry_policy(policy_grid[indices], symmetry_id)
+    obs_by_symmetry = np.stack(
+        (
+            obs,
+            np.rot90(obs, k=1, axes=(1, 2)),
+            np.rot90(obs, k=2, axes=(1, 2)),
+            np.rot90(obs, k=3, axes=(1, 2)),
+            np.flip(obs, axis=2),
+            np.rot90(np.flip(obs, axis=2), k=1, axes=(1, 2)),
+            np.rot90(np.flip(obs, axis=2), k=2, axes=(1, 2)),
+            np.rot90(np.flip(obs, axis=2), k=3, axes=(1, 2)),
+        ),
+        axis=0,
+    )
+    policy_by_symmetry = np.stack(
+        (
+            policy_grid,
+            np.rot90(policy_grid, k=1, axes=(1, 2)),
+            np.rot90(policy_grid, k=2, axes=(1, 2)),
+            np.rot90(policy_grid, k=3, axes=(1, 2)),
+            np.flip(policy_grid, axis=2),
+            np.rot90(np.flip(policy_grid, axis=2), k=1, axes=(1, 2)),
+            np.rot90(np.flip(policy_grid, axis=2), k=2, axes=(1, 2)),
+            np.rot90(np.flip(policy_grid, axis=2), k=3, axes=(1, 2)),
+        ),
+        axis=0,
+    )
+    row_idx = np.arange(batch_size, dtype=np.intp)
+    augmented_obs = obs_by_symmetry[symmetry_ids, row_idx]
+    augmented_policy_grid = policy_by_symmetry[symmetry_ids, row_idx]
 
     return augmented_obs, augmented_policy_grid.reshape((-1, board_size * board_size))
 
@@ -1768,29 +1845,12 @@ def _merge_selfplay_payloads_across_hosts(payload: SelfPlayBatch) -> SelfPlayBat
     horizon_all_np = np.asarray(jax.device_get(horizon_all), dtype=np.float32)
     stats_all_np = np.asarray(jax.device_get(stats_all), dtype=np.int32)
 
-    merged_obs_parts = []
-    merged_policy_parts = []
-    merged_value_parts = []
-    merged_horizon_parts = []
-    for proc_i, proc_examples in enumerate(counts_np):
-        proc_n = int(proc_examples)
-        if proc_n <= 0:
-            continue
-        merged_obs_parts.append(obs_all_np[proc_i, :proc_n])
-        merged_policy_parts.append(policy_all_np[proc_i, :proc_n])
-        merged_value_parts.append(value_all_np[proc_i, :proc_n])
-        merged_horizon_parts.append(horizon_all_np[proc_i, :proc_n])
-
-    if merged_obs_parts:
-        merged_obs = np.concatenate(merged_obs_parts, axis=0)
-        merged_policy = np.concatenate(merged_policy_parts, axis=0)
-        merged_value = np.concatenate(merged_value_parts, axis=0)
-        merged_horizon = np.concatenate(merged_horizon_parts, axis=0)
-    else:
-        merged_obs = np.zeros((0,) + new_obs.shape[1:], dtype=np.uint8)
-        merged_policy = np.zeros((0, new_policy.shape[1]), dtype=np.float32)
-        merged_value = np.zeros((0,), dtype=np.float32)
-        merged_horizon = np.zeros((0,), dtype=np.float32)
+    valid_counts = np.maximum(counts_np, 0)
+    valid_mask = np.arange(max_examples, dtype=np.int32)[None, :] < valid_counts[:, None]
+    merged_obs = obs_all_np[valid_mask]
+    merged_policy = policy_all_np[valid_mask]
+    merged_value = value_all_np[valid_mask]
+    merged_horizon = horizon_all_np[valid_mask]
 
     stats_sum = stats_all_np if stats_all_np.ndim == 1 else stats_all_np.sum(axis=0)
     merged_examples = int(counts_np.sum()) if counts_np.size > 0 else 0
@@ -3408,7 +3468,10 @@ def main() -> None:
             param_snapshot_ms = 0.0
             arena_ms = 0.0
             checkpoint_ms = 0.0
-            payloads_to_append: list[SelfPlayBatch] = []
+            append_obs = None
+            append_policy = None
+            append_value = None
+            append_horizon = None
             if actor_errors:
                 actor_idx, exc = actor_errors[0]
                 raise RuntimeError(f"async self-play actor[{actor_idx}] failed: {exc}") from exc
@@ -3457,9 +3520,14 @@ def main() -> None:
                 collect_wait_ms = wait_sec * 1000.0
                 learner_wait_total_sec += wait_sec
                 learner_wait_count += 1
-                payloads_to_append = [
-                    (new_obs, new_policy, new_value, new_horizon, black_win, white_win, draw, new_examples)
-                ]
+                append_obs_parts = [new_obs]
+                append_policy_parts = [new_policy]
+                append_value_parts = [new_value]
+                append_horizon_parts = [new_horizon]
+                total_examples = int(new_examples)
+                total_black_win = int(black_win)
+                total_white_win = int(white_win)
+                total_draw = int(draw)
                 if args.learner_drain_max_batches > 0:
                     drained = 0
                     while drained < args.learner_drain_max_batches:
@@ -3467,15 +3535,42 @@ def main() -> None:
                             drained_payload = replay_queue.get_nowait()
                         except queue_lib.Empty:
                             break
-                        payloads_to_append.append(drained_payload)
+                        (
+                            drained_obs,
+                            drained_policy,
+                            drained_value,
+                            drained_horizon,
+                            drained_black_win,
+                            drained_white_win,
+                            drained_draw,
+                            drained_examples,
+                        ) = drained_payload
+                        append_obs_parts.append(drained_obs)
+                        append_policy_parts.append(drained_policy)
+                        append_value_parts.append(drained_value)
+                        append_horizon_parts.append(drained_horizon)
+                        total_examples += int(drained_examples)
+                        total_black_win += int(drained_black_win)
+                        total_white_win += int(drained_white_win)
+                        total_draw += int(drained_draw)
                         with actor_stats_lock:
                             actor_batches_total += 1
-                            actor_examples_total += drained_payload[7]
+                            actor_examples_total += int(drained_examples)
                         drained += 1
-                new_examples = int(sum(item[7] for item in payloads_to_append))
-                black_win = int(sum(item[4] for item in payloads_to_append))
-                white_win = int(sum(item[5] for item in payloads_to_append))
-                draw = int(sum(item[6] for item in payloads_to_append))
+                if len(append_obs_parts) == 1:
+                    append_obs = append_obs_parts[0]
+                    append_policy = append_policy_parts[0]
+                    append_value = append_value_parts[0]
+                    append_horizon = append_horizon_parts[0]
+                else:
+                    append_obs = np.concatenate(append_obs_parts, axis=0)
+                    append_policy = np.concatenate(append_policy_parts, axis=0)
+                    append_value = np.concatenate(append_value_parts, axis=0)
+                    append_horizon = np.concatenate(append_horizon_parts, axis=0)
+                new_examples = total_examples
+                black_win = total_black_win
+                white_win = total_white_win
+                draw = total_draw
             elif args.async_selfplay:
                 assert actor_stop is not None
                 wait_start = time.perf_counter()
@@ -3555,16 +3650,10 @@ def main() -> None:
 
             replay_append_start = time.perf_counter()
             if args.role == "learner":
-                if len(payloads_to_append) == 1:
-                    append_obs = payloads_to_append[0][0]
-                    append_policy = payloads_to_append[0][1]
-                    append_value = payloads_to_append[0][2]
-                    append_horizon = payloads_to_append[0][3]
-                else:
-                    append_obs = np.concatenate([payload[0] for payload in payloads_to_append], axis=0)
-                    append_policy = np.concatenate([payload[1] for payload in payloads_to_append], axis=0)
-                    append_value = np.concatenate([payload[2] for payload in payloads_to_append], axis=0)
-                    append_horizon = np.concatenate([payload[3] for payload in payloads_to_append], axis=0)
+                assert append_obs is not None
+                assert append_policy is not None
+                assert append_value is not None
+                assert append_horizon is not None
                 replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count = _append_replay_host(
                     replay_obs_host,
                     replay_policy_host,
@@ -3604,41 +3693,40 @@ def main() -> None:
             horizon_sum = 0.0
             train_updates_start = time.perf_counter()
             if fused_train_updates:
-                obs_batches = []
-                policy_batches = []
-                value_batches = []
-                horizon_batches = []
-                for _ in range(args.updates_per_step):
-                    sample_ids = _sample_replay_indices(
-                        np_rng=np_rng,
-                        replay_count=replay_count,
-                        batch_size=args.batch_size,
-                        recent_fraction=args.replay_recent_fraction,
-                        recent_window=args.replay_recent_window,
+                sample_ids_batch = _sample_replay_indices_batch(
+                    np_rng=np_rng,
+                    replay_count=replay_count,
+                    batch_size=args.batch_size,
+                    num_batches=args.updates_per_step,
+                    recent_fraction=args.replay_recent_fraction,
+                    recent_window=args.replay_recent_window,
+                )
+                obs_stack = jnp.asarray(replay_obs_host[sample_ids_batch])
+                policy_stack = jnp.asarray(replay_policy_host[sample_ids_batch])
+                value_stack = jnp.asarray(replay_value_host[sample_ids_batch])
+                horizon_stack = jnp.asarray(replay_horizon_host[sample_ids_batch])
+                if not args.disable_symmetry_augmentation:
+                    rng_key, aug_seed = jax.random.split(rng_key)
+                    aug_keys = jax.random.split(aug_seed, args.updates_per_step)
+                    obs_stack, policy_stack = jax.vmap(_augment_batch_with_random_symmetry_jax)(
+                        obs_stack,
+                        policy_stack,
+                        aug_keys,
                     )
-                    obs = jnp.asarray(replay_obs_host[sample_ids])
-                    policy_target = jnp.asarray(replay_policy_host[sample_ids])
-                    value_target = jnp.asarray(replay_value_host[sample_ids])
-                    horizon_target = jnp.asarray(replay_horizon_host[sample_ids])
-                    if not args.disable_symmetry_augmentation:
-                        rng_key, aug_key = jax.random.split(rng_key)
-                        obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
-
-                    if use_pmap:
-                        obs = obs.reshape((local_devices, per_device_batch, args.board_size, args.board_size, env.OBS_PLANES))
-                        policy_target = policy_target.reshape((local_devices, per_device_batch, -1))
-                        value_target = value_target.reshape((local_devices, per_device_batch))
-                        horizon_target = horizon_target.reshape((local_devices, per_device_batch))
-
-                    obs_batches.append(obs)
-                    policy_batches.append(policy_target)
-                    value_batches.append(value_target)
-                    horizon_batches.append(horizon_target)
-
-                obs_stack = jnp.stack(obs_batches, axis=0)
-                policy_stack = jnp.stack(policy_batches, axis=0)
-                value_stack = jnp.stack(value_batches, axis=0)
-                horizon_stack = jnp.stack(horizon_batches, axis=0)
+                if use_pmap:
+                    obs_stack = obs_stack.reshape(
+                        (
+                            args.updates_per_step,
+                            local_devices,
+                            per_device_batch,
+                            args.board_size,
+                            args.board_size,
+                            env.OBS_PLANES,
+                        )
+                    )
+                    policy_stack = policy_stack.reshape((args.updates_per_step, local_devices, per_device_batch, -1))
+                    value_stack = value_stack.reshape((args.updates_per_step, local_devices, per_device_batch))
+                    horizon_stack = horizon_stack.reshape((args.updates_per_step, local_devices, per_device_batch))
                 if use_pmap:
                     # pmap maps over leading axis (local_devices). For fused updates we first
                     # stack by update index, so move device axis to front before calling pmap.
@@ -3693,16 +3781,7 @@ def main() -> None:
                         params_host = _extract_host_tree(params, use_pmap=use_pmap)
                         params_host = jax.device_get(params_host)
                         params_host = extract_collect_params(params_host, runtime_use_pmap=False)
-                        for param_q in actor_params_queues:
-                            try:
-                                while True:
-                                    param_q.get_nowait()
-                            except queue_lib.Empty:
-                                pass
-                            try:
-                                param_q.put_nowait(params_host)
-                            except queue_lib.Full:
-                                pass
+                        _broadcast_collect_params_to_actor_queues(actor_params_queues, params_host)
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
                             params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
@@ -3776,16 +3855,7 @@ def main() -> None:
                             params_host = _extract_host_tree(params, use_pmap=use_pmap)
                             params_host = jax.device_get(params_host)
                             params_host = extract_collect_params(params_host, runtime_use_pmap=False)
-                            for param_q in actor_params_queues:
-                                try:
-                                    while True:
-                                        param_q.get_nowait()
-                                except queue_lib.Empty:
-                                    pass
-                                try:
-                                    param_q.put_nowait(params_host)
-                                except queue_lib.Full:
-                                    pass
+                            _broadcast_collect_params_to_actor_queues(actor_params_queues, params_host)
                         elif params_ref_lock is not None and params_ref is not None:
                             with params_ref_lock:
                                 params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
