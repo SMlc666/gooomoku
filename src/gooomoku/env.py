@@ -130,12 +130,12 @@ def pack_bits(bits: jnp.ndarray) -> jnp.ndarray:
 
 
 def unpack_bits(words: jnp.ndarray, *, num_actions: int) -> jnp.ndarray:
-    idx = jnp.arange(num_actions, dtype=jnp.int32)
-    word_idx = idx // _WORD_BITS
-    bit_idx = (idx % _WORD_BITS).astype(_WORD_DTYPE)
-    selected = jnp.take(words, word_idx, axis=-1)
+    shifts = jnp.arange(_WORD_BITS, dtype=_WORD_DTYPE)
     one = jnp.asarray(1, dtype=_WORD_DTYPE)
-    return jnp.not_equal(jnp.bitwise_and(jnp.right_shift(selected, bit_idx), one), 0)
+    expanded = jnp.right_shift(words[..., None], shifts)
+    bit_grid = jnp.not_equal(jnp.bitwise_and(expanded, one), 0)
+    flat = bit_grid.reshape(words.shape[:-1] + (words.shape[-1] * _WORD_BITS,))
+    return flat[..., :num_actions]
 
 
 def black_bits(state: GomokuState) -> jnp.ndarray:
@@ -179,20 +179,21 @@ def player_view_bits(state: GomokuState) -> tuple[jnp.ndarray, jnp.ndarray, jnp.
 
 
 def _bit_is_set(words: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-    word_idx = action // _WORD_BITS
+    word_idx = (action // _WORD_BITS).astype(jnp.int32)
     bit_idx = (action % _WORD_BITS).astype(_WORD_DTYPE)
-    word = words[word_idx]
+    word = jax.lax.dynamic_index_in_dim(words, word_idx, axis=0, keepdims=False)
     one = jnp.asarray(1, dtype=_WORD_DTYPE)
     return jnp.not_equal(jnp.bitwise_and(jnp.right_shift(word, bit_idx), one), 0)
 
 
 def _set_bit(words: jnp.ndarray, action: jnp.ndarray, enabled: jnp.ndarray) -> jnp.ndarray:
-    word_idx = action // _WORD_BITS
+    word_idx = (action // _WORD_BITS).astype(jnp.int32)
     bit_idx = (action % _WORD_BITS).astype(_WORD_DTYPE)
     mask = jnp.left_shift(jnp.asarray(1, dtype=_WORD_DTYPE), bit_idx)
-    current = words[word_idx]
-    updated = jnp.where(enabled, jnp.bitwise_or(current, mask), current)
-    return words.at[word_idx].set(updated)
+    cur_word = jax.lax.dynamic_index_in_dim(words, word_idx, axis=0, keepdims=False)
+    updated_word = jnp.bitwise_or(cur_word, mask)
+    updated_words = jax.lax.dynamic_update_index_in_dim(words, updated_word, word_idx, axis=0)
+    return jnp.where(enabled, updated_words, words)
 
 
 def _shift_bits(bits: jnp.ndarray, offset: int) -> jnp.ndarray:
@@ -472,7 +473,10 @@ def encode_state(state: GomokuState) -> jnp.ndarray:
     opp = opp_bits.reshape(board_size, board_size).astype(jnp.float32)
 
     safe_last_action = jnp.clip(state.last_action, 0, num_actions - 1)
-    last_plane = jax.nn.one_hot(safe_last_action, num_actions, dtype=jnp.float32).reshape(board_size, board_size)
+    last_row = safe_last_action // board_size
+    last_col = safe_last_action % board_size
+    last_plane = jnp.zeros((board_size, board_size), dtype=jnp.float32)
+    last_plane = last_plane.at[last_row, last_col].set(jnp.float32(1.0))
     last_plane = jnp.where(state.last_action >= 0, last_plane, jnp.zeros_like(last_plane))
 
     side_to_move = jnp.full((board_size, board_size), (state.to_play == 1).astype(jnp.float32), dtype=jnp.float32)

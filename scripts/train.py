@@ -33,8 +33,7 @@ sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
-from gooomoku.mctx_adapter import _current_player_winning_mask
-from gooomoku.mctx_adapter import _opponent_threat_block_mask
+from gooomoku.mctx_adapter import _batched_force_masks
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 from gooomoku.replay_wire import ReplayWireError
@@ -334,19 +333,6 @@ def _states_from_obs_for_aux(obs: jnp.ndarray) -> env.GomokuState:
     )
 
 
-def _threat_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
-    states = _states_from_obs_for_aux(obs)
-    win_mask = jax.vmap(_current_player_winning_mask)(states)
-    block_mask = jax.vmap(_opponent_threat_block_mask)(states)
-    legal = env.batch_legal_action_mask(states)
-    return (win_mask | block_mask) & legal
-
-
-def _win1_target_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
-    states = _states_from_obs_for_aux(obs)
-    return jax.vmap(_current_player_winning_mask)(states)
-
-
 def _current_player_forbidden_mask(state: env.GomokuState) -> jnp.ndarray:
     board_size = int(state.board.shape[0])
     num_actions = board_size * board_size
@@ -442,7 +428,11 @@ def _compute_training_loss(
 
     policy_loss = -jnp.mean(jnp.sum(policy_target * jax.nn.log_softmax(logits), axis=-1))
     value_loss = jnp.mean(jnp.square(value - value_target))
-    threat_target = _threat_target_from_obs(obs)
+    aux_states = _states_from_obs_for_aux(obs)
+    win_mask, _, _, block_mask = _batched_force_masks(aux_states)
+    legal_mask = env.batch_legal_action_mask(aux_states)
+    win_target = win_mask & legal_mask
+    threat_target = (win_mask | block_mask) & legal_mask
     threat_loss = _balanced_bce_loss(threat_logits, threat_target)
     horizon_target_norm = horizon_target / jnp.float32(model.board_size * model.board_size)
     horizon_pred = jax.nn.sigmoid(horizon_logit)
@@ -453,8 +443,7 @@ def _compute_training_loss(
         legality_loss = _balanced_bce_loss(legality_logits, legality_target)
     win1_loss = jnp.float32(0.0)
     if win1_loss_weight > 0.0:
-        win1_target = _win1_target_from_obs(obs)
-        win1_loss = _balanced_bce_loss(win1_logits, win1_target)
+        win1_loss = _balanced_bce_loss(win1_logits, win_target)
 
     intermediate_loss = jnp.float32(0.0)
     if intermediate_supervision_weight > 0.0 and tap_policy_logits.shape[0] > 0:
@@ -1493,19 +1482,14 @@ def build_arena_fn(
     @jax.jit
     def arena_fn(params_a, params_b, rng_key):
         game_indices = jnp.arange(num_games, dtype=jnp.int32)
-
-        def body_fn(carry, game_idx):
-            cur_key, a_wins, b_wins, draws = carry
-            cur_key, game_key = jax.random.split(cur_key)
-            a_color = jnp.where((game_idx % 2) == 0, jnp.int8(1), jnp.int8(-1))
-            a_win, b_win, draw = play_game(params_a, params_b, game_key, a_color)
-            return (cur_key, a_wins + a_win, b_wins + b_win, draws + draw), 0
-
-        (_, a_wins, b_wins, draws), _ = jax.lax.scan(
-            body_fn,
-            (rng_key, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
-            game_indices,
-        )
+        game_keys = jax.random.split(rng_key, num_games)
+        a_colors = jnp.where((game_indices % 2) == 0, jnp.int8(1), jnp.int8(-1))
+        a_wins, b_wins, draws = jax.vmap(
+            lambda key, color: play_game(params_a, params_b, key, color)
+        )(game_keys, a_colors)
+        a_wins = jnp.sum(a_wins, dtype=jnp.int32)
+        b_wins = jnp.sum(b_wins, dtype=jnp.int32)
+        draws = jnp.sum(draws, dtype=jnp.int32)
         return a_wins, b_wins, draws
 
     return arena_fn
@@ -1686,6 +1670,20 @@ def _init_host_replay(
     return obs_host, policy_host, value_host, horizon_host, replay_head, replay_count
 
 
+def _init_device_replay_from_host(
+    replay_obs_host: np.ndarray,
+    replay_policy_host: np.ndarray,
+    replay_value_host: np.ndarray,
+    replay_horizon_host: np.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    return (
+        jnp.asarray(replay_obs_host),
+        jnp.asarray(replay_policy_host),
+        jnp.asarray(replay_value_host),
+        jnp.asarray(replay_horizon_host),
+    )
+
+
 def _append_replay_host(
     replay_obs_host: np.ndarray,
     replay_policy_host: np.ndarray,
@@ -1728,6 +1726,58 @@ def _append_replay_host(
     replay_head = (replay_head + new_count) % capacity
     replay_count = min(capacity, replay_count + new_count)
     return replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count
+
+
+def _append_replay_device(
+    replay_obs_dev: jnp.ndarray,
+    replay_policy_dev: jnp.ndarray,
+    replay_value_dev: jnp.ndarray,
+    replay_horizon_dev: jnp.ndarray,
+    *,
+    replay_head: int,
+    replay_count: int,
+    new_obs: np.ndarray,
+    new_policy: np.ndarray,
+    new_value: np.ndarray,
+    new_horizon: np.ndarray,
+):
+    capacity = int(replay_obs_dev.shape[0])
+    new_count = int(new_obs.shape[0])
+    if new_count <= 0 or capacity <= 0:
+        return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_horizon_dev, replay_head, replay_count
+
+    new_obs_dev = jnp.asarray(new_obs, dtype=jnp.uint8)
+    new_policy_dev = jnp.asarray(new_policy, dtype=jnp.float32)
+    new_value_dev = jnp.asarray(new_value, dtype=jnp.float32)
+    new_horizon_dev = jnp.asarray(new_horizon, dtype=jnp.float32)
+
+    if new_count >= capacity:
+        return (
+            new_obs_dev[-capacity:],
+            new_policy_dev[-capacity:],
+            new_value_dev[-capacity:],
+            new_horizon_dev[-capacity:],
+            0,
+            capacity,
+        )
+
+    first = min(new_count, capacity - replay_head)
+    if first > 0:
+        replay_obs_dev = replay_obs_dev.at[replay_head : replay_head + first].set(new_obs_dev[:first])
+        replay_policy_dev = replay_policy_dev.at[replay_head : replay_head + first].set(new_policy_dev[:first])
+        replay_value_dev = replay_value_dev.at[replay_head : replay_head + first].set(new_value_dev[:first])
+        replay_horizon_dev = replay_horizon_dev.at[replay_head : replay_head + first].set(new_horizon_dev[:first])
+
+    remaining = new_count - first
+    if remaining > 0:
+        replay_obs_dev = replay_obs_dev.at[:remaining].set(new_obs_dev[first:])
+        replay_policy_dev = replay_policy_dev.at[:remaining].set(new_policy_dev[first:])
+        replay_value_dev = replay_value_dev.at[:remaining].set(new_value_dev[first:])
+        replay_horizon_dev = replay_horizon_dev.at[:remaining].set(new_horizon_dev[first:])
+
+    replay_head = (replay_head + new_count) % capacity
+    replay_count = min(capacity, replay_count + new_count)
+    return replay_obs_dev, replay_policy_dev, replay_value_dev, replay_horizon_dev, replay_head, replay_count
 
 
 def _materialize_replay_from_host(
@@ -3135,6 +3185,12 @@ def main() -> None:
         replay_size=args.replay_size,
         board_size=args.board_size,
     )
+    replay_obs_dev, replay_policy_dev, replay_value_dev, replay_horizon_dev = _init_device_replay_from_host(
+        replay_obs_host,
+        replay_policy_host,
+        replay_value_host,
+        replay_horizon_host,
+    )
     best_path = _best_checkpoint_path(args.output)
 
     def maybe_save_training_checkpoint(step: int, reason: str) -> float:
@@ -3649,6 +3705,8 @@ def main() -> None:
                 collect_wait_ms = (time.perf_counter() - collect_start) * 1000.0
 
             replay_append_start = time.perf_counter()
+            replay_head_before = replay_head
+            replay_count_before = replay_count
             if args.role == "learner":
                 assert append_obs is not None
                 assert append_policy is not None
@@ -3666,6 +3724,18 @@ def main() -> None:
                     new_value=append_value,
                     new_horizon=append_horizon,
                 )
+                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_horizon_dev, replay_head_dev, replay_count_dev = _append_replay_device(
+                    replay_obs_dev,
+                    replay_policy_dev,
+                    replay_value_dev,
+                    replay_horizon_dev,
+                    replay_head=replay_head_before,
+                    replay_count=replay_count_before,
+                    new_obs=append_obs,
+                    new_policy=append_policy,
+                    new_value=append_value,
+                    new_horizon=append_horizon,
+                )
             else:
                 replay_obs_host, replay_policy_host, replay_value_host, replay_horizon_host, replay_head, replay_count = _append_replay_host(
                     replay_obs_host,
@@ -3678,6 +3748,24 @@ def main() -> None:
                     new_policy=new_policy,
                     new_value=new_value,
                     new_horizon=new_horizon,
+                )
+                replay_obs_dev, replay_policy_dev, replay_value_dev, replay_horizon_dev, replay_head_dev, replay_count_dev = _append_replay_device(
+                    replay_obs_dev,
+                    replay_policy_dev,
+                    replay_value_dev,
+                    replay_horizon_dev,
+                    replay_head=replay_head_before,
+                    replay_count=replay_count_before,
+                    new_obs=new_obs,
+                    new_policy=new_policy,
+                    new_value=new_value,
+                    new_horizon=new_horizon,
+                )
+            if (replay_head_dev != replay_head) or (replay_count_dev != replay_count):
+                raise RuntimeError(
+                    "replay host/device state mismatch: "
+                    f"host(head={replay_head},count={replay_count}) "
+                    f"dev(head={replay_head_dev},count={replay_count_dev})"
                 )
             replay_append_ms = (time.perf_counter() - replay_append_start) * 1000.0
 
@@ -3701,10 +3789,11 @@ def main() -> None:
                     recent_fraction=args.replay_recent_fraction,
                     recent_window=args.replay_recent_window,
                 )
-                obs_stack = jnp.asarray(replay_obs_host[sample_ids_batch])
-                policy_stack = jnp.asarray(replay_policy_host[sample_ids_batch])
-                value_stack = jnp.asarray(replay_value_host[sample_ids_batch])
-                horizon_stack = jnp.asarray(replay_horizon_host[sample_ids_batch])
+                sample_ids_batch = jnp.asarray(sample_ids_batch, dtype=jnp.int32)
+                obs_stack = replay_obs_dev[sample_ids_batch]
+                policy_stack = replay_policy_dev[sample_ids_batch]
+                value_stack = replay_value_dev[sample_ids_batch]
+                horizon_stack = replay_horizon_dev[sample_ids_batch]
                 if not args.disable_symmetry_augmentation:
                     rng_key, aug_seed = jax.random.split(rng_key)
                     aug_keys = jax.random.split(aug_seed, args.updates_per_step)
@@ -3794,10 +3883,11 @@ def main() -> None:
                         recent_fraction=args.replay_recent_fraction,
                         recent_window=args.replay_recent_window,
                     )
-                    obs = jnp.asarray(replay_obs_host[sample_ids])
-                    policy_target = jnp.asarray(replay_policy_host[sample_ids])
-                    value_target = jnp.asarray(replay_value_host[sample_ids])
-                    horizon_target = jnp.asarray(replay_horizon_host[sample_ids])
+                    sample_ids = jnp.asarray(sample_ids, dtype=jnp.int32)
+                    obs = replay_obs_dev[sample_ids]
+                    policy_target = replay_policy_dev[sample_ids]
+                    value_target = replay_value_dev[sample_ids]
+                    horizon_target = replay_horizon_dev[sample_ids]
                     if not args.disable_symmetry_augmentation:
                         rng_key, aug_key = jax.random.split(rng_key)
                         obs, policy_target = _augment_batch_with_random_symmetry_jax(obs, policy_target, aug_key)
