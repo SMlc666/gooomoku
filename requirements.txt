@@ -6,3 +6,4 @@ mctx>=0.0.5
 numpy>=1.26
 fastapi>=0.116.0
 uvicorn>=0.31.0
+pybind11>=2.12

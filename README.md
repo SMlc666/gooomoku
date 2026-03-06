@@ -5,6 +5,7 @@ This is a minimal self-play Gomoku scaffold using:
 - Flax
 - Optax
 - mctx (Gumbel MuZero search)
+- optional C++ backend for board + batched Gumbel MCTS (virtual loss)
 
 It includes:
 - Environment: `src/gooomoku/env.py`
@@ -61,6 +62,33 @@ PYTHONPATH=src python scripts/train.py \
 ```bash
 PYTHONPATH=src python scripts/eval.py --checkpoint checkpoints/latest.pkl --games 20
 ```
+
+### C++ MCTS backend build
+
+Build the extension in-place:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+Then enable C++ search/board path in self-play or training:
+
+```bash
+PYTHONPATH=src python scripts/train.py \
+  --mcts-backend cpp \
+  --cpp-virtual-loss 1.0 \
+  --cpp-c-puct 1.5 \
+  --cpp-num-threads 64 \
+  --cpp-leaf-eval-batch-size 1024
+```
+
+Relevant knobs:
+- `--mcts-backend {mctx,cpp}`: switch search backend.
+- `--cpp-virtual-loss`: parallel tree expansion penalty.
+- `--cpp-c-puct`: exploration constant for PUCT.
+- `--cpp-num-threads`: C++ search worker threads (`0` => hardware concurrency).
+- `--cpp-leaf-eval-batch-size`: batched leaf network-eval size.
+- `--gumbel-scale`: Gumbel noise scale (both backends).
 
 Resume from checkpoint:
 

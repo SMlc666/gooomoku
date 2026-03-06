@@ -4,7 +4,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import List, Sequence, Tuple
+from typing import Any, List, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
+from gooomoku.cpp_backend import CppSearchEngine
+from gooomoku.cpp_backend import gomoku_state_to_numpy_dict
+from gooomoku.cpp_backend import is_cpp_backend_available
+from gooomoku.cpp_backend import rng_key_to_seed
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
 from gooomoku.runtime import configure_jax_runtime
@@ -154,6 +158,175 @@ def _sample_actions_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperat
     return jax.lax.cond(temperature <= 1e-6, greedy, sample, operand=None)
 
 
+def _sample_actions_numpy(
+    visit_probs: np.ndarray,
+    *,
+    temperature: float,
+    active: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    batch = int(visit_probs.shape[0])
+    actions = np.full((batch,), -1, dtype=np.int32)
+    if temperature <= 1e-6:
+        actions[active] = np.argmax(visit_probs[active], axis=-1).astype(np.int32)
+        return actions
+
+    for i in np.flatnonzero(active):
+        probs = np.asarray(visit_probs[i], dtype=np.float64)
+        probs = np.maximum(probs, 1e-12)
+        logits = np.log(probs) / max(temperature, 1e-6)
+        logits -= np.max(logits)
+        p = np.exp(logits)
+        p /= np.sum(p)
+        actions[i] = int(rng.choice(p.shape[0], p=p))
+    return actions
+
+
+def _build_play_many_games_fn_cpp(
+    *,
+    model: PolicyValueNet,
+    board_size: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_games: int,
+    dynamic_considered_actions: bool,
+    opening_considered_actions: int,
+    midgame_considered_actions: int,
+    endgame_considered_actions: int,
+    midgame_start_move: int,
+    endgame_start_move: int,
+    temperature_drop_move: int,
+    final_temperature: float,
+    root_dirichlet_fraction: float,
+    root_dirichlet_alpha: float,
+    c_lcb: float,
+    mode_freestyle_weight: float,
+    mode_forbidden_weight: float,
+    mode_swap2_weight: float,
+    mode_swap2_forbidden_weight: float,
+    swap2_swap_prob: float,
+    gumbel_scale: float,
+    mcts_backend: str,
+    cpp_virtual_loss: float,
+    cpp_c_puct: float,
+    cpp_num_threads: int,
+    cpp_leaf_eval_batch_size: int,
+):
+    if str(mcts_backend).strip().lower() != "cpp":
+        raise ValueError("_build_play_many_games_fn_cpp requires mcts_backend='cpp'")
+    if not is_cpp_backend_available():
+        raise RuntimeError(
+            "mcts_backend='cpp' requested but gooomoku_cpp extension is unavailable. "
+            "Build with: python setup.py build_ext --inplace"
+        )
+
+    max_steps = board_size * board_size
+    num_actions = max_steps
+    search_fn = build_search_fn(
+        model=model,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=gumbel_scale,
+        root_dirichlet_fraction=root_dirichlet_fraction,
+        root_dirichlet_alpha=root_dirichlet_alpha,
+        force_defense_at_root=False,
+        c_lcb=c_lcb,
+        dynamic_considered_actions=dynamic_considered_actions,
+        opening_considered_actions=opening_considered_actions,
+        midgame_considered_actions=midgame_considered_actions,
+        endgame_considered_actions=endgame_considered_actions,
+        midgame_start_move=midgame_start_move,
+        endgame_start_move=endgame_start_move,
+        mcts_backend="cpp",
+        cpp_virtual_loss=cpp_virtual_loss,
+        cpp_c_puct=cpp_c_puct,
+        cpp_num_threads=cpp_num_threads,
+        cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+    )
+    board_ops = getattr(search_fn, "_cpp_engine", None)
+    if board_ops is None:
+        board_ops = CppSearchEngine(
+            model=model,
+            board_size=board_size,
+            leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+            num_threads=cpp_num_threads,
+            virtual_loss=cpp_virtual_loss,
+            c_puct=cpp_c_puct,
+        )
+
+    def play_many_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
+        setup_seed = rng_key_to_seed(rng_key)
+        setup_key = jax.random.PRNGKey(np.uint32(setup_seed & ((1 << 31) - 1)))
+        batched_init_state = _build_mixed_init_state(
+            board_size=board_size,
+            num_games=num_games,
+            rng_key=setup_key,
+            mode_freestyle_weight=mode_freestyle_weight,
+            mode_forbidden_weight=mode_forbidden_weight,
+            mode_swap2_weight=mode_swap2_weight,
+            mode_swap2_forbidden_weight=mode_swap2_forbidden_weight,
+            swap2_swap_prob=swap2_swap_prob,
+        )
+
+        state = gomoku_state_to_numpy_dict(batched_init_state)
+        obs_buf = np.zeros((num_games, max_steps, board_size, board_size, env.OBS_PLANES), dtype=np.float32)
+        pi_buf = np.zeros((num_games, max_steps, num_actions), dtype=np.float32)
+        to_play_buf = np.zeros((num_games, max_steps), dtype=np.int8)
+        mask_buf = np.zeros((num_games, max_steps), dtype=np.bool_)
+        action_buf = np.full((num_games, max_steps), -1, dtype=np.int32)
+        steps = np.zeros((num_games,), dtype=np.int32)
+
+        rollout_rng = np.random.default_rng(setup_seed + 0x9E3779B97F4A7C15)
+        base_temperature = float(np.asarray(jax.device_get(temperature)).reshape(()))
+
+        for step_idx in range(max_steps):
+            active = ~state["terminated"]
+            if not np.any(active):
+                break
+
+            obs = board_ops.batch_encode(state)
+            policy_output = search_fn(params, state, jax.random.PRNGKey(np.uint32((setup_seed + step_idx + 1) & ((1 << 31) - 1))))
+            visit_probs = np.asarray(jax.device_get(policy_output.action_weights), dtype=np.float32)
+
+            move_temperature = base_temperature if step_idx < int(temperature_drop_move) else float(final_temperature)
+            action = _sample_actions_numpy(
+                visit_probs,
+                temperature=move_temperature,
+                active=active,
+                rng=rollout_rng,
+            )
+
+            obs_buf[:, step_idx] = np.where(active[:, None, None, None], obs, 0.0)
+            pi_buf[:, step_idx] = np.where(active[:, None], visit_probs, 0.0)
+            to_play_buf[:, step_idx] = np.where(active, state["to_play"], 0).astype(np.int8)
+            mask_buf[:, step_idx] = active
+            action_buf[:, step_idx] = np.where(active, action, -1).astype(np.int32)
+            steps = steps + active.astype(np.int32)
+
+            state, _, _ = board_ops.batch_step(state, action)
+
+        winners = np.asarray(state["winner"], dtype=np.int8)
+        signed_values = np.where(
+            winners[:, None] == 0,
+            0.0,
+            np.where(to_play_buf == winners[:, None], 1.0, -1.0),
+        ).astype(np.float32)
+        value_buf = np.where(mask_buf, signed_values, 0.0).astype(np.float32)
+        pi_buf = np.where(mask_buf[:, :, None], pi_buf, 0.0).astype(np.float32)
+
+        return (
+            jnp.asarray(obs_buf),
+            jnp.asarray(pi_buf),
+            jnp.asarray(value_buf),
+            jnp.asarray(mask_buf),
+            jnp.asarray(action_buf),
+            jnp.asarray(steps),
+            jnp.asarray(winners),
+        )
+
+    return play_many_fn
+
+
 def build_play_one_game_fn(
     *,
     model: PolicyValueNet,
@@ -171,7 +344,60 @@ def build_play_one_game_fn(
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
     c_lcb: float = 0.0,
+    gumbel_scale: float = 1.0,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ):
+    backend = str(mcts_backend).strip().lower()
+    if backend not in {"mctx", "cpp"}:
+        raise ValueError(f"unsupported mcts_backend={mcts_backend!r}, expected 'mctx' or 'cpp'")
+    if backend == "cpp":
+        play_many_one = _build_play_many_games_fn_cpp(
+            model=model,
+            board_size=board_size,
+            num_simulations=num_simulations,
+            max_num_considered_actions=max_num_considered_actions,
+            num_games=1,
+            dynamic_considered_actions=dynamic_considered_actions,
+            opening_considered_actions=opening_considered_actions,
+            midgame_considered_actions=midgame_considered_actions,
+            endgame_considered_actions=endgame_considered_actions,
+            midgame_start_move=midgame_start_move,
+            endgame_start_move=endgame_start_move,
+            temperature_drop_move=temperature_drop_move,
+            final_temperature=final_temperature,
+            root_dirichlet_fraction=root_dirichlet_fraction,
+            root_dirichlet_alpha=root_dirichlet_alpha,
+            c_lcb=c_lcb,
+            mode_freestyle_weight=1.0,
+            mode_forbidden_weight=0.0,
+            mode_swap2_weight=0.0,
+            mode_swap2_forbidden_weight=0.0,
+            swap2_swap_prob=0.5,
+            gumbel_scale=gumbel_scale,
+            mcts_backend=backend,
+            cpp_virtual_loss=cpp_virtual_loss,
+            cpp_c_puct=cpp_c_puct,
+            cpp_num_threads=cpp_num_threads,
+            cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+        )
+
+        def play_one_fn(params, rng_key: jnp.ndarray, temperature: jnp.ndarray):
+            obs, pi, value, mask, _action, steps, winners = play_many_one(params, rng_key, temperature)
+            return (
+                obs[0],
+                pi[0],
+                value[0],
+                mask[0],
+                steps[0],
+                winners[0],
+            )
+
+        return play_one_fn
+
     max_steps = board_size * board_size
     num_actions = max_steps
     # Keep root-defense heuristics off for self-play throughput: they add
@@ -181,6 +407,7 @@ def build_play_one_game_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=gumbel_scale,
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
         force_defense_at_root=False,
@@ -191,6 +418,11 @@ def build_play_one_game_fn(
         endgame_considered_actions=endgame_considered_actions,
         midgame_start_move=midgame_start_move,
         endgame_start_move=endgame_start_move,
+        mcts_backend=backend,
+        cpp_virtual_loss=cpp_virtual_loss,
+        cpp_c_puct=cpp_c_puct,
+        cpp_num_threads=cpp_num_threads,
+        cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
     )
 
     @jax.jit
@@ -268,7 +500,47 @@ def build_play_many_games_fn(
     mode_swap2_weight: float = 0.0,
     mode_swap2_forbidden_weight: float = 0.0,
     swap2_swap_prob: float = 0.5,
+    gumbel_scale: float = 1.0,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ):
+    backend = str(mcts_backend).strip().lower()
+    if backend not in {"mctx", "cpp"}:
+        raise ValueError(f"unsupported mcts_backend={mcts_backend!r}, expected 'mctx' or 'cpp'")
+    if backend == "cpp":
+        return _build_play_many_games_fn_cpp(
+            model=model,
+            board_size=board_size,
+            num_simulations=num_simulations,
+            max_num_considered_actions=max_num_considered_actions,
+            num_games=num_games,
+            dynamic_considered_actions=dynamic_considered_actions,
+            opening_considered_actions=opening_considered_actions,
+            midgame_considered_actions=midgame_considered_actions,
+            endgame_considered_actions=endgame_considered_actions,
+            midgame_start_move=midgame_start_move,
+            endgame_start_move=endgame_start_move,
+            temperature_drop_move=temperature_drop_move,
+            final_temperature=final_temperature,
+            root_dirichlet_fraction=root_dirichlet_fraction,
+            root_dirichlet_alpha=root_dirichlet_alpha,
+            c_lcb=c_lcb,
+            mode_freestyle_weight=mode_freestyle_weight,
+            mode_forbidden_weight=mode_forbidden_weight,
+            mode_swap2_weight=mode_swap2_weight,
+            mode_swap2_forbidden_weight=mode_swap2_forbidden_weight,
+            swap2_swap_prob=swap2_swap_prob,
+            gumbel_scale=gumbel_scale,
+            mcts_backend=backend,
+            cpp_virtual_loss=cpp_virtual_loss,
+            cpp_c_puct=cpp_c_puct,
+            cpp_num_threads=cpp_num_threads,
+            cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+        )
+
     max_steps = board_size * board_size
     num_actions = max_steps
     # Keep root-defense heuristics off for self-play throughput: they add
@@ -278,6 +550,7 @@ def build_play_many_games_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=gumbel_scale,
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
         force_defense_at_root=False,
@@ -288,6 +561,11 @@ def build_play_many_games_fn(
         endgame_considered_actions=endgame_considered_actions,
         midgame_start_move=midgame_start_move,
         endgame_start_move=endgame_start_move,
+        mcts_backend=backend,
+        cpp_virtual_loss=cpp_virtual_loss,
+        cpp_c_puct=cpp_c_puct,
+        cpp_num_threads=cpp_num_threads,
+        cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
     )
 
     @jax.jit
@@ -412,6 +690,12 @@ def play_one_game(
     root_dirichlet_fraction: float = 0.25,
     root_dirichlet_alpha: float = 0.03,
     c_lcb: float = 0.0,
+    gumbel_scale: float = 1.0,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ) -> Tuple[List[TrainingExample], int]:
     compiled = build_play_one_game_fn(
         model=model,
@@ -429,6 +713,12 @@ def play_one_game(
         root_dirichlet_fraction=root_dirichlet_fraction,
         root_dirichlet_alpha=root_dirichlet_alpha,
         c_lcb=c_lcb,
+        gumbel_scale=gumbel_scale,
+        mcts_backend=mcts_backend,
+        cpp_virtual_loss=cpp_virtual_loss,
+        cpp_c_puct=cpp_c_puct,
+        cpp_num_threads=cpp_num_threads,
+        cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
     )
     obs_buf, pi_buf, value_buf, mask, _, winner = compiled(params, rng_key, jnp.float32(temperature))
 
@@ -475,6 +765,12 @@ def play_many_games(
     mode_swap2_weight: float = 0.0,
     mode_swap2_forbidden_weight: float = 0.0,
     swap2_swap_prob: float = 0.5,
+    gumbel_scale: float = 1.0,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ) -> Tuple[List[TrainingExample], dict]:
     play_many_fn = build_play_many_games_fn(
         model=model,
@@ -498,6 +794,12 @@ def play_many_games(
         mode_swap2_weight=mode_swap2_weight,
         mode_swap2_forbidden_weight=mode_swap2_forbidden_weight,
         swap2_swap_prob=swap2_swap_prob,
+        gumbel_scale=gumbel_scale,
+        mcts_backend=mcts_backend,
+        cpp_virtual_loss=cpp_virtual_loss,
+        cpp_c_puct=cpp_c_puct,
+        cpp_num_threads=cpp_num_threads,
+        cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
     )
     obs, pi, value, mask, _, _, winners = play_many_fn(params, rng_key, jnp.float32(temperature))
     obs = jax.device_get(obs)
@@ -545,6 +847,12 @@ def main() -> None:
     parser.add_argument("--considered-actions-endgame-move", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--c-lcb", type=float, default=0.0)
+    parser.add_argument("--gumbel-scale", type=float, default=1.0)
+    parser.add_argument("--mcts-backend", choices=("mctx", "cpp"), default="mctx")
+    parser.add_argument("--cpp-virtual-loss", type=float, default=1.0)
+    parser.add_argument("--cpp-c-puct", type=float, default=1.5)
+    parser.add_argument("--cpp-num-threads", type=int, default=0)
+    parser.add_argument("--cpp-leaf-eval-batch-size", type=int, default=512)
     parser.add_argument("--max-attention-heads", type=int, default=4)
     parser.add_argument("--compute-dtype", type=str, default="bfloat16")
     parser.add_argument("--param-dtype", type=str, default="bfloat16")
@@ -576,6 +884,12 @@ def main() -> None:
         midgame_start_move=args.considered_actions_mid_move,
         endgame_start_move=args.considered_actions_endgame_move,
         c_lcb=args.c_lcb,
+        gumbel_scale=args.gumbel_scale,
+        mcts_backend=args.mcts_backend,
+        cpp_virtual_loss=args.cpp_virtual_loss,
+        cpp_c_puct=args.cpp_c_puct,
+        cpp_num_threads=args.cpp_num_threads,
+        cpp_leaf_eval_batch_size=args.cpp_leaf_eval_batch_size,
     )
     print(f"samples={len(samples)} winner={winner}")
 

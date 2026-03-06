@@ -33,6 +33,10 @@ sys.path.append(str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
 from gooomoku import env
+from gooomoku.cpp_backend import CppSearchEngine
+from gooomoku.cpp_backend import gomoku_state_to_numpy_dict
+from gooomoku.cpp_backend import numpy_dict_to_gomoku_state
+from gooomoku.cpp_backend import rng_key_to_seed
 from gooomoku.mctx_adapter import _batched_force_masks
 from gooomoku.mctx_adapter import build_search_fn
 from gooomoku.net import PolicyValueNet
@@ -127,6 +131,12 @@ def _run_cross_process_actor(
         mode_swap2_weight=float(cfg.get("mode_swap2_weight", 0.0)),
         mode_swap2_forbidden_weight=float(cfg.get("mode_swap2_forbidden_weight", 0.0)),
         swap2_swap_prob=float(cfg.get("swap2_swap_prob", 0.5)),
+        gumbel_scale=float(cfg.get("gumbel_scale", 1.0)),
+        mcts_backend=str(cfg.get("mcts_backend", "mctx")),
+        cpp_virtual_loss=float(cfg.get("cpp_virtual_loss", 1.0)),
+        cpp_c_puct=float(cfg.get("cpp_c_puct", 1.5)),
+        cpp_num_threads=int(cfg.get("cpp_num_threads", 0)),
+        cpp_leaf_eval_batch_size=int(cfg.get("cpp_leaf_eval_batch_size", 512)),
     )
 
     rng = jax.random.PRNGKey(int(cfg["seed"]) + 100003 * (actor_idx + 1))
@@ -1366,6 +1376,12 @@ def _checkpoint_config(args, optimizer_updates: int, best_step: int) -> dict[str
         "max_attention_heads": args.max_attention_heads,
         "num_simulations": args.num_simulations,
         "max_num_considered_actions": args.max_num_considered_actions,
+        "gumbel_scale": args.gumbel_scale,
+        "mcts_backend": args.mcts_backend,
+        "cpp_virtual_loss": args.cpp_virtual_loss,
+        "cpp_c_puct": args.cpp_c_puct,
+        "cpp_num_threads": args.cpp_num_threads,
+        "cpp_leaf_eval_batch_size": args.cpp_leaf_eval_batch_size,
         "dynamic_considered_actions": not args.disable_dynamic_considered_actions,
         "considered_actions_opening": args.considered_actions_opening,
         "considered_actions_midgame": args.considered_actions_midgame,
@@ -1427,14 +1443,109 @@ def build_arena_fn(
     max_num_considered_actions: int,
     num_games: int,
     temperature: float,
+    gumbel_scale: float = 1.0,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ):
+    backend = str(mcts_backend).strip().lower()
+    if backend == "cpp":
+        search_fn = build_search_fn(
+            model=model,
+            num_simulations=num_simulations,
+            max_num_considered_actions=max_num_considered_actions,
+            gumbel_scale=gumbel_scale,
+            root_dirichlet_fraction=0.0,
+            root_dirichlet_alpha=0.03,
+            mcts_backend="cpp",
+            cpp_virtual_loss=cpp_virtual_loss,
+            cpp_c_puct=cpp_c_puct,
+            cpp_num_threads=cpp_num_threads,
+            cpp_leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+        )
+        board_ops = getattr(search_fn, "_cpp_engine", None)
+        if board_ops is None:
+            board_ops = CppSearchEngine(
+                model=model,
+                board_size=board_size,
+                leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+                num_threads=cpp_num_threads,
+                virtual_loss=cpp_virtual_loss,
+                c_puct=cpp_c_puct,
+            )
+
+        max_steps = board_size * board_size
+        use_greedy = temperature <= 1e-6
+        temp = float(temperature)
+
+        def arena_fn(params_a, params_b, rng_key):
+            seed = rng_key_to_seed(rng_key)
+            rng = np.random.default_rng(seed)
+            state = gomoku_state_to_numpy_dict(
+                jax.tree_util.tree_map(
+                    lambda x: jnp.repeat(x[None, ...], repeats=num_games, axis=0),
+                    env.reset(board_size),
+                )
+            )
+            game_indices = np.arange(num_games, dtype=np.int32)
+            a_colors = np.where((game_indices % 2) == 0, np.int8(1), np.int8(-1))
+
+            for step_idx in range(max_steps):
+                active = ~state["terminated"]
+                if not np.any(active):
+                    break
+                state_jax = numpy_dict_to_gomoku_state(state)
+                key_a = jax.random.PRNGKey(np.uint32((seed + 0x10001 + step_idx) & ((1 << 31) - 1)))
+                key_b = jax.random.PRNGKey(np.uint32((seed + 0x20003 + step_idx) & ((1 << 31) - 1)))
+                pi_a = np.asarray(jax.device_get(search_fn(params_a, state_jax, key_a).action_weights), dtype=np.float32)
+                pi_b = np.asarray(jax.device_get(search_fn(params_b, state_jax, key_b).action_weights), dtype=np.float32)
+
+                use_a = active & (state["to_play"] == a_colors)
+                use_b = active & (~use_a)
+                actions = np.full((num_games,), -1, dtype=np.int32)
+
+                if use_greedy:
+                    actions[use_a] = np.argmax(pi_a[use_a], axis=-1).astype(np.int32)
+                    actions[use_b] = np.argmax(pi_b[use_b], axis=-1).astype(np.int32)
+                else:
+                    def _sample_one(probs: np.ndarray) -> int:
+                        p = np.maximum(probs, 1e-12).astype(np.float64, copy=False)
+                        lg = np.log(p) / max(temp, 1e-6)
+                        lg -= np.max(lg)
+                        p = np.exp(lg)
+                        p /= np.sum(p)
+                        return int(rng.choice(p.shape[0], p=p))
+
+                    for i in np.flatnonzero(use_a):
+                        actions[i] = _sample_one(pi_a[i])
+                    for i in np.flatnonzero(use_b):
+                        actions[i] = _sample_one(pi_b[i])
+
+                state, _, _ = board_ops.batch_step(state, actions)
+
+            winners = np.asarray(state["winner"], dtype=np.int8)
+            is_draw = winners == 0
+            a_win = winners == a_colors
+            b_win = (~is_draw) & (~a_win)
+            return (
+                jnp.int32(int(np.sum(a_win, dtype=np.int32))),
+                jnp.int32(int(np.sum(b_win, dtype=np.int32))),
+                jnp.int32(int(np.sum(is_draw, dtype=np.int32))),
+            )
+
+        return arena_fn
+
     max_steps = board_size * board_size
     search_fn = build_search_fn(
         model=model,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=gumbel_scale,
         root_dirichlet_fraction=0.0,
         root_dirichlet_alpha=0.03,
+        mcts_backend="mctx",
     )
     use_greedy = temperature <= 1e-6
     temp = jnp.float32(temperature)
@@ -2136,6 +2247,12 @@ def _run_actor_role(
         mode_swap2_weight=args.mode_swap2_weight,
         mode_swap2_forbidden_weight=args.mode_swap2_forbidden_weight,
         swap2_swap_prob=args.swap2_swap_prob,
+        gumbel_scale=args.gumbel_scale,
+        mcts_backend=args.mcts_backend,
+        cpp_virtual_loss=args.cpp_virtual_loss,
+        cpp_c_puct=args.cpp_c_puct,
+        cpp_num_threads=args.cpp_num_threads,
+        cpp_leaf_eval_batch_size=args.cpp_leaf_eval_batch_size,
     )
     collect_step = make_pmap_collect_step(play_many_games_fn) if use_pmap else play_many_games_fn
 
@@ -2449,6 +2566,12 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-simulations", type=int, default=64)
     parser.add_argument("--max-num-considered-actions", type=int, default=24)
+    parser.add_argument("--gumbel-scale", type=float, default=1.0)
+    parser.add_argument("--mcts-backend", choices=("mctx", "cpp"), default="mctx")
+    parser.add_argument("--cpp-virtual-loss", type=float, default=1.0)
+    parser.add_argument("--cpp-c-puct", type=float, default=1.5)
+    parser.add_argument("--cpp-num-threads", type=int, default=0)
+    parser.add_argument("--cpp-leaf-eval-batch-size", type=int, default=512)
     parser.add_argument("--disable-dynamic-considered-actions", action="store_true")
     parser.add_argument("--considered-actions-opening", type=int, default=64)
     parser.add_argument("--considered-actions-midgame", type=int, default=96)
@@ -2905,17 +3028,21 @@ def main() -> None:
                 "forcing disable-pmap to avoid cross-host pmap hangs"
             )
             use_pmap = False
+    selfplay_use_pmap = use_pmap and (str(args.mcts_backend).strip().lower() == "mctx")
+    arena_use_pmap = use_pmap and (str(args.mcts_backend).strip().lower() == "mctx")
+    if use_pmap and (not selfplay_use_pmap) and is_chief:
+        print("self-play pmap disabled because --mcts-backend=cpp; training pmap remains enabled")
     if args.role != "actor" and use_pmap and (args.batch_size % local_devices != 0):
         raise ValueError(f"batch-size must be divisible by local_device_count={local_devices}")
     selfplay_batch_games = args.selfplay_batch_games or args.games_per_step
     if selfplay_batch_games < 1:
         raise ValueError("selfplay-batch-games must be >= 1")
-    if use_pmap and (selfplay_batch_games % local_devices != 0):
+    if selfplay_use_pmap and (selfplay_batch_games % local_devices != 0):
         raise ValueError(f"games-per-step must be divisible by local_device_count={local_devices}")
-    if args.role != "actor" and use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
+    if args.role != "actor" and arena_use_pmap and args.arena_every_steps > 0 and (args.arena_games % local_devices != 0):
         raise ValueError(f"arena-games must be divisible by local_device_count={local_devices} when pmap is enabled")
 
-    if auto_overlap_enabled and (not selfplay_actors_explicit) and use_pmap and local_devices >= 4 and (local_devices % 2 == 0):
+    if auto_overlap_enabled and (not selfplay_actors_explicit) and selfplay_use_pmap and local_devices >= 4 and (local_devices % 2 == 0):
         args.selfplay_actors = 2
     if auto_overlap_enabled and is_chief:
         print(
@@ -2930,20 +3057,20 @@ def main() -> None:
             params=params,
             train_blocks=args.blocks,
             search_blocks=effective_search_blocks,
-            use_pmap=use_pmap,
+            use_pmap=selfplay_use_pmap,
             local_devices=local_devices,
             process_index=process_index,
             selfplay_batch_games=selfplay_batch_games,
         )
         return
 
-    games_per_device = selfplay_batch_games // local_devices if use_pmap else selfplay_batch_games
+    games_per_device = selfplay_batch_games // local_devices if selfplay_use_pmap else selfplay_batch_games
     fused_train_updates = args.updates_per_step > 1 and (not args.disable_fused_train_updates)
     ema_decay_step = float(args.ema_decay)
     ema_decay_fused = float(args.ema_decay ** max(args.updates_per_step, 1))
     actor_device_groups = None
     actor_devices_per_group = 0
-    if args.async_selfplay and (not args.cross_process_selfplay) and use_pmap:
+    if args.async_selfplay and (not args.cross_process_selfplay) and selfplay_use_pmap:
         if args.selfplay_actors > local_devices:
             raise ValueError(
                 f"selfplay-actors={args.selfplay_actors} cannot exceed local_device_count={local_devices} in in-process TPU mode"
@@ -2981,10 +3108,16 @@ def main() -> None:
         mode_swap2_weight=args.mode_swap2_weight,
         mode_swap2_forbidden_weight=args.mode_swap2_forbidden_weight,
         swap2_swap_prob=args.swap2_swap_prob,
+        gumbel_scale=args.gumbel_scale,
+        mcts_backend=args.mcts_backend,
+        cpp_virtual_loss=args.cpp_virtual_loss,
+        cpp_c_puct=args.cpp_c_puct,
+        cpp_num_threads=args.cpp_num_threads,
+        cpp_leaf_eval_batch_size=args.cpp_leaf_eval_batch_size,
     )
     arena_num_simulations = args.arena_num_simulations or args.num_simulations
     arena_max_num_considered_actions = args.arena_max_num_considered_actions or args.max_num_considered_actions
-    arena_games_per_device = args.arena_games // local_devices if use_pmap else args.arena_games
+    arena_games_per_device = args.arena_games // local_devices if arena_use_pmap else args.arena_games
     arena_fn = build_arena_fn(
         model=train_model,
         board_size=args.board_size,
@@ -2992,8 +3125,14 @@ def main() -> None:
         max_num_considered_actions=arena_max_num_considered_actions,
         num_games=arena_games_per_device,
         temperature=args.arena_temperature,
+        gumbel_scale=args.gumbel_scale,
+        mcts_backend=args.mcts_backend,
+        cpp_virtual_loss=args.cpp_virtual_loss,
+        cpp_c_puct=args.cpp_c_puct,
+        cpp_num_threads=args.cpp_num_threads,
+        cpp_leaf_eval_batch_size=args.cpp_leaf_eval_batch_size,
     )
-    pmap_arena_step = make_pmap_arena_step(arena_fn) if use_pmap else None
+    pmap_arena_step = make_pmap_arena_step(arena_fn) if arena_use_pmap else None
     # Muon path uses optimizer-side weight decay on matrix parameters only.
     loss_l2_weight_decay = args.weight_decay if args.optimizer == "adam" else 0.0
 
@@ -3021,7 +3160,7 @@ def main() -> None:
             win1_loss_weight=args.win1_loss_weight,
             intermediate_supervision_weight=args.intermediate_supervision_weight,
         )
-        collect_step = make_pmap_collect_step(play_many_games_fn)
+        collect_step = make_pmap_collect_step(play_many_games_fn) if selfplay_use_pmap else play_many_games_fn
         params = _replicate_tree_for_pmap(params, local_devices=local_devices)
         opt_state = _replicate_tree_for_pmap(opt_state, local_devices=local_devices)
         ema_params = _replicate_tree_for_pmap(ema_params, local_devices=local_devices)
@@ -3195,7 +3334,7 @@ def main() -> None:
     async_last_wait_log_at = learner_last_wait_log_at
 
     def collect_new_examples(params_for_collect, collect_rng_key):
-        if use_pmap:
+        if selfplay_use_pmap:
             collect_keys = jax.random.split(collect_rng_key, local_devices)
             collect_temperature = jnp.full((local_devices,), jnp.float32(args.temperature), dtype=jnp.float32)
             obs, policy, value, mask, _, steps, winners = collect_step(
@@ -3222,8 +3361,11 @@ def main() -> None:
         return payload
 
     def extract_collect_params(runtime_params, *, runtime_use_pmap: bool):
+        collect_params = runtime_params
+        if use_pmap and (not runtime_use_pmap):
+            collect_params = _extract_host_tree(runtime_params, use_pmap=True)
         return _extract_search_params(
-            runtime_params,
+            collect_params,
             train_blocks=args.blocks,
             search_blocks=effective_search_blocks,
             use_pmap=runtime_use_pmap,
@@ -3309,6 +3451,12 @@ def main() -> None:
                 "param_dtype": args.param_dtype,
                 "num_simulations": args.num_simulations,
                 "max_num_considered_actions": args.max_num_considered_actions,
+                "gumbel_scale": args.gumbel_scale,
+                "mcts_backend": args.mcts_backend,
+                "cpp_virtual_loss": args.cpp_virtual_loss,
+                "cpp_c_puct": args.cpp_c_puct,
+                "cpp_num_threads": args.cpp_num_threads,
+                "cpp_leaf_eval_batch_size": args.cpp_leaf_eval_batch_size,
                 "dynamic_considered_actions": not args.disable_dynamic_considered_actions,
                 "considered_actions_opening": args.considered_actions_opening,
                 "considered_actions_midgame": args.considered_actions_midgame,
@@ -3364,9 +3512,9 @@ def main() -> None:
         else:
             actor_stop = threading.Event()
             params_ref_lock = threading.Lock()
-            params_ref = [_clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))]
+            params_ref = [_clone_tree(extract_collect_params(params, runtime_use_pmap=selfplay_use_pmap))]
             actor_collect_steps = None
-            if use_pmap:
+            if selfplay_use_pmap:
                 assert actor_device_groups is not None
                 actor_collect_steps = [
                     make_pmap_collect_step(play_many_games_fn, devices=devices)
@@ -3383,7 +3531,7 @@ def main() -> None:
                         with params_ref_lock:
                             collect_params = params_ref[0]
                         actor_rng, collect_key = jax.random.split(actor_rng)
-                        if use_pmap and actor_collect_steps is not None:
+                        if selfplay_use_pmap and actor_collect_steps is not None:
                             assert actor_devices_per_group > 0
                             start = actor_idx * actor_devices_per_group
                             end = start + actor_devices_per_group
@@ -3616,7 +3764,7 @@ def main() -> None:
             else:
                 rng_key, collect_key = jax.random.split(rng_key)
                 collect_start = time.perf_counter()
-                collect_params = extract_collect_params(params, runtime_use_pmap=use_pmap)
+                collect_params = extract_collect_params(params, runtime_use_pmap=selfplay_use_pmap)
                 payload = collect_new_examples(collect_params, collect_key)
                 if cross_host_replay_merge:
                     payload = _merge_selfplay_payloads_across_hosts(payload)
@@ -3768,7 +3916,7 @@ def main() -> None:
                         _broadcast_collect_params_to_actor_queues(actor_params_queues, params_host)
                     elif params_ref_lock is not None and params_ref is not None:
                         with params_ref_lock:
-                            params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
+                            params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=selfplay_use_pmap))
             else:
                 for _ in range(args.updates_per_step):
                     sample_ids = _sample_replay_indices(
@@ -3842,7 +3990,7 @@ def main() -> None:
                             _broadcast_collect_params_to_actor_queues(actor_params_queues, params_host)
                         elif params_ref_lock is not None and params_ref is not None:
                             with params_ref_lock:
-                                params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=use_pmap))
+                                params_ref[0] = _clone_tree(extract_collect_params(params, runtime_use_pmap=selfplay_use_pmap))
             train_updates_ms = (time.perf_counter() - train_updates_start) * 1000.0
 
             if (
@@ -3915,7 +4063,7 @@ def main() -> None:
             if args.arena_every_steps > 0 and (step % args.arena_every_steps == 0):
                 arena_start = time.perf_counter()
                 rng_key, arena_key = jax.random.split(rng_key)
-                if use_pmap:
+                if arena_use_pmap:
                     arena_keys = jax.random.split(arena_key, local_devices)
                     assert pmap_arena_step is not None
                     arena_wins, arena_losses, arena_draws = pmap_arena_step(ema_params, best_params_repl, arena_keys)

@@ -8,6 +8,9 @@ import jax
 import jax.numpy as jnp
 import mctx
 
+from gooomoku.cpp_backend import CppSearchEngine
+from gooomoku.cpp_backend import numpy_dict_to_gomoku_state
+from gooomoku.cpp_backend import is_cpp_backend_available
 from gooomoku import env
 from gooomoku.net import PolicyValueNet
 
@@ -530,7 +533,97 @@ def build_search_fn(
     endgame_considered_actions: int = 160,
     midgame_start_move: int = 12,
     endgame_start_move: int = 40,
+    mcts_backend: str = "mctx",
+    cpp_virtual_loss: float = 1.0,
+    cpp_c_puct: float = 1.5,
+    cpp_num_threads: int = 0,
+    cpp_leaf_eval_batch_size: int = 512,
 ):
+    backend = str(mcts_backend).strip().lower()
+    if backend not in {"mctx", "cpp"}:
+        raise ValueError(f"unsupported mcts_backend={mcts_backend!r}, expected 'mctx' or 'cpp'")
+
+    if backend == "cpp":
+        if force_defense_in_recurrent:
+            raise ValueError("force_defense_in_recurrent is not supported by mcts_backend='cpp'")
+        if not is_cpp_backend_available():
+            raise RuntimeError(
+                "mcts_backend='cpp' requested but gooomoku_cpp extension is unavailable. "
+                "Build with: python setup.py build_ext --inplace"
+            )
+        cpp_engine = CppSearchEngine(
+            model=model,
+            board_size=int(model.board_size),
+            leaf_eval_batch_size=cpp_leaf_eval_batch_size,
+            num_threads=cpp_num_threads,
+            virtual_loss=cpp_virtual_loss,
+            c_puct=cpp_c_puct,
+        )
+        use_root_noise = root_dirichlet_fraction > 0.0
+
+        def search_fn(params, states: env.GomokuState | dict, rng_key):
+            search_key = rng_key
+            states_for_cpp = states
+            if isinstance(states, dict) and (not force_defense_at_root):
+                state_np, prior_logits_np, value_np, legal_np = cpp_engine.root_policy(
+                    params=params,
+                    states=states,
+                )
+                states_for_cpp = state_np
+                prior_logits = jnp.asarray(prior_logits_np, dtype=jnp.float32)
+                root_value = jnp.asarray(value_np, dtype=jnp.float32)
+                legal_actions = jnp.asarray(legal_np, dtype=jnp.bool_)
+                num_moves = jnp.asarray(state_np["num_moves"], dtype=jnp.int32)
+            else:
+                states_jax = numpy_dict_to_gomoku_state(states) if isinstance(states, dict) else states
+                root = root_output(
+                    params=params,
+                    model=model,
+                    states=states_jax,
+                    force_defense_at_root=force_defense_at_root,
+                )
+                invalid_actions = ~env.batch_legal_action_mask(states_jax)
+                legal_actions = ~invalid_actions
+                prior_logits = root.prior_logits
+                root_value = root.value
+                num_moves = states_jax.num_moves
+            if dynamic_considered_actions:
+                prior_logits = _apply_dynamic_considered_pruning(
+                    prior_logits=prior_logits,
+                    legal_mask=legal_actions,
+                    num_moves=num_moves,
+                    max_num_considered_actions=max_num_considered_actions,
+                    opening_considered_actions=opening_considered_actions,
+                    midgame_considered_actions=midgame_considered_actions,
+                    endgame_considered_actions=endgame_considered_actions,
+                    midgame_start_move=midgame_start_move,
+                    endgame_start_move=endgame_start_move,
+                )
+            if use_root_noise:
+                noise_key, search_key = jax.random.split(rng_key)
+                prior_logits = _apply_root_dirichlet_noise(
+                    prior_logits=prior_logits,
+                    legal_mask=legal_actions,
+                    rng_key=noise_key,
+                    fraction=root_dirichlet_fraction,
+                    alpha=root_dirichlet_alpha,
+                )
+
+            return cpp_engine.search(
+                params=params,
+                states=states_for_cpp,
+                root_prior_logits=prior_logits,
+                root_values=root_value,
+                rng_key=search_key,
+                num_simulations=num_simulations,
+                max_num_considered_actions=max_num_considered_actions,
+                gumbel_scale=gumbel_scale,
+                c_lcb=c_lcb,
+            )
+
+        setattr(search_fn, "_cpp_engine", cpp_engine)
+        return search_fn
+
     recurrent = functools.partial(
         recurrent_fn,
         model=model,
