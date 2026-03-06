@@ -199,7 +199,7 @@ class PolicyValueNet(nn.Module):
             transformer_stack = nn.scan(
                 TransformerScanCell,
                 variable_axes={"params": 0},
-                split_rngs={"params": True},
+                split_rngs={"params": True, "stochastic_depth": False},
                 in_axes=0,
                 out_axes=0,
             )
