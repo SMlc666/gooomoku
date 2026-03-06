@@ -78,17 +78,21 @@ class TransformerBlock(nn.Module):
 
         attn_logits = jnp.einsum("bthd,bshd->bhts", q, k)
         attn_logits = attn_logits * jnp.asarray(head_dim ** -0.5, dtype=self.compute_dtype)
-        rel_table_size = (2 * self.board_size - 1) * (2 * self.board_size - 1)
+        tokens = self.board_size * self.board_size
         rel_pos_bias = self.param(
             "rel_pos_bias",
             nn.initializers.normal(stddev=0.02),
-            (self.num_heads, rel_table_size),
+            (self.num_heads, tokens, tokens),
             self.param_dtype,
         )
-        rel_index = _relative_position_index(self.board_size)
-        tokens = self.board_size * self.board_size
-        rel_bias = jnp.take(rel_pos_bias.astype(self.compute_dtype), rel_index.reshape(-1), axis=1)
-        rel_bias = rel_bias.reshape(self.num_heads, tokens, tokens)
+        if rel_pos_bias.ndim == 2:
+            # Backward-compat path for old checkpoints that stored compact relative
+            # position table as (num_heads, (2*board_size-1)^2).
+            rel_index = _relative_position_index(self.board_size)
+            rel_bias = jnp.take(rel_pos_bias.astype(self.compute_dtype), rel_index.reshape(-1), axis=1)
+            rel_bias = rel_bias.reshape(self.num_heads, tokens, tokens)
+        else:
+            rel_bias = rel_pos_bias.astype(self.compute_dtype)
         attn_logits = attn_logits + rel_bias[None, :, :, :]
 
         attn_weights = jax.nn.softmax(attn_logits, axis=-1).astype(self.compute_dtype)
@@ -314,7 +318,7 @@ class PolicyValueNet(nn.Module):
         if return_intermediate:
             tap_indices = _intermediate_tap_indices(self.blocks, self.intermediate_supervision_stride)
             if tap_indices:
-                tap_x = jnp.take(layer_outputs, jnp.asarray(tap_indices, dtype=jnp.int32), axis=0)
+                tap_x = jnp.stack([layer_outputs[i] for i in tap_indices], axis=0)
                 tap_policy_logits = jax.vmap(lambda tx: policy_head(tx).squeeze(-1))(tap_x)
                 tap_value_raw, _ = jax.vmap(_value_heads)(tap_x)
                 tap_values = jnp.tanh(tap_value_raw)

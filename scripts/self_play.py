@@ -149,8 +149,7 @@ def _sample_actions_jax(visit_probs: jnp.ndarray, rng_key: jnp.ndarray, temperat
     def sample(_):
         safe_probs = jnp.maximum(visit_probs, 1e-8)
         logits = jnp.log(safe_probs) / temperature
-        keys = jax.random.split(rng_key, visit_probs.shape[0])
-        return jax.vmap(lambda key, row: jax.random.categorical(key, row).astype(jnp.int32))(keys, logits)
+        return jax.random.categorical(rng_key, logits, axis=-1).astype(jnp.int32)
 
     return jax.lax.cond(temperature <= 1e-6, greedy, sample, operand=None)
 
